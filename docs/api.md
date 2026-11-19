@@ -3795,6 +3795,10 @@ error IoError (open, access, read, write, exists, os, closed, timeout, range, ca
 + fn close(fd: i32) void !IoError
 // Copies `reader` into `writer` until the reader is exhausted and returns the bytes copied.
 + fn copy(reader: Reader, writer: Writer, chunk_size: uint (65536)) uint !IoError
+// Copies up to `limit` bytes from `reader` into `writer` and returns the bytes copied.
++ fn copy_n(reader: Reader, writer: Writer, limit: uint, chunk_size: uint (65536)) uint !IoError
+// Returns an `io.Writer` that discards everything written to it; cached per thread.
++ fn discard() Discard
 // Wakes pending socket I/O on `fd` and makes later I/O on it fail, without releasing it.
 + fn interrupt_fd(fd: i32) void
 // Writes `msg` to standard output, without a newline.
@@ -3805,6 +3809,8 @@ error IoError (open, access, read, write, exists, os, closed, timeout, range, ca
 + fn read(fd: i32, buf: local mut &[u8], offset: uint (uint.$max)) uint !IoError
 // Reads `reader` until it is exhausted and returns everything read.
 + fn read_all(reader: Reader, chunk_size: uint (65536)) ByteBuffer !IoError
+// Fills all of `buf` from `reader`, retrying short reads until every byte is read.
++ fn read_exact(reader: Reader, buf: local mut &[u8]) void !IoError
 // Reads like `read`, but always blocks the thread, even inside a coroutine.
 + fn read_sync(fd: i32, buf: local mut &[u8], offset: uint (uint.$max)) uint !IoError
 // Moves the position of `fd` to `offset` bytes from `from` and returns the new position.
@@ -3825,15 +3831,100 @@ error IoError (open, access, read, write, exists, os, closed, timeout, range, ca
 + fn sync(fd: i32, data_only: bool (false)) void !IoError
 // Writes up to `data.length` bytes of `data` to `fd` and returns the number written.
 + fn write(fd: i32, data: local &[u8], offset: uint (uint.$max)) uint !IoError
+// Writes all of `data` to `writer`, retrying short writes until every byte is written.
++ fn write_all(writer: Writer, data: local &[u8]) void !IoError
 ```
 
 ## Classes for 'io'
+
+```js
+// Buffers reads from an `io.Reader` so small reads avoid repeated underlying calls.
++ class BufReader is Reader {
+    // Number of unread bytes currently held in the buffer.
+    + get buffered: uint
+    // Size of the internal buffer in bytes.
+    + get capacity: uint
+    // Marks up to `count` buffered bytes as read.
+    + fn consume(count: uint) void
+    // Skips up to `count` bytes and returns the number of bytes actually skipped.
+    + fn discard(count: uint) uint !IoError
+    // Returns a view of the currently buffered bytes, filling from the underlying reader once if the buffer is empty.
+    + fn fill() &[u8] !IoError
+    // Returns the underlying reader.
+    + fn inner() Reader
+    // Creates a buffered reader over `reader` with an internal buffer of `capacity` bytes (at least 1).
+    + static fn new(reader: Reader, capacity: uint (8192)) BufReader
+    // Returns the next byte without consuming it, or `null` at the end of input.
+    + fn peek() ?u8 !IoError
+    // Reads up to `out.length` bytes into `out` and returns the count; 0 at the end of input.
+    + fn read(out: local mut &[u8]) uint !IoError
+    // Reads and consumes one byte, or returns `null` at the end of input.
+    + fn read_byte() ?u8 !IoError
+    // Returns the next line without its `\n` or `\r\n`, or `null` at the end of input.
+    + fn read_line() ?String !IoError
+    // Writes the next line to `out` without its `\n` or `\r\n` and returns the bytes written, or `null` at the end of input.
+    + fn read_line_into(out: Writer) ?uint !IoError
+    // Returns the bytes up to, not including, the next `delimiter`, or `null` at the end.
+    + fn read_until(delimiter: u8) ?String !IoError
+    // Writes the bytes up to, not including, the next `delimiter` to `out` and returns the bytes written, or `null` at the end of input.
+    + fn read_until_into(delimiter: u8, out: Writer) ?uint !IoError
+    // Switches to `reader` and discards any unread buffered bytes, reusing the buffer.
+    + fn reset(reader: Reader) void
+}
+```
+
+```js
+// Buffers writes to an `io.Writer` so small writes are combined into larger chunks.
++ class BufWriter is Writer {
+    // Remaining free space in the buffer before the next flush.
+    + get available: uint
+    // Number of bytes currently waiting in the buffer.
+    + get buffered: uint
+    // Size of the internal buffer in bytes.
+    + get capacity: uint
+    // Writes all buffered bytes to the underlying writer.
+    + fn flush() void !IoError
+    // Returns the underlying writer.
+    + fn inner() Writer
+    // Creates a buffered writer over `writer` with an internal buffer of `capacity` bytes (at least 1).
+    + static fn new(writer: Writer, capacity: uint (8192)) BufWriter
+    // Switches to `writer` and discards any unflushed buffered bytes, reusing the buffer.
+    + fn reset(writer: Writer) void
+    // Writes `data` into the buffer, flushing to the underlying writer when full.
+    + fn write(data: local &[u8]) uint !IoError
+    // Buffers a single byte, flushing first if the buffer is full.
+    + fn write_byte(byte: u8) void !IoError
+}
+```
 
 ```js
 // A resource that is released with `close`.
 + interface Closer {
     // Releases the resource.
     + fn close() void !IoError
+}
+```
+
+```js
+// An `io.Writer` that accepts and discards all bytes without doing any work.
++ class Discard is Writer {
+    // Creates a discard writer.
+    + static fn new() Discard
+    // Discards `data` and returns `data.length`.
+    + fn write(data: local &[u8]) uint !IoError
+}
+```
+
+```js
+// Reads at most `remaining` bytes from an underlying `io.Reader`.
++ class LimitReader is Reader {
+    // Number of bytes left to read before reporting end of input.
+    ~ remaining: uint
+
+    // Creates a reader that yields at most `limit` bytes from `reader`.
+    + static fn new(reader: Reader, limit: uint) LimitReader
+    // Reads up to `min(buf.length, remaining)` bytes from the underlying reader.
+    + fn read(buf: local mut &[u8]) uint !IoError
 }
 ```
 
@@ -3852,6 +3943,18 @@ error IoError (open, access, read, write, exists, os, closed, timeout, range, ca
     + fn read_until(delimiter: u8) ?String !IoError
     // Writes the bytes up to, not including, the next `delimiter` to `out` and returns the bytes written, or `null` at the end of the input.
     + fn read_until_into(delimiter: u8, out: Writer) ?uint !IoError
+}
+```
+
+```js
+// Duplicates every write to all wrapped `io.Writer` targets in order.
++ class MultiWriter is Writer {
+    // Appends another target writer.
+    + fn add(writer: Writer) void
+    // Creates a writer that forwards writes to each writer in `writers`.
+    + static fn new(writers: ...Writer) MultiWriter
+    // Writes all of `data` to every target writer and returns `data.length`.
+    + fn write(data: local &[u8]) uint !IoError
 }
 ```
 

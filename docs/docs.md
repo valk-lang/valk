@@ -1869,6 +1869,13 @@ while true {
 }
 ```
 
+For general stream I/O, `io.write_all` writes an entire slice across short writes,
+`io.read_exact` fills a buffer completely or throws `.closed`, and `io.copy_n`
+copies at most `limit` bytes. `io.BufReader` and `io.BufWriter` buffer reads and
+writes (call `flush()` on a `BufWriter` when done), `io.LimitReader` caps a
+reader, `io.MultiWriter` fans writes out to several writers, and `io.discard()`
+returns a writer that ignores everything written to it.
+
 Environment variables are read with `core.getenv(name)`, and changed for the
 process and its children with `core.setenv(name, value)` and `core.unsetenv(name)`.
 `core.env_vars()` returns all of them as a map.

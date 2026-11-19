@@ -59,7 +59,7 @@ test "io: byte reader and buffer writer" {
 
     // `read` takes a local mut borrow, so a stack array is filled through the interface
     let source: io.Reader = "stack".reader()
-    let stack_buf: [u8 x 8] = {0...}
+    let stack_buf: [u8 x 8] = { 0... }
     assert((source.read(stack_buf) !? 99) == 5)
     assert(stack_buf[0] == 's' && stack_buf[4] == 'k' && stack_buf[5] == 0)
 }
@@ -220,4 +220,293 @@ test "io: a line reader writes lines and delimited parts into a writer" {
     assert((empty.read_line_into(buf) !!) == 0)
     assert((empty.read_line_into(buf) !!) == 1)
     assert(!isset(empty.read_line_into(buf) !!))
+}
+
+class IoChunkedReader is io.Reader {
+    - data: &[u8]
+    - pos: uint (0)
+    - max_chunk: uint
+    ~ calls: uint (0)
+
+    + static fn new(data: &[u8], max_chunk: uint) SELF {
+        return SELF { data: data, max_chunk: max_chunk }
+    }
+
+    + fn read(buf: local mut &[u8]) uint !io.IoError {
+        this.calls++
+        if this.pos >= this.data.length : return 0
+        let rem = this.data.length - this.pos
+        let take = buf.length
+        if take > rem : take = rem
+        if take > this.max_chunk : take = this.max_chunk
+        let i: uint = 0
+        while i < take {
+            buf[i] = this.data[this.pos + i]
+            i++
+        }
+        this.pos += take
+        return take
+    }
+}
+
+class IoShortWriter is io.Writer {
+    + out: ByteBuffer (ByteBuffer.new())
+    - max_chunk: uint
+    ~ calls: uint (0)
+    + fail_after_calls: uint (0)
+
+    + static fn new(max_chunk: uint, fail_after_calls: uint (0)) SELF {
+        return SELF { max_chunk: max_chunk, fail_after_calls: fail_after_calls }
+    }
+
+    + fn write(data: local &[u8]) uint !io.IoError {
+        this.calls++
+        if this.fail_after_calls > 0 && this.calls == this.fail_after_calls {
+            throw .write
+        }
+        let take = data.length
+        if take > this.max_chunk : take = this.max_chunk
+        this.out.write(data.view(0, take))
+        return take
+    }
+}
+
+class IoBrokenWriter is io.Writer {
+    - mode: int
+
+    + fn write(data: local &[u8]) uint !io.IoError {
+        if this.mode == 0 : return 0
+        return data.length + 1
+    }
+}
+
+test "io: write_all and read_exact" {
+    // write_all continues short writes
+    let sw = IoShortWriter.new(2)
+    io.write_all(sw, "abcdefg") ! assert(false)
+    assert(sw.out.to_string() == "abcdefg")
+    assert(sw.calls == 4)
+
+    // Empty write does not call underlying writer
+    let sw_empty = IoShortWriter.new(2)
+    io.write_all(sw_empty, "") ! assert(false)
+    assert(sw_empty.calls == 0)
+
+    // Zero-progress and overreporting writers throw .write
+    let got_write_err = false
+    io.write_all(IoBrokenWriter { mode: 0 }, "x") ! { got_write_err = error_is(E.code, write) }
+    assert(got_write_err)
+    got_write_err = false
+    io.write_all(IoBrokenWriter { mode: 1 }, "x") ! { got_write_err = error_is(E.code, write) }
+    assert(got_write_err)
+
+    // read_exact continues short reads and works with stack arrays
+    let cr = IoChunkedReader.new("hello world", 3)
+    let stack_buf: [u8 x 5] = { 0... }
+    io.read_exact(cr, stack_buf) ! assert(false)
+    assert(stack_buf[0] == 'h' && stack_buf[4] == 'o')
+    assert(cr.calls == 2)
+
+    // Empty read_exact does not call underlying reader
+    let before = cr.calls
+    let empty_buf = [u8]{ 0 x 0 }
+    io.read_exact(cr, empty_buf) ! assert(false)
+    assert(cr.calls == before)
+
+    // Short input throws .closed
+    let too_big = [u8]{ 0 x 20 }
+    let got_closed = false
+    io.read_exact(cr, too_big) ! { got_closed = error_is(E.code, closed) }
+    assert(got_closed)
+
+    // Overreporting reader throws .read
+    let got_read = false
+    let small = [u8]{ 0 x 4 }
+    io.read_exact(OverreportingReader {}, small) ! { got_read = error_is(E.code, read) }
+    assert(got_read)
+}
+
+test "io: copy_n" {
+    let src = "0123456789".reader()
+    let dst = ByteBuffer.new()
+    assert((io.copy_n(src, dst, 0) !!) == 0)
+    assert(src.pos == 0)
+    assert((io.copy_n(src, dst, 4, 2) !!) == 4)
+    assert(dst.to_string() == "0123")
+    assert(src.pos == 4)
+
+    // Stops cleanly when source has fewer bytes than limit
+    dst.clear()
+    assert((io.copy_n(src, dst, 100, 3) !!) == 6)
+    assert(dst.to_string() == "456789")
+}
+
+test "io: BufReader" {
+    // Coalesces small reads into fewer underlying calls
+    let src = IoChunkedReader.new("abcdefghij", 10)
+    let br = io.BufReader.new(src, 8)
+    assert(br.capacity == 8)
+    assert(br.buffered == 0)
+    assert(br.inner() is_a IoChunkedReader)
+
+    assert((br.peek() !!) == 'a')
+    assert(br.buffered == 8)
+    assert(src.calls == 1)
+    assert((br.read_byte() !!) == 'a')
+    assert((br.read_byte() !!) == 'b')
+    assert(br.buffered == 6)
+
+    let piece = [u8]{ 0 x 3 }
+    assert((br.read(piece) !!) == 3)
+    assert(piece.to_string() == "cde")
+    assert(src.calls == 1)
+
+    // fill + consume
+    let view = br.fill() !!
+    assert(view.length == 3 && view[0] == 'f' && view[2] == 'h')
+    br.consume(2)
+    assert(br.buffered == 1)
+    assert((br.read_byte() !!) == 'h')
+    assert(br.buffered == 0)
+
+    // Remaining 2 bytes + EOF
+    assert((br.discard(1) !!) == 1)
+    assert((br.read_byte() !!) == 'j')
+    assert(!isset(br.peek() !!))
+    assert(!isset(br.read_byte() !!))
+    assert((br.discard(5) !!) == 0)
+
+    // Large read when buffer is empty bypasses internal buffer
+    let big_src = IoChunkedReader.new("0123456789abcdef", 16)
+    let big_br = io.BufReader.new(big_src, 4)
+    let big_out = [u8]{ 0 x 10 }
+    assert((big_br.read(big_out) !!) == 10)
+    assert(big_out.to_string() == "0123456789")
+    assert(big_br.buffered == 0)
+    assert(big_src.calls == 1)
+
+    // reset switches reader and drops buffered bytes
+    big_br.reset("xyz".reader())
+    assert(big_br.buffered == 0)
+    assert((big_br.read_byte() !!) == 'x')
+
+    // Mixed text + binary protocol on the same BufReader
+    let proto = io.BufReader.new("LEN 4\r\nDATArest\r".reader(), 3)
+    assert((proto.read_line() !!) == "LEN 4")
+    let payload = [u8]{ 0 x 4 }
+    io.read_exact(proto, payload) ! assert(false)
+    assert(payload.to_string() == "DATA")
+    // Trailing CR without LF is preserved
+    assert((proto.read_line() !!) == "rest\r")
+    assert(!isset(proto.read_line() !!))
+
+    // read_until + read_until_into + read_line_into
+    let delim = io.BufReader.new("k=v;next\r\n".reader(), 2)
+    assert((delim.read_until('=') !!) == "k")
+    let into_buf = ByteBuffer.new()
+    assert((delim.read_until_into(';', into_buf) !!) == 1)
+    assert(into_buf.to_string() == "v")
+    into_buf.clear()
+    assert((delim.read_line_into(into_buf) !!) == 4)
+    assert(into_buf.to_string() == "next")
+}
+
+test "io: BufWriter" {
+    let sink = IoShortWriter.new(100)
+    let bw = io.BufWriter.new(sink, 4)
+    assert(bw.capacity == 4)
+    assert(bw.buffered == 0)
+    assert(bw.available == 4)
+    assert(bw.inner() is_a IoShortWriter)
+
+    // Small writes stay buffered
+    assert((bw.write("ab") !!) == 2)
+    bw.write_byte('c') ! assert(false)
+    assert(bw.buffered == 3)
+    assert(bw.available == 1)
+    assert(sink.calls == 0)
+
+    // Filling past capacity flushes a full 4-byte chunk and buffers remainder
+    assert((bw.write("def") !!) == 3)
+    assert(sink.calls == 1)
+    assert(sink.out.to_string() == "abcd")
+    assert(bw.buffered == 2)
+
+    // Large write flushes pending and bypasses buffer
+    assert((bw.write("01234567") !!) == 8)
+    assert(bw.buffered == 0)
+    assert(sink.out.to_string() == "abcdef01234567")
+
+    // Final write_byte + flush
+    bw.write_byte('!') ! assert(false)
+    assert(bw.buffered == 1)
+    bw.flush() ! assert(false)
+    assert(bw.buffered == 0)
+    assert(sink.out.to_string() == "abcdef01234567!")
+
+    // Partial-progress flush failure keeps only unsent bytes for retry
+    let flaky = IoShortWriter.new(2, 2)
+    let fbw = io.BufWriter.new(flaky, 8)
+    assert((fbw.write("abcdef") !!) == 6)
+    let failed = false
+    fbw.flush() ! { failed = error_is(E.code, write) }
+    assert(failed)
+    assert(flaky.out.to_string() == "ab")
+    assert(fbw.buffered == 4)
+    // Retrying flush sends only the remaining 4 bytes without duplicating "ab"
+    fbw.flush() ! assert(false)
+    assert(flaky.out.to_string() == "abcdef")
+    assert(fbw.buffered == 0)
+
+    // reset switches writer and clears buffer
+    let second = ByteBuffer.new()
+    assert((fbw.write("discarded") !!) == 9)
+    fbw.reset(second)
+    assert(fbw.buffered == 0)
+    assert((fbw.write("ok") !!) == 2)
+    fbw.flush() ! assert(false)
+    assert(second.to_string() == "ok")
+}
+
+test "io: LimitReader, MultiWriter and Discard" {
+    // LimitReader caps reads without consuming past limit
+    let underlying = "abcdefghij".reader()
+    let limited = io.LimitReader.new(underlying, 4)
+    assert(limited.remaining == 4)
+    let out = io.read_all(limited, 2) !!
+    assert(out.to_string() == "abcd")
+    assert(limited.remaining == 0)
+    assert(underlying.pos == 4)
+
+    // Limit 0 never reads underlying
+    let cr = IoChunkedReader.new("xyz", 3)
+    let zero = io.LimitReader.new(cr, 0)
+    let buf = [u8]{ 0 x 4 }
+    assert((zero.read(buf) !!) == 0)
+    assert(cr.calls == 0)
+
+    // LimitReader clamps overreporting reader
+    let over = io.LimitReader.new(OverreportingReader {}, 3)
+    let obuf = [u8]{ 0 x 8 }
+    assert((over.read(obuf) !!) == 3)
+    assert(over.remaining == 0)
+
+    // MultiWriter forwards to all writers including short writers
+    let a = ByteBuffer.new()
+    let b = IoShortWriter.new(2)
+    let c = ByteBuffer.new()
+    let mw = io.MultiWriter.new(a, b)
+    mw.add(c)
+    assert((mw.write("hello!") !!) == 6)
+    assert((mw.write("") !!) == 0)
+    assert(a.to_string() == "hello!")
+    assert(b.out.to_string() == "hello!")
+    assert(c.to_string() == "hello!")
+
+    // Discard accepts everything and caches per thread
+    assert(io.discard() == io.discard())
+    let d: io.Writer = io.discard()
+    assert(d is_a io.Discard)
+    assert((io.copy("discard me".reader(), io.discard(), 3) !!) == 10)
+    assert((io.Discard.new().write("abc") !!) == 3)
 }

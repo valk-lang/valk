@@ -10354,6 +10354,9 @@ Takes the calling thread's GC lock again after `unlock`.
 
 Returns the bytes held by the GC pool blocks of all threads, including free slots.
 
+Flushes the calling thread's counter first; other threads batch their updates in 256 KiB
+steps, so their contributions may lag slightly.
+
 ### release_memory
 
 Collects the calling thread's garbage and returns the memory it frees to the system.
@@ -13000,6 +13003,10 @@ The reference point of a seek offset.
 + fn close(fd: i32) void !IoError
 // Copies `reader` into `writer` until the reader is exhausted and returns the bytes copied.
 + fn copy(reader: Reader, writer: Writer, chunk_size: uint (65536)) uint !IoError
+// Copies up to `limit` bytes from `reader` into `writer` and returns the bytes copied.
++ fn copy_n(reader: Reader, writer: Writer, limit: uint, chunk_size: uint (65536)) uint !IoError
+// Returns an `io.Writer` that discards everything written to it; cached per thread.
++ fn discard() Discard
 // Wakes pending socket I/O on `fd` and makes later I/O on it fail, without releasing it.
 + fn interrupt_fd(fd: i32) void
 // Writes `msg` to standard output, without a newline.
@@ -13010,6 +13017,8 @@ The reference point of a seek offset.
 + fn read(fd: i32, buf: local mut &[u8], offset: uint (uint.$max)) uint !IoError
 // Reads `reader` until it is exhausted and returns everything read.
 + fn read_all(reader: Reader, chunk_size: uint (65536)) ByteBuffer !IoError
+// Fills all of `buf` from `reader`, retrying short reads until every byte is read.
++ fn read_exact(reader: Reader, buf: local mut &[u8]) void !IoError
 // Reads like `read`, but always blocks the thread, even inside a coroutine.
 + fn read_sync(fd: i32, buf: local mut &[u8], offset: uint (uint.$max)) uint !IoError
 // Moves the position of `fd` to `offset` bytes from `from` and returns the new position.
@@ -13030,6 +13039,8 @@ The reference point of a seek offset.
 + fn sync(fd: i32, data_only: bool (false)) void !IoError
 // Writes up to `data.length` bytes of `data` to `fd` and returns the number written.
 + fn write(fd: i32, data: local &[u8], offset: uint (uint.$max)) uint !IoError
+// Writes all of `data` to `writer`, retrying short writes until every byte is written.
++ fn write_all(writer: Writer, data: local &[u8]) void !IoError
 ```
 
 ### await_fd
@@ -13062,6 +13073,17 @@ Copies `reader` into `writer` until the reader is exhausted and returns the byte
 Short writes are continued until each chunk is written; a write of 0 bytes throws `.write`.
 A `.closed` error from the reader counts as the end of input. Reads `chunk_size` bytes at a
 time.
+
+### copy_n
+
+Copies up to `limit` bytes from `reader` into `writer` and returns the bytes copied.
+
+Stops early and returns fewer than `limit` bytes when `reader` reaches the end of input
+(or throws `.closed`). Short writes are continued; a write of 0 bytes throws `.write`.
+
+### discard
+
+Returns an `io.Writer` that discards everything written to it; cached per thread.
 
 ### interrupt_fd
 
@@ -13101,6 +13123,13 @@ Reads `reader` until it is exhausted and returns everything read.
 
 Reads `chunk_size` bytes at a time. A `.closed` error from the reader counts as the end of
 input.
+
+### read_exact
+
+Fills all of `buf` from `reader`, retrying short reads until every byte is read.
+
+Throws `.closed` if the input ends before `buf` is full, and `.read` if `reader` reports
+more bytes than requested.
 
 ### read_sync
 
@@ -13164,7 +13193,199 @@ opened in `fs.WriteMode.append`. Inside a coroutine the call lets other coroutin
 while it waits on Linux and Windows; with epoll only for a non-blocking descriptor. Throws
 `.write`, or `.os` when the request cannot be queued.
 
+### write_all
+
+Writes all of `data` to `writer`, retrying short writes until every byte is written.
+
+Throws `.write` when `writer` accepts 0 bytes or reports more bytes than offered.
+
 ## Classes for 'io'
+
+```js
+// Buffers reads from an `io.Reader` so small reads avoid repeated underlying calls.
++ class BufReader is Reader {
+    // Number of unread bytes currently held in the buffer.
+    + get buffered: uint
+    // Size of the internal buffer in bytes.
+    + get capacity: uint
+    // Marks up to `count` buffered bytes as read.
+    + fn consume(count: uint) void
+    // Skips up to `count` bytes and returns the number of bytes actually skipped.
+    + fn discard(count: uint) uint !IoError
+    // Returns a view of the currently buffered bytes, filling from the underlying reader once if the buffer is empty.
+    + fn fill() &[u8] !IoError
+    // Returns the underlying reader.
+    + fn inner() Reader
+    // Creates a buffered reader over `reader` with an internal buffer of `capacity` bytes (at least 1).
+    + static fn new(reader: Reader, capacity: uint (8192)) BufReader
+    // Returns the next byte without consuming it, or `null` at the end of input.
+    + fn peek() ?u8 !IoError
+    // Reads up to `out.length` bytes into `out` and returns the count; 0 at the end of input.
+    + fn read(out: local mut &[u8]) uint !IoError
+    // Reads and consumes one byte, or returns `null` at the end of input.
+    + fn read_byte() ?u8 !IoError
+    // Returns the next line without its `\n` or `\r\n`, or `null` at the end of input.
+    + fn read_line() ?String !IoError
+    // Writes the next line to `out` without its `\n` or `\r\n` and returns the bytes written, or `null` at the end of input.
+    + fn read_line_into(out: Writer) ?uint !IoError
+    // Returns the bytes up to, not including, the next `delimiter`, or `null` at the end.
+    + fn read_until(delimiter: u8) ?String !IoError
+    // Writes the bytes up to, not including, the next `delimiter` to `out` and returns the bytes written, or `null` at the end of input.
+    + fn read_until_into(delimiter: u8, out: Writer) ?uint !IoError
+    // Switches to `reader` and discards any unread buffered bytes, reusing the buffer.
+    + fn reset(reader: Reader) void
+}
+```
+
+### BufReader
+
+Buffers reads from an `io.Reader` so small reads avoid repeated underlying calls.
+
+Implements `io.Reader` and also supports byte peeking, delimited reads, and line reads
+over the same stream without losing unread bytes.
+
+#### buffered
+
+Number of unread bytes currently held in the buffer.
+
+#### capacity
+
+Size of the internal buffer in bytes.
+
+#### consume
+
+Marks up to `count` buffered bytes as read.
+
+#### discard
+
+Skips up to `count` bytes and returns the number of bytes actually skipped.
+
+#### fill
+
+Returns a view of the currently buffered bytes, filling from the underlying reader
+once if the buffer is empty.
+
+Returns an empty view at the end of input (a `.closed` error counts as end of input).
+The returned view is overwritten by subsequent reads once the buffer is refilled.
+
+#### inner
+
+Returns the underlying reader.
+
+#### new
+
+Creates a buffered reader over `reader` with an internal buffer of `capacity` bytes
+(at least 1).
+
+#### peek
+
+Returns the next byte without consuming it, or `null` at the end of input.
+
+#### read
+
+Reads up to `out.length` bytes into `out` and returns the count; 0 at the end of input.
+
+Large reads when the buffer is empty go straight to the underlying reader without an
+extra copy.
+
+#### read_byte
+
+Reads and consumes one byte, or returns `null` at the end of input.
+
+#### read_line
+
+Returns the next line without its `\n` or `\r\n`, or `null` at the end of input.
+
+#### read_line_into
+
+Writes the next line to `out` without its `\n` or `\r\n` and returns the bytes
+written, or `null` at the end of input.
+
+#### read_until
+
+Returns the bytes up to, not including, the next `delimiter`, or `null` at the end.
+
+#### read_until_into
+
+Writes the bytes up to, not including, the next `delimiter` to `out` and returns the
+bytes written, or `null` at the end of input.
+
+#### reset
+
+Switches to `reader` and discards any unread buffered bytes, reusing the buffer.
+
+```js
+// Buffers writes to an `io.Writer` so small writes are combined into larger chunks.
++ class BufWriter is Writer {
+    // Remaining free space in the buffer before the next flush.
+    + get available: uint
+    // Number of bytes currently waiting in the buffer.
+    + get buffered: uint
+    // Size of the internal buffer in bytes.
+    + get capacity: uint
+    // Writes all buffered bytes to the underlying writer.
+    + fn flush() void !IoError
+    // Returns the underlying writer.
+    + fn inner() Writer
+    // Creates a buffered writer over `writer` with an internal buffer of `capacity` bytes (at least 1).
+    + static fn new(writer: Writer, capacity: uint (8192)) BufWriter
+    // Switches to `writer` and discards any unflushed buffered bytes, reusing the buffer.
+    + fn reset(writer: Writer) void
+    // Writes `data` into the buffer, flushing to the underlying writer when full.
+    + fn write(data: local &[u8]) uint !IoError
+    // Buffers a single byte, flushing first if the buffer is full.
+    + fn write_byte(byte: u8) void !IoError
+}
+```
+
+### BufWriter
+
+Buffers writes to an `io.Writer` so small writes are combined into larger chunks.
+
+Call `flush` when finished writing to ensure all buffered bytes reach the underlying
+writer.
+
+#### available
+
+Remaining free space in the buffer before the next flush.
+
+#### buffered
+
+Number of bytes currently waiting in the buffer.
+
+#### capacity
+
+Size of the internal buffer in bytes.
+
+#### flush
+
+Writes all buffered bytes to the underlying writer.
+
+If a write fails partway through, the remaining unwritten bytes stay at the front of
+the buffer so a later `flush` can retry them without duplicating already-sent bytes.
+
+#### inner
+
+Returns the underlying writer.
+
+#### new
+
+Creates a buffered writer over `writer` with an internal buffer of `capacity` bytes
+(at least 1).
+
+#### reset
+
+Switches to `writer` and discards any unflushed buffered bytes, reusing the buffer.
+
+#### write
+
+Writes `data` into the buffer, flushing to the underlying writer when full.
+
+Returns `data.length`. Large writes bypass the buffer once pending data is flushed.
+
+#### write_byte
+
+Buffers a single byte, flushing first if the buffer is full.
 
 ```js
 // A resource that is released with `close`.
@@ -13181,6 +13402,60 @@ A resource that is released with `close`.
 #### close
 
 Releases the resource.
+
+```js
+// An `io.Writer` that accepts and discards all bytes without doing any work.
++ class Discard is Writer {
+    // Creates a discard writer.
+    + static fn new() Discard
+    // Discards `data` and returns `data.length`.
+    + fn write(data: local &[u8]) uint !IoError
+}
+```
+
+### Discard
+
+An `io.Writer` that accepts and discards all bytes without doing any work.
+
+#### new
+
+Creates a discard writer.
+
+#### write
+
+Discards `data` and returns `data.length`.
+
+```js
+// Reads at most `remaining` bytes from an underlying `io.Reader`.
++ class LimitReader is Reader {
+    // Number of bytes left to read before reporting end of input.
+    ~ remaining: uint
+
+    // Creates a reader that yields at most `limit` bytes from `reader`.
+    + static fn new(reader: Reader, limit: uint) LimitReader
+    // Reads up to `min(buf.length, remaining)` bytes from the underlying reader.
+    + fn read(buf: local mut &[u8]) uint !IoError
+}
+```
+
+### LimitReader
+
+Reads at most `remaining` bytes from an underlying `io.Reader`.
+
+Once the limit reaches 0, `read` returns 0 without reading further from the underlying
+reader.
+
+#### remaining
+
+Number of bytes left to read before reporting end of input.
+
+#### new
+
+Creates a reader that yields at most `limit` bytes from `reader`.
+
+#### read
+
+Reads up to `min(buf.length, remaining)` bytes from the underlying reader.
 
 ```js
 // Reads a `Reader` line by line, buffering its input.
@@ -13244,6 +13519,37 @@ bytes written, or `null` at the end of the input.
 
 The bytes reach `out` as the reader delivers them, so a long line never sits in memory
 as a whole. Throws when the reader or `out` fails.
+
+```js
+// Duplicates every write to all wrapped `io.Writer` targets in order.
++ class MultiWriter is Writer {
+    // Appends another target writer.
+    + fn add(writer: Writer) void
+    // Creates a writer that forwards writes to each writer in `writers`.
+    + static fn new(writers: ...Writer) MultiWriter
+    // Writes all of `data` to every target writer and returns `data.length`.
+    + fn write(data: local &[u8]) uint !IoError
+}
+```
+
+### MultiWriter
+
+Duplicates every write to all wrapped `io.Writer` targets in order.
+
+Short writes on any target are continued with `write_all` before moving to the next.
+Stops and throws on the first target that fails.
+
+#### add
+
+Appends another target writer.
+
+#### new
+
+Creates a writer that forwards writes to each writer in `writers`.
+
+#### write
+
+Writes all of `data` to every target writer and returns `data.length`.
 
 ```js
 // A source of bytes that is read one buffer at a time.
