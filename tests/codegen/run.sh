@@ -1554,6 +1554,131 @@ if [ "$init_count" -lt 1 ] || [ "$exit_count" -lt 2 ]; then
     exit 1
 fi
 
+echo "> Emit explicit LLVM align N for \$align(N) structs and globals"
+align_src="$workdir/explicit-align.valk"
+align_ir="$workdir/explicit-align.ll"
+cat > "$align_src" << 'EOF'
+struct CacheLine $align(64) {
+    counter: uint (0)
+}
+shared g_aligned: uint (0) $align(64)
+fn use_aligned() uint {
+    let local_line = CacheLine { counter: 5 }
+    return local_line.counter + g_aligned
+}
+fn main() {
+    let _ = use_aligned()
+}
+EOF
+if ! out=$("$VALK" build "$align_src" --release --ir --no-warn -o "$align_ir" 2>&1); then
+    echo "# Failed to emit IR for explicit align fixture"
+    echo "$out"
+    exit 1
+fi
+if ! grep -Eq 'g_aligned.*global i64 zeroinitializer, align 64' "$align_ir"; then
+    echo "# Expected align 64 on g_aligned global"
+    grep 'g_aligned' "$align_ir" || true
+    exit 1
+fi
+if ! grep -Eq 'alloca \[8 x i64\], align 64' "$align_ir"; then
+    echo "# Expected align 64 on CacheLine stack alloca"
+    sed -n '/^define .*__use_aligned__/,/^}/p' "$align_ir" || true
+    exit 1
+fi
+
+echo "> Eliminate compile-time false branches in const generic specializations"
+cg_src="$workdir/const-generic-branch.valk"
+cg_ir="$workdir/const-generic-branch.ll"
+cat > "$cg_src" << 'EOF'
+fn pretty_helper(x: int) int $noinline {
+    return x * 100
+}
+fn compact_helper(x: int) int $noinline {
+    return x + 1
+}
+fn emit_mode[const PRETTY: bool](x: int) int $noinline {
+    #if PRETTY
+    return pretty_helper(x)
+    #else
+    return compact_helper(x)
+    #end
+}
+fn main() {
+    let a = emit_mode[false](5)
+    let b = emit_mode[true](5)
+    let _ = a + b
+}
+EOF
+if ! out=$("$VALK" build "$cg_src" --release --ir --no-warn -o "$cg_ir" 2>&1); then
+    echo "# Failed to emit IR for const generic fixture"
+    echo "$out"
+    exit 1
+fi
+compact_fn=$(grep -E '^define .*emit_mode__' "$cg_ir" | while read -r line; do
+    sym=$(echo "$line" | sed -E 's/.*@"([^"]+)".*/\1/')
+    body=$(sed -n "/^define .*@\"$sym\"/,/^}/p" "$cg_ir")
+    if echo "$body" | grep -q 'compact_helper' && ! echo "$body" | grep -q 'pretty_helper'; then
+        echo "$sym"
+    fi
+done)
+pretty_fn=$(grep -E '^define .*emit_mode__' "$cg_ir" | while read -r line; do
+    sym=$(echo "$line" | sed -E 's/.*@"([^"]+)".*/\1/')
+    body=$(sed -n "/^define .*@\"$sym\"/,/^}/p" "$cg_ir")
+    if echo "$body" | grep -q 'pretty_helper' && ! echo "$body" | grep -q 'compact_helper'; then
+        echo "$sym"
+    fi
+done)
+if [ -z "$compact_fn" ] || [ -z "$pretty_fn" ]; then
+    echo "# Expected distinct const-generic specializations with dead branches eliminated"
+    grep -n 'emit_mode__\|pretty_helper\|compact_helper' "$cg_ir" || true
+    exit 1
+fi
+
+echo "> Borrow elements in each loops without copying large structs"
+eb_src="$workdir/each-borrow.valk"
+eb_ir="$workdir/each-borrow.ll"
+cat > "$eb_src" << 'EOF'
+struct BigItem {
+    a: int (0)
+    pad: [u64 x 16]
+}
+fn sum_array_borrow(arr: Array[BigItem]) int $noinline {
+    let total = 0
+    each arr as &item {
+        total += item.a
+    }
+    return total
+}
+fn sum_slice_borrow(items: local &[BigItem]) int $noinline {
+    let total = 0
+    each items as &item {
+        total += item.a
+    }
+    return total
+}
+fn main() {
+    let arr = Array[BigItem]{ BigItem { a: 1 }, BigItem { a: 2 } }
+    let _ = sum_array_borrow(arr) + sum_slice_borrow(arr)
+}
+EOF
+if ! out=$("$VALK" build "$eb_src" --release --ir --no-warn -o "$eb_ir" 2>&1); then
+    echo "# Failed to emit IR for each-borrow fixture"
+    echo "$out"
+    exit 1
+fi
+for fn_name in sum_array_borrow sum_slice_borrow; do
+    body=$(sed -n "/^define .*__${fn_name}__/,/^}/p" "$eb_ir")
+    if [ -z "$body" ]; then
+        echo "# Missing $fn_name in IR"
+        exit 1
+    fi
+    if echo "$body" | grep -Eq 'alloca \[17 x i64\]|llvm\.memcpy'; then
+        echo "# Expected zero-copy element borrow in $fn_name, found struct copy"
+        echo "$body"
+        exit 1
+    fi
+done
+
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 55"
+echo "# Test count: 58"
 echo ""

@@ -1,0 +1,546 @@
+fn region_type_sig_part(t: Type) String {
+    let nn = t.get_non_nullable()
+    let cls = nn.get_class_or_null()
+    if isset(cls) : return nn.kind.to(int).to_string() + ":" + cls.pretty_name()
+    return nn.kind.to(int).to_string()
+}
+
+fn region_callable_sig(type: Type) String {
+    let nn = type.get_non_nullable()
+    let info = nn.get_function_info() ?! return "*"
+    let out = ByteBuffer.new(32)
+    out.write_uint_ascii(info.args.length)
+    out.write(":")
+    each info.args as a, i {
+        if i > 0 : out.write(",")
+        out.write(region_type_sig_part(a))
+    }
+    out.write("->")
+    each info.returns as r, i {
+        if i > 0 : out.write(",")
+        out.write(region_type_sig_part(r))
+    }
+    if isset(info.error_type) : out.write("!")
+    return out.into_string()
+}
+
+fn region_note_sig_coercion(build: Build, from_sig: String, to_sig: String) {
+    build.region_sig_from.append(from_sig)
+    build.region_sig_to.append(to_sig)
+}
+
+fn region_iface_key(func: Func) String {
+    let cls = func.class
+    if isset(cls) : return cls.ns.pkg.identity() + ":" + cls.ns.name + ":" + cls.pretty_name() + "." + func.name
+    return func.name
+}
+
+// Which functions can give up the thread while a region of theirs is alive. `may_suspend` also
+// counts what a collection may run, which reaches nearly everything through the write barrier.
+// A collection does not switch coroutines and a finalizer may not block, so the collector
+// does not count
+fn region_find_suspending(build: Build) {
+    let susp_sigs = build.region_suspending_sigs
+    let susp_ifaces = build.region_suspending_ifaces
+    susp_sigs.clear()
+    susp_ifaces.clear()
+
+    let watched_ifaces = Array[Func]{}
+    let watched_iface_seen = Map[bool]{}
+    each build.lists.units as unit {
+        each unit.functions as func {
+            func.region_suspends = func.suspends_explicitly
+            let ifaces = func.indirect_iface_calls
+            if isset(ifaces) {
+                each ifaces as ifunc {
+                    let key = region_iface_key(ifunc)
+                    if !watched_iface_seen.has(key) {
+                        watched_iface_seen.set(key, true)
+                        watched_ifaces.append(ifunc)
+                    }
+                }
+            }
+        }
+    }
+
+    let changed = true
+    while changed {
+        changed = false
+        each build.lists.units as unit {
+            each unit.functions as func {
+                if !func.region_suspends : continue
+                if func.is_export && !susp_sigs.has("*") {
+                    susp_sigs.set("*", true)
+                    changed = true
+                }
+                let taken = func.taken_sigs
+                if isset(taken) {
+                    each taken as sig {
+                        if !susp_sigs.has(sig) {
+                            susp_sigs.set(sig, true)
+                            changed = true
+                        }
+                    }
+                }
+            }
+        }
+        each build.region_sig_from as from_sig, i {
+            let to_sig = build.region_sig_to[i]
+            if susp_sigs.has(from_sig) && !susp_sigs.has(to_sig) {
+                susp_sigs.set(to_sig, true)
+                changed = true
+            }
+        }
+        each watched_ifaces as ifunc {
+            let key = region_iface_key(ifunc)
+            if susp_ifaces.has(key) : continue
+            let iface = ifunc.class ?! continue
+            each iface.interface_adapters as adapter {
+                let concrete = adapter.interface_concrete ?! continue
+                let impl = concrete.get_func(ifunc.name) ?? ifunc
+                if impl.region_suspends {
+                    susp_ifaces.set(key, true)
+                    changed = true
+                    break
+                }
+            }
+        }
+        let any_susp = susp_sigs.has("*")
+        each build.lists.units as unit {
+            each unit.functions as func {
+                if func.region_suspends : continue
+                let found = false
+                each func.effect_callees as callee {
+                    if !callee.region_suspends || callee.ns.name == "gc" : continue
+                    found = true
+                    break
+                }
+                if !found {
+                    let sigs = func.indirect_call_sigs
+                    if isset(sigs) {
+                        each sigs as sig {
+                            if any_susp || susp_sigs.has(sig) {
+                                found = true
+                                break
+                            }
+                        }
+                    }
+                }
+                if !found {
+                    let ifaces = func.indirect_iface_calls
+                    if isset(ifaces) {
+                        each ifaces as ifunc {
+                            if susp_ifaces.has(region_iface_key(ifunc)) {
+                                found = true
+                                break
+                            }
+                        }
+                    }
+                }
+                if found {
+                    func.region_suspends = true
+                    changed = true
+                }
+            }
+        }
+    }
+}
+
+fn region_solve(build: Build) {
+    if build.region_solved : return
+    build.region_solved = true
+    region_find_suspending(build)
+    let all = Array[RegionFacts]{}
+    each build.region_funcs as func {
+        let f = func.region_facts
+        if isset(f) {
+            f.compute_loop_suspends()
+            all.append(f)
+        }
+    }
+    each all as f {
+        // A caller is listed once: its calls are read together
+        each f.calls as call {
+            let callee = call.callee.region_facts ?! continue
+            let last = callee.callers.get(callee.callers.length - 1) !? null
+            if callee.callers.length == 0 || last != f : callee.callers.append(f)
+        }
+    }
+    // Callees first, so that most functions are read once: `todo` is taken from its end
+    let todo = Array[RegionFacts]{}
+    let path = Array[RegionFacts]{}
+    let at = Array[uint]{}
+    each all as start {
+        if start.queued : continue
+        start.queued = true
+        path.append(start)
+        at.append(0)
+        while path.length > 0 {
+            let f = path[path.length - 1]
+            let next = at[at.length - 1]
+            if next == f.calls.length {
+                todo.append(f)
+                path.pop_last() _
+                at.pop_last() _
+                continue
+            }
+            at[at.length - 1] = next + 1
+            let callee = f.calls[next].callee.region_facts
+            if !isset(callee) || callee.queued : continue
+            callee.queued = true
+            path.append(callee)
+            at.append(0)
+        }
+    }
+    todo.reverse()
+    // A function is read again when a callee learned something. The summaries only grow, so
+    // this ends; the limit is there so that a mistake in that costs speed and not a hanging
+    // compiler. Every function is read at least once, and after the last change of a callee
+    let budget = all.length * REGION_SOLVE_ROUNDS + 1000
+    while true {
+        let f = todo.pop_last() ! break
+        f.queued = false
+        if budget == 0 : return
+        budget--
+        f.rounds++
+        if !f.solve() : continue
+        each f.callers as caller {
+            if caller.queued : continue
+            caller.queued = true
+            todo.append(caller)
+        }
+    }
+    // From none upward: a function that calls itself, or one that does, never gets there
+    let more = true
+    while more {
+        more = false
+        each all as f {
+            if f.bounded || f.lost || !f.is_bounded() : continue
+            f.bounded = true
+            more = true
+        }
+    }
+    each all as f {
+        f.runtime.settled = true
+        break
+    }
+    each all as f : f.set_params()
+    each all as f : f.decide(build)
+    each all as f {
+        each f.calls as call {
+            if !f.call_uses_copy(call, false) : continue
+            let callee = call.callee.region_facts ?! continue
+            callee.mark_copy()
+        }
+    }
+    let spreading = true
+    while spreading {
+        spreading = false
+        each all as f {
+            if f.spread_null(false) : spreading = true
+            if f.needs_copy && f.spread_null(true) : spreading = true
+        }
+    }
+    build.region_decided = true
+}
+
+////////////////////////////
+// IR
+////////////////////////////
+
+fn region_copy_address(func: Func) String {
+    return ir_symbol_address(func_ir_name(func) + ".rg")
+}
+
+fn region_local_name(index: uint) String {
+    return "\%\"rg." + index + "\""
+}
+
+fn region_frame_name(site: uint) String {
+    return "\%\"rg.f" + site + "\""
+}
+
+fn region_passed_name(index: uint) String {
+    return "\%rg.in." + index
+}
+
+fn region_copy_declare(func: Func, regions: uint) String !Error {
+    let out = ByteBuffer.new(128)
+    out.append_text("declare ")
+    out.append_text(ir_func_rett_type(func) !>)
+    out.append_text(" ")
+    out.append_text(region_copy_address(func))
+    out.append_text("(ptr")
+    each 1 .. regions - 1 : out.append_text(", ptr")
+    if ir_func_rett_by_pointer(func) : out.append_text(", ptr")
+    each func.args as arg {
+        out.append_text(", ")
+        out.append_text(ir_param_type(arg.type) !>)
+    }
+    out.append_text(")\n")
+    return out.to_string()
+}
+
+// Writes one form of a function's IR with its structured region patches materialized.
+// `copy`: the form that makes the objects of the groups it grows in the regions its first
+// parameters name. A caller that has one of those groups on the heap passes null for it,
+// and the copy then asks the collector.
+fn region_patch(f: RegionFacts, code: String, copy: bool, unit: Unit, out: ByteBuffer) !Error {
+    let build = f.func.ns.build
+    let runtime = build.region_runtime ?! f.func.exp.bug("Region runtime is missing")
+    let decided = build.region_decided
+    let at: uint = 0
+    // The copy is the function alone
+    let bytes = copy ? f.body_bytes : code.bytes
+    each f.patches as patch {
+        if patch.offset > bytes : break
+        if patch.offset > at : out.append_text(code.range(at, patch.offset - at))
+        at = patch.offset
+        let id = patch.id.to(uint)
+        match patch.kind {
+            REGION_PATCH.copy_suffix => {
+                if copy : out.append_text(".rg")
+            }
+            REGION_PATCH.copy_params_comma, REGION_PATCH.copy_params => {
+                if copy {
+                    each f.params as slot, n {
+                        if n > 0 : out.append_text(", ")
+                        out.append_text("ptr " + region_passed_name(n))
+                    }
+                    if patch.kind == REGION_PATCH.copy_params_comma : out.append_text(", ")
+                }
+            }
+            REGION_PATCH.alloc_fn => {
+                // What makes the object: a region, or the place the frame has for it
+                let site = f.sites.get(id - 1) ! f.func.exp.bug("Region patch of an unknown object")
+                let in_frame = runtime.stack_object
+                out.append_text(ir_func_address(decided && site.stack && isset(in_frame) ? in_frame : runtime.alloc))
+            }
+            REGION_PATCH.alloc_zeroed_fn => {
+                let site = f.sites.get(id - 1) ! f.func.exp.bug("Region patch of an unknown object")
+                let in_frame = runtime.stack_object_zeroed
+                out.append_text(ir_func_address(decided && site.stack && isset(in_frame) ? in_frame : runtime.alloc_zeroed))
+            }
+            REGION_PATCH.site_used, REGION_PATCH.site_ptr => {
+                let site = f.sites.get(id - 1) ! f.func.exp.bug("Region patch of an unknown object")
+                let name = ""
+                let used = "true"
+                if decided && site.stack {
+                    name = region_frame_name(id)
+                } else if decided && copy && site.param != REGION_NONE {
+                    name = region_passed_name(site.param)
+                    if f.may_null[site.param] : used = "\%rg.on." + site.param
+                } else if decided && site.region != REGION_NONE {
+                    name = region_local_name(site.region)
+                }
+                if patch.kind == REGION_PATCH.site_used : out.append_text(name.length > 0 ? used : "false")
+                else : out.append_text(name.length > 0 ? name : "null")
+            }
+            REGION_PATCH.site_field_pin => {
+                // What pins for the fields of an object: its region, when a field can refer to
+                // something of the collector
+                let site = f.sites.get(id - 1) ! f.func.exp.bug("Region patch of an unknown object")
+                if !decided || !site.pins : out.append_text("null")
+                else if copy && site.param != REGION_NONE : out.append_text(region_passed_name(site.param))
+                else if site.region != REGION_NONE : out.append_text(region_local_name(site.region))
+                else : out.append_text("null")
+            }
+            REGION_PATCH.store_pin_mode => {
+                // Bit 0: pin what is stored. Bit 1: object is proven non-heap (skip GC barrier)
+                let pin = f.pins.get(id - 1) ! f.func.exp.bug("Region patch of an unknown store")
+                let pass = pin.pass
+                let does_pin = decided && pass != REGION_NONE && (pass < REGION_PASSED || copy)
+                let plain = pin.plain
+                let is_plain = decided && plain != REGION_NONE && (plain < REGION_PASSED || (copy && !f.may_null[plain - REGION_PASSED]))
+                let mode: uint = (does_pin ? 1 : 0) | (is_plain ? 2 : 0)
+                if mode == 0 : out.append_text("null")
+                else : out.append_text("inttoptr (i64 " + mode + " to ptr)")
+            }
+            REGION_PATCH.call_target => {
+                let call = f.calls.get(id - 1) ! f.func.exp.bug("Region patch of an unknown call")
+                if !decided || !f.call_uses_copy(call, copy) {
+                    out.append_text(ir_func_address(call.callee))
+                    out.append_text("(")
+                } else {
+                    out.append_text(region_copy_address(call.callee))
+                    out.append_text("(")
+                    each 0 .. call.pass_count as n {
+                        let pass = f.call_pass[call.pass_first + n]
+                        if n > 0 : out.append_text(", ")
+                        if pass == REGION_NONE || (pass >= REGION_PASSED && !copy) : out.append_text("ptr null")
+                        else if pass >= REGION_PASSED : out.append_text("ptr " + region_passed_name(pass - REGION_PASSED))
+                        else : out.append_text("ptr " + region_local_name(pass))
+                    }
+                    if call.has_args : out.append_text(", ")
+                    if call.callee.unit != unit {
+                        let symbol = region_copy_address(call.callee)
+                        if !unit.region_declares.has(symbol) : unit.region_declares.set(symbol, region_copy_declare(call.callee, call.pass_count) !>)
+                    }
+                }
+            }
+            REGION_PATCH.func_entry => {
+                if decided && copy {
+                    each f.may_null as may, n {
+                        if may : out.append_text("  \%rg.on." + n + " = icmp ne ptr " + region_passed_name(n) + ", null\n")
+                    }
+                }
+                if decided {
+                    // Non-suspending functions own their regions for the whole call; suspending
+                    // functions initialize non-suspending loop regions on loop entry
+                    if !f.func.region_suspends {
+                        each f.regions as loop, i {
+                            out.append_text("  " + region_local_name(i) + " = call ptr " + ir_func_address(runtime.init) + "()\n")
+                        }
+                    }
+                    // The objects of the frame, each with its header
+                    each f.sites as site, i {
+                        if site.stack : out.append_text("  " + region_frame_name(i + 1) + " = alloca [" + ((site.bytes + 15) / 8) + " x i64]\n")
+                    }
+                }
+            }
+            REGION_PATCH.func_exit => {
+                if decided && !f.func.region_suspends {
+                    let i = f.regions.length
+                    while i-- > 0 {
+                        out.append_text("  call void " + ir_func_address(runtime.exit) + "(ptr " + region_local_name(i) + ")\n")
+                    }
+                }
+            }
+            REGION_PATCH.loop_init => {
+                if decided && f.func.region_suspends {
+                    each f.regions as loop, i {
+                        if loop == id : out.append_text("  " + region_local_name(i) + " = call ptr " + ir_func_address(runtime.init) + "()\n")
+                    }
+                }
+            }
+            REGION_PATCH.loop_exit => {
+                if decided && f.func.region_suspends {
+                    let i = f.regions.length
+                    while i-- > 0 {
+                        if f.regions[i] == id : out.append_text("  call void " + ir_func_address(runtime.exit) + "(ptr " + region_local_name(i) + ")\n")
+                    }
+                }
+            }
+            REGION_PATCH.loop_reset => {
+                if decided {
+                    each f.regions as loop, i {
+                        if loop == id : out.append_text("  call void " + ir_func_address(runtime.reset) + "(ptr " + region_local_name(i) + ")\n")
+                    }
+                }
+            }
+        }
+    }
+    if at < bytes : out.append_text(code.range(at, bytes - at))
+}
+
+// Writes the IR of a function once all is decided: its own form, and the copy when a caller uses it
+fn region_write_ir(func: Func, code: String, unit: Unit, out: ByteBuffer) !Error {
+    let f = func.region_facts
+    if !isset(f) || f.patches.length == 0 {
+        out.append_text(code)
+        return
+    }
+    region_patch(f, code, false, unit, out) !>
+    if f.needs_copy && func.ns.build.region_decided : region_patch(f, code, true, unit, out) !>
+}
+
+////////////////////////////
+// Report
+////////////////////////////
+
+fn region_print_report(build: Build) {
+    region_solve(build)
+    if !build.region_decided && build.region_funcs.length > 0 : println("The analysis did not settle (a compiler bug): nothing is in a region")
+    // One verdict per place in the source; a generic instance that is refused decides it
+    let verdicts = Map[String]{}
+    let places = Array[String]{}
+    let main_pkg = build.main_pkg
+    each build.region_funcs as func {
+        let f = func.region_facts ?! continue
+        f.solve()
+        each f.sites as site {
+            let src = site.src
+            let ns = src.ns
+            if !isset(ns) || ns.pkg != main_pkg : continue
+            let verdict = ""
+            if build.region_decided && site.stack {
+                verdict = "frame of " + func.name
+            } else if build.region_decided && site.region != REGION_NONE {
+                verdict = "region of " + func.name
+                if f.regions[site.region] != 0 : verdict += ", per round of a loop"
+            } else if build.region_decided && site.param != REGION_NONE && f.needs_copy {
+                verdict = "region of a caller"
+            } else if build.region_decided && site.param != REGION_NONE {
+                verdict = "heap: no caller keeps it in a region"
+            } else {
+                verdict = "heap: " + f.heap_reason(site.node)
+            }
+            let display = source_display(src)
+            let place = display.path + ":" + src.line_of(site.at) + "  " + site.name
+            let known = verdicts.get(place) !? ""
+            if known.length == 0 {
+                places.append(place)
+                verdicts.set(place, verdict)
+            } else if verdict.starts_with("heap") && !known.starts_with("heap") {
+                verdicts.set(place, verdict)
+            }
+        }
+        // A call of a function that makes its objects where the caller says
+        each f.calls as call {
+            let src = call.src ?! continue
+            let ns = src.ns
+            if !isset(ns) || ns.pkg != main_pkg : continue
+            let callee = call.callee.region_facts ?! continue
+            if f.lost || callee.lost || !callee.any_grows : continue
+            // The first group of the callee that this function has a region for decides
+            let actual = REGION_NONE
+            let pass = REGION_NONE
+            f.map_call(call, callee, false)
+            // What the callee makes says more than what it only pins for
+            each 0 .. callee.sum_reason.length as g {
+                if callee.grows(g) && callee.sum_made[g] && actual == REGION_NONE : actual = f.runtime.map[g]
+            }
+            each 0 .. callee.sum_reason.length as g {
+                if callee.grows(g) && actual == REGION_NONE : actual = f.runtime.map[g]
+            }
+            each 0 .. call.pass_count as n {
+                if pass == REGION_NONE : pass = f.call_pass[call.pass_first + n]
+            }
+            if pass == REGION_NONE : pass = call.pinned
+            if actual == REGION_NONE : continue
+            // Nothing to say about a call that only writes into objects of the frame
+            if pass == REGION_NONE && f.reason[f.find(actual)] == 0 && f.runtime.reach[f.find(actual)] == REGION_NONE : continue
+            let verdict = ""
+            if build.region_decided && pass != REGION_NONE && pass < REGION_PASSED {
+                verdict = "region of " + func.name
+                if f.regions[pass] != 0 : verdict += ", per round of a loop"
+            } else if build.region_decided && pass != REGION_NONE && f.needs_copy {
+                verdict = "region of a caller"
+            } else if build.region_decided && pass != REGION_NONE {
+                verdict = "heap: no caller keeps it in a region"
+            } else {
+                verdict = "heap: " + f.heap_reason(actual)
+            }
+            let display = source_display(src)
+            let place = display.path + ":" + src.line_of(call.at) + "  call of " + call.callee.name
+            let known = verdicts.get(place) !? ""
+            if known.length == 0 {
+                places.append(place)
+                verdicts.set(place, verdict)
+            } else if verdict.starts_with("heap") && !known.starts_with("heap") {
+                verdicts.set(place, verdict)
+            }
+        }
+    }
+    places.sort(fn(a: String, b: String) bool { return a < b })
+    let in_region: uint = 0
+    let in_frame: uint = 0
+    each places as place {
+        let verdict = verdicts.get(place) !? ""
+        println(place + "  " + verdict)
+        if verdict.starts_with("frame") : in_frame++
+        else if !verdict.starts_with("heap") : in_region++
+    }
+    println("")
+    println("%{places.length} places make objects, %in_region of them in a region, %in_frame in a frame (places in the source, not how often they run)")
+}
