@@ -1575,5 +1575,74 @@ if [[ "$(uname -s)" == "Linux" ]]; then
     fi
 fi
 
+echo ""
+echo "# Test --deny-warnings / -Werror"
+dw_dir="$workdir/deny-warnings"
+mkdir -p "$dw_dir/warn" "$dw_dir/clean" "$dw_dir/dep" "$dw_dir/depr_app"
+cat > "$dw_dir/warn/main.valk" <<'EOF'
+fn main() {
+    let unused = 1
+}
+EOF
+cat > "$dw_dir/clean/main.valk" <<'EOF'
+fn main() {
+    println("clean-ok")
+}
+EOF
+cat > "$dw_dir/dep/valk.json" <<'EOF'
+{ "src": "." }
+EOF
+cat > "$dw_dir/dep/dep.valk" <<'EOF'
+/// Deprecated: old helper.
++ fn old_fn() int $deprecated {
+    return 7
+}
+EOF
+cat > "$dw_dir/depr_app/valk.json" <<'EOF'
+{ "src": ".", "dependencies": { "dep": { "src": "../dep" } } }
+EOF
+cat > "$dw_dir/depr_app/main.valk" <<'EOF'
+use dep
+fn main() {
+    let _ = dep.old_fn()
+}
+EOF
+dw_out_bin="$dw_dir/out_bin"
+rm -f "$dw_out_bin"
+dw_out=$("$VALK" build "$dw_dir/warn/main.valk" --deny-warnings -o "$dw_out_bin" 2>&1) && {
+    echo "# Expected --deny-warnings to fail when a warning is emitted"
+    echo "$dw_out"
+    exit 1
+}
+if [[ "$dw_out" != *"--deny-warnings"* ]] || [ -e "$dw_out_bin" ]; then
+    echo "# Expected --deny-warnings message and no output binary:"
+    echo "$dw_out"
+    exit 1
+fi
+dw_out=$("$VALK" build "$dw_dir/warn/main.valk" -Werror --lint 2>&1) && {
+    echo "# Expected -Werror --lint to fail when a warning is emitted"
+    echo "$dw_out"
+    exit 1
+}
+dw_out=$("$VALK" build "$dw_dir/clean/main.valk" --deny-warnings -o "$dw_out_bin" 2>&1) || {
+    echo "# Expected clean build with --deny-warnings to succeed:"
+    echo "$dw_out"
+    exit 1
+}
+if [[ "$("$dw_out_bin")" != "clean-ok" ]]; then
+    echo "# Clean binary built with --deny-warnings did not run as expected"
+    exit 1
+fi
+dw_out=$("$VALK" build "$dw_dir/depr_app" --lint --no-warn-deprecated --deny-warnings 2>&1) || {
+    echo "# Expected --no-warn-deprecated --deny-warnings to pass when only deprecated warnings exist:"
+    echo "$dw_out"
+    exit 1
+}
+dw_out=$("$VALK" build "$dw_dir/warn/main.valk" --lint --no-warn --deny-warnings 2>&1) || {
+    echo "# Expected --no-warn --deny-warnings to pass:"
+    echo "$dw_out"
+    exit 1
+}
+
 echo "# CLI tests passed"
-echo "# Test count: 86"
+echo "# Test count: 87"
