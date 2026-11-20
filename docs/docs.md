@@ -3426,27 +3426,35 @@ if !public.verify(crypto.SignatureAlgorithm.rsa_pkcs1_sha256, message, signature
 
 API for [valk.compress](api.md#compress)
 
-DEFLATE, zlib and gzip compression, plus the CRC-32 and Adler-32 checksums.
-zlib is DEFLATE with a small header and an Adler-32 trailer (what HTTP calls
-`deflate`); gzip adds a header and a CRC-32 trailer (`.gz` files, HTTP `gzip`).
+DEFLATE, zlib, gzip and Zstandard (zstd) compression, plus the CRC-32 and
+Adler-32 checksums. zlib is DEFLATE with a small header and an Adler-32 trailer
+(what HTTP calls `deflate`); gzip adds a header and a CRC-32 trailer (`.gz`
+files, HTTP `gzip`); zstd (`zstd` / `unzstd`) is a modern, fast format with an
+XXH64 checksum (`.zst` files, HTTP `zstd`).
 
 ```rust
 use valk.compress
 
 fn main() {
     let text = "hello hello hello hello"
-    let packed = compress.gzip(text)          // also: deflate(), zlib()
-    let unpacked = compress.gunzip(packed) ! panic("Corrupt data") // inflate(), unzlib()
+    let packed = compress.gzip(text)          // also: deflate(), zlib(), zstd()
+    let unpacked = compress.gunzip(packed) ! panic("Corrupt data") // inflate(), unzlib(), unzstd()
     println(unpacked == text)
+
+    let zpacked = compress.zstd(text)
+    let zunpacked = compress.unzstd(zpacked) ! panic("Corrupt data")
+    println(zunpacked == text)
 
     let crc = compress.crc32("123456789")      // 0xcbf43926
     let adler = compress.adler32("Wikipedia")  // 0x11e60398
 }
 ```
 
-Levels run from 0 (store only) to 9; the default is 6. Decompression takes an
-optional `max_size` to bound the output of untrusted data. Streams of any size
-go through `Compressor` (an `io.Writer`) and `Decompressor` (an `io.Reader`):
+Levels run from 0 (store only) to 9; the default is 6 for DEFLATE/zlib/gzip and
+3 for zstd. Decompression takes an optional `max_size` to bound the output of
+untrusted data. `_into` variants (`gzip_into`, `zstd_into`, `unzstd_into`, ...)
+write directly to an `io.Writer`. Streams of any size for DEFLATE/zlib/gzip go
+through `Compressor` (an `io.Writer`) and `Decompressor` (an `io.Reader`):
 
 ```rust
 use valk.compress

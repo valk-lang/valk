@@ -1,0 +1,852 @@
+// RFC 8878 Zstandard encoder
+
+value ZSTD_ENC_HASH_BITS (15)
+value ZSTD_ENC_HASH_SIZE (32768)
+value ZSTD_ENC_WIN_SIZE (131072)
+value ZSTD_ENC_WIN_MASK (131071)
+value ZSTD_ENC_NONE (0xffffffff.to(u32))
+
+// LSB-first bit writer for reverse Zstd bitstreams (Huffman and sequences)
+struct ZstdBitWriter {
+    out: ByteBuffer
+    buf: u64 (0)
+    bit_count: uint (0)
+
+    fn write(val: uint, n: uint) $inline {
+        if n == 0 : return
+        let mask = ((1).to(u64) << n.to(u64)) - 1
+        this.buf = this.buf | ((val.to(u64) & mask) << this.bit_count.to(u64))
+        this.bit_count += n
+        while this.bit_count >= 8 {
+            this.out.write_byte((this.buf & 0xff).to(u8))
+            this.buf >>= 8
+            this.bit_count -= 8
+        }
+    }
+
+    // Writes the terminating sentinel 1-bit and flushes the final byte
+    fn finish() {
+        this.write(1, 1)
+        if this.bit_count > 0 {
+            this.out.write_byte((this.buf & 0xff).to(u8))
+            this.buf = 0
+            this.bit_count = 0
+        }
+    }
+}
+
+struct ZstdSeq {
+    ll: u32
+    ml: u32
+    of_val: u32
+}
+
+struct ZstdHufNode {
+    freq: u32 (0)
+    left: i16 (-1)
+    right: i16 (-1)
+    sym: i16 (-1)
+    depth: u8 (0)
+}
+
+class ZstdEncoder {
+    head: [u32 x 32768] ({ 0xffffffff... })
+    prev: [u32 x 131072] ({ 0xffffffff... })
+    literals: ByteBuffer (ByteBuffer.new(4096))
+    blk_buf: ByteBuffer (ByteBuffer.new(4096))
+    huf_buf: ByteBuffer (ByteBuffer.new(4096))
+    huf_s1: ByteBuffer (ByteBuffer.new(1024))
+    huf_s2: ByteBuffer (ByteBuffer.new(1024))
+    huf_s3: ByteBuffer (ByteBuffer.new(1024))
+    huf_s4: ByteBuffer (ByteBuffer.new(1024))
+    seqs: Array[ZstdSeq] (Array[ZstdSeq].new(1024))
+    rep0: uint (1)
+    rep1: uint (4)
+    rep2: uint (8)
+
+    fn reset_frame() {
+        zstd_fill_bytes(@ref(this.head).@cast(*[u8]), 0xff, ZSTD_ENC_HASH_SIZE * 4)
+        this.rep0 = 1
+        this.rep1 = 4
+        this.rep2 = 8
+    }
+
+    fn encode_frame(data: local &[u8], out: ByteBuffer, level: uint) {
+        let p = data.data
+        let len = data.length
+        this.reset_frame()
+
+        // Frame magic (0xFD2FB528)
+        out.write_u32_le(ZSTD_MAGIC.to(u32))
+
+        // Frame Header Descriptor: Single_Segment (if <= 8 MiB) + Content_Checksum (bit 2)
+        let single_seg = len <= 8 * 1024 * 1024
+        let fcs_flag: uint = 0
+        if len <= 255 && single_seg : fcs_flag = 0
+        else if len >= 256 && len <= 65535 + 256 : fcs_flag = 1
+        else if len <= 0xffffffff : fcs_flag = 2
+        else : fcs_flag = 3
+
+        let fhd: uint = (fcs_flag << 6) | (single_seg ? 0x20 : 0) | 0x04
+        out.write_byte(fhd.to(u8))
+        if !single_seg {
+            // Window_Descriptor: 128 KiB (exponent = 7, mantissa = 0 -> 7 << 3 = 56)
+            out.write_byte(56)
+        }
+        if fcs_flag == 0 {
+            out.write_byte(len.to(u8))
+        } else if fcs_flag == 1 {
+            let v = len - 256
+            out.write_byte((v & 0xff).to(u8))
+            out.write_byte(((v >> 8) & 0xff).to(u8))
+        } else if fcs_flag == 2 {
+            out.write_u32_le(len.to(u32))
+        } else {
+            out.write_u32_le((len & 0xffffffff).to(u32))
+            out.write_u32_le((len >> 32).to(u32))
+        }
+
+        if len == 0 {
+            // Empty last Raw_Block (3-byte header: last=1, type=0, size=0)
+            out.write_byte(1)
+            out.write_byte(0)
+            out.write_byte(0)
+        } else {
+            let pos: uint = 0
+            while pos < len {
+                let blk_len = len - pos
+                if blk_len > ZSTD_MAX_BLOCK_SIZE : blk_len = ZSTD_MAX_BLOCK_SIZE
+                let is_last = pos + blk_len >= len
+                this.encode_block(p, pos, blk_len, is_last, level, out)
+                pos += blk_len
+            }
+        }
+
+        // Content checksum: low 32 bits of XXH64(data, 0), little-endian
+        let checksum = (zstd_xxh64(data, 0) & 0xffffffff).to(u32)
+        out.write_u32_le(checksum)
+    }
+
+    fn encode_block(p: *[u8], blk_start: uint, blk_len: uint, is_last: bool, level: uint, out: ByteBuffer) {
+        @unsafe
+        let last_bit: uint = is_last ? 1 : 0
+
+        // Fast path: RLE_Block if all bytes are identical
+        let first = p[blk_start]
+        if blk_len >= 4 && zstd_is_all_byte(p.@offset(blk_start), blk_len, first) {
+            let hdr = last_bit | (1 << 1) | (blk_len << 3)
+            out.write_byte((hdr & 0xff).to(u8))
+            out.write_byte(((hdr >> 8) & 0xff).to(u8))
+            out.write_byte(((hdr >> 16) & 0xff).to(u8))
+            out.write_byte(first)
+            // Update hash chain tail for later blocks when compressing
+            if level > 0 : this.index_tail(p, blk_start, blk_len)
+            return
+        }
+
+        if level == 0 || blk_len < 16 {
+            zstd_write_raw_block(p.@offset(blk_start), blk_len, is_last, out)
+            return
+        }
+
+        // Save repeat offsets in case we fall back to Raw_Block
+        let saved_r0 = this.rep0
+        let saved_r1 = this.rep1
+        let saved_r2 = this.rep2
+
+        this.find_sequences(p, blk_start, blk_len, level)
+        if this.seqs.length == 0 {
+            this.rep0 = saved_r0
+            this.rep1 = saved_r1
+            this.rep2 = saved_r2
+            zstd_write_raw_block(p.@offset(blk_start), blk_len, is_last, out)
+            return
+        }
+
+        this.blk_buf.clear()
+        this.write_literals_section(level)
+        this.write_sequences_section()
+
+        if this.blk_buf.length < blk_len {
+            let hdr = last_bit | (2 << 1) | (this.blk_buf.length << 3)
+            out.write_byte((hdr & 0xff).to(u8))
+            out.write_byte(((hdr >> 8) & 0xff).to(u8))
+            out.write_byte(((hdr >> 16) & 0xff).to(u8))
+            out.write(produced_bytes(this.blk_buf, 0))
+        } else {
+            // Raw_Block is smaller; restore repeat offsets (unchanged by Raw_Block)
+            this.rep0 = saved_r0
+            this.rep1 = saved_r1
+            this.rep2 = saved_r2
+            zstd_write_raw_block(p.@offset(blk_start), blk_len, is_last, out)
+        }
+    }
+
+    fn index_tail(p: *[u8], blk_start: uint, blk_len: uint) {
+        let end = blk_start + blk_len
+        if end < 4 : return
+        let start = blk_len > 32 ? end - 32 : blk_start
+        let i = start
+        while i + 4 <= end {
+            this.insert_hash(p, i)
+            i++
+        }
+    }
+
+    fn insert_hash(p: *[u8], pos: uint) $inline {
+        let h = zstd_hash4(zstd_load_le32(p, pos))
+        this.prev[pos & ZSTD_ENC_WIN_MASK] = this.head[h]
+        this.head[h] = pos.to(u32)
+    }
+
+    fn find_sequences(p: *[u8], blk_start: uint, blk_len: uint, level: uint) {
+        @unsafe
+        this.literals.clear()
+        this.seqs.clear()
+
+        let end = blk_start + blk_len
+        let limit = end >= 4 ? end - 4 : blk_start
+        let max_chain = zstd_chain_for_level(level)
+        let use_lazy = level >= 4
+        let nice_len: uint = level >= 7 ? 128 : (level >= 4 ? 48 : 24)
+
+        let anchor = blk_start
+        let pos = blk_start
+
+        while pos <= limit {
+            let best_len: uint = 0
+            let best_off: uint = 0
+            let ll = pos - anchor
+
+            // Check current repeat offset first
+            let rep_cand = ll > 0 ? this.rep0 : this.rep1
+            if rep_cand > 0 && rep_cand <= pos && rep_cand <= ZSTD_ENC_WIN_SIZE {
+                let rlen = zstd_match_len(p, pos - rep_cand, pos, end)
+                if rlen >= 3 {
+                    best_len = rlen
+                    best_off = rep_cand
+                }
+            }
+
+            if best_len < nice_len {
+                let h = zstd_hash4(zstd_load_le32(p, pos))
+                let cand = this.head[h]
+                this.prev[pos & ZSTD_ENC_WIN_MASK] = cand
+                this.head[h] = pos.to(u32)
+
+                let min_pos = pos > ZSTD_ENC_WIN_SIZE ? pos - ZSTD_ENC_WIN_SIZE : 0
+                let steps: uint = 0
+                while cand != ZSTD_ENC_NONE && steps < max_chain {
+                    if pos + best_len >= end : break
+                    let cpos = cand.to(uint)
+                    if cpos < min_pos || cpos >= pos : break
+                    let dist = pos - cpos
+                    if best_len == 0 || p[cpos + best_len] == p[pos + best_len] {
+                        let mlen = zstd_match_len(p, cpos, pos, end)
+                        let min_need: uint = dist < 65536 ? 3 : 4
+                        if mlen >= min_need {
+                            let beats = best_len == 0
+                                || (best_off == rep_cand ? mlen >= best_len + 2 : (mlen > best_len || (mlen == best_len && dist < best_off)))
+                            if beats {
+                                best_len = mlen
+                                best_off = dist
+                                if best_len >= nice_len : break
+                            }
+                        }
+                    }
+                    let next = this.prev[cpos & ZSTD_ENC_WIN_MASK]
+                    if next.to(uint) >= cpos : break
+                    cand = next
+                    steps++
+                }
+            } else {
+                this.insert_hash(p, pos)
+            }
+
+            if best_len >= 3 {
+                // Lazy matching: check if pos + 1 yields a longer match
+                if use_lazy && best_len < nice_len && pos + 1 <= limit {
+                    let next_pos = pos + 1
+                    let h2 = zstd_hash4(zstd_load_le32(p, next_pos))
+                    let cand2 = this.head[h2]
+                    let min_pos2 = next_pos > ZSTD_ENC_WIN_SIZE ? next_pos - ZSTD_ENC_WIN_SIZE : 0
+                    let best2: uint = 0
+                    let steps2: uint = 0
+                    let lazy_chain = max_chain >> 1
+                    while cand2 != ZSTD_ENC_NONE && steps2 < lazy_chain {
+                        let cpos = cand2.to(uint)
+                        if cpos < min_pos2 || cpos >= next_pos : break
+                        let mlen = zstd_match_len(p, cpos, next_pos, end)
+                        if mlen > best2 : best2 = mlen
+                        if best2 >= best_len + 2 : break
+                        let nxt = this.prev[cpos & ZSTD_ENC_WIN_MASK]
+                        if nxt.to(uint) >= cpos : break
+                        cand2 = nxt
+                        steps2++
+                    }
+                    if best2 >= best_len + 2 {
+                        pos++
+                        continue
+                    }
+                }
+
+                // Append literals [anchor .. pos)
+                if ll > 0 {
+                    let slice = [u8]{ owner: null, data: p.@offset(anchor), length: ll }
+                    this.literals.write(slice)
+                }
+
+                // Resolve repeat-offset code and update rep[0..2]
+                let of_val = this.encode_offset(ll, best_off)
+                this.seqs.append(ZstdSeq { ll: ll.to(u32), ml: best_len.to(u32), of_val: of_val.to(u32) })
+
+                // Index skipped match positions (capped for speed on huge matches)
+                let match_end = pos + best_len
+                let idx_limit = best_len > 64 ? pos + 32 : match_end
+                if idx_limit > limit + 1 : idx_limit = limit + 1
+                let k = pos + 1
+                while k < idx_limit {
+                    this.insert_hash(p, k)
+                    k++
+                }
+                pos = match_end
+                anchor = match_end
+            } else {
+                pos++
+            }
+        }
+
+        // Trailing literals
+        if anchor < end {
+            let tail = [u8]{ owner: null, data: p.@offset(anchor), length: end - anchor }
+            this.literals.write(tail)
+        }
+    }
+
+    // Maps `(ll, offset)` to RFC 8878 `offset_value` and updates `rep[0..2]`
+    fn encode_offset(ll: uint, offset: uint) uint {
+        if ll > 0 {
+            if offset == this.rep0 : return 1
+            if offset == this.rep1 {
+                this.rep1 = this.rep0
+                this.rep0 = offset
+                return 2
+            }
+            if offset == this.rep2 {
+                this.rep2 = this.rep1
+                this.rep1 = this.rep0
+                this.rep0 = offset
+                return 3
+            }
+        } else {
+            if offset == this.rep1 {
+                this.rep1 = this.rep0
+                this.rep0 = offset
+                return 1
+            }
+            if offset == this.rep2 {
+                this.rep2 = this.rep1
+                this.rep1 = this.rep0
+                this.rep0 = offset
+                return 2
+            }
+            if this.rep0 > 1 && offset == this.rep0 - 1 {
+                this.rep2 = this.rep1
+                this.rep1 = this.rep0
+                this.rep0 = offset
+                return 3
+            }
+        }
+        this.rep2 = this.rep1
+        this.rep1 = this.rep0
+        this.rep0 = offset
+        return offset + 3
+    }
+
+    fn write_literals_section(level: uint) {
+        @unsafe
+        let lits = this.literals
+        let n = lits.length
+        let out = this.blk_buf
+
+        // RLE literals check
+        if n >= 4 {
+            let p = lits.data.@cast(*[u8])
+            let first = p[0]
+            if zstd_is_all_byte(p, n, first) {
+                zstd_write_lit_hdr_raw_rle(out, 1, n)
+                out.write_byte(first)
+                return
+            }
+        }
+
+        // Try Huffman compressed literals for ASCII/low-byte blocks
+        if level >= 2 && n >= 64 {
+            if this.try_write_huf_literals(lits, out) : return
+        }
+
+        // Raw_Literals_Block
+        zstd_write_lit_hdr_raw_rle(out, 0, n)
+        if n > 0 : out.write(produced_bytes(lits, 0))
+    }
+
+    // Attempts canonical Huffman encoding with direct 4-bit weights (covers bytes 0..128)
+    fn try_write_huf_literals(lits: ByteBuffer, out: ByteBuffer) bool {
+        @unsafe
+        let p = lits.data.@cast(*[u8])
+        let n = lits.length
+        let freq: [u32 x 256] = { 0... }
+        let max_sym: uint = 0
+        let i: uint = 0
+        while i < n {
+            let b = p[i].to(uint)
+            freq[b] = freq[b] + 1
+            if b > max_sym : max_sym = b
+            i++
+        }
+        // Direct 4-bit weights encode up to 128 weights + 1 implied = symbol 0..128
+        if max_sym == 0 || max_sym > 128 : return false
+
+        // Collect active leaves
+        let nodes: [ZstdHufNode x 260] = { ZstdHufNode {}... }
+        let active: [i16 x 130] = { 0... }
+        let active_count: uint = 0
+        let s: uint = 0
+        while s <= max_sym {
+            if freq[s] > 0 {
+                nodes[active_count] = ZstdHufNode { freq: freq[s], left: -1, right: -1, sym: s.to(i16), depth: 0 }
+                active[active_count] = active_count.to(i16)
+                active_count++
+            }
+            s++
+        }
+        if active_count < 2 : return false
+
+        // Build Huffman tree
+        let next_node = active_count
+        let cur_active = active_count
+        while cur_active > 1 {
+            // Find two lowest-frequency active nodes
+            let m1: uint = 0
+            let m2: uint = 1
+            if nodes[active[m2].to(uint)].freq < nodes[active[m1].to(uint)].freq {
+                let tmp = m1
+                m1 = m2
+                m2 = tmp
+            }
+            let j: uint = 2
+            while j < cur_active {
+                let f = nodes[active[j].to(uint)].freq
+                if f < nodes[active[m1].to(uint)].freq {
+                    m2 = m1
+                    m1 = j
+                } else if f < nodes[active[m2].to(uint)].freq {
+                    m2 = j
+                }
+                j++
+            }
+            let idx1 = active[m1]
+            let idx2 = active[m2]
+            nodes[next_node] = ZstdHufNode {
+                freq: nodes[idx1.to(uint)].freq + nodes[idx2.to(uint)].freq
+                left: idx1
+                right: idx2
+                sym: -1
+                depth: 0
+            }
+            // Replace m1 with parent, swap last into m2
+            let hi = m1 > m2 ? m1 : m2
+            let lo = m1 < m2 ? m1 : m2
+            active[lo] = next_node.to(i16)
+            cur_active--
+            if hi < cur_active : active[hi] = active[cur_active]
+            next_node++
+        }
+
+        // Compute depths top-down (root is next_node - 1)
+        let root = next_node - 1
+        nodes[root].depth = 0
+        let k = root
+        while true {
+            let l = nodes[k].left
+            let r = nodes[k].right
+            let d = nodes[k].depth + 1
+            if l >= 0 : nodes[l.to(uint)].depth = d
+            if r >= 0 : nodes[r.to(uint)].depth = d
+            if k == 0 : break
+            k--
+        }
+
+        // Enforce max code length <= 11 using Kraft sum balancing
+        let lengths: [u8 x 130] = { 0... }
+        let leaf_syms: [u8 x 130] = { 0... }
+        let leaf_freqs: [u32 x 130] = { 0... }
+        let max_bits: uint = 0
+        i = 0
+        while i < active_count {
+            let d = nodes[i].depth.to(uint)
+            if d > 11 : d = 11
+            if d > max_bits : max_bits = d
+            lengths[i] = d.to(u8)
+            leaf_syms[i] = nodes[i].sym.to(u8)
+            leaf_freqs[i] = nodes[i].freq
+            i++
+        }
+        if max_bits == 0 || max_bits > 11 : return false
+
+        let target = (1).to(uint) << max_bits
+        let kraft: uint = 0
+        i = 0
+        while i < active_count {
+            kraft += (1).to(uint) << (max_bits - lengths[i].to(uint))
+            i++
+        }
+        // Oversubscribed after clamping: lengthen lowest-frequency short codes
+        while kraft > target {
+            let best: int = -1
+            let best_f: u32 = 0xffffffff
+            i = 0
+            while i < active_count {
+                if lengths[i] < 11 && leaf_freqs[i] < best_f {
+                    best_f = leaf_freqs[i]
+                    best = i.to(int)
+                }
+                i++
+            }
+            if best < 0 : return false
+            let bi = best.to(uint)
+            let old_len = lengths[bi].to(uint)
+            kraft -= (1).to(uint) << (max_bits - old_len - 1)
+            lengths[bi] = (old_len + 1).to(u8)
+        }
+        // Undersubscribed: shorten highest-frequency codes that fit
+        while kraft < target {
+            let room = target - kraft
+            let best: int = -1
+            let best_f: u32 = 0
+            i = 0
+            while i < active_count {
+                let len = lengths[i].to(uint)
+                if len > 1 {
+                    let add = (1).to(uint) << (max_bits - len)
+                    if add <= room && leaf_freqs[i] >= best_f {
+                        best_f = leaf_freqs[i]
+                        best = i.to(int)
+                    }
+                }
+                i++
+            }
+            if best < 0 : return false
+            let bi = best.to(uint)
+            let old_len = lengths[bi].to(uint)
+            kraft += (1).to(uint) << (max_bits - old_len)
+            lengths[bi] = (old_len - 1).to(u8)
+        }
+
+        // Convert lengths to weights and assign RFC 8878 canonical codes
+        let weights: [u8 x 130] = { 0... }
+        let rank_count: [u16 x 13] = { 0... }
+        i = 0
+        while i < active_count {
+            let sym = leaf_syms[i].to(uint)
+            let w = max_bits + 1 - lengths[i].to(uint)
+            weights[sym] = w.to(u8)
+            rank_count[w] = rank_count[w] + 1
+            i++
+        }
+
+        let rank_idx: [u16 x 13] = { 0... }
+        let w: uint = 1
+        while w <= max_bits {
+            rank_idx[w + 1] = (rank_idx[w].to(uint) + (rank_count[w].to(uint) << (w - 1))).to(u16)
+            w++
+        }
+
+        let codes: [u16 x 130] = { 0... }
+        let code_nb: [u8 x 130] = { 0... }
+        s = 0
+        while s <= max_sym {
+            let sw = weights[s].to(uint)
+            if sw > 0 {
+                let nb = max_bits + 1 - sw
+                let start = rank_idx[sw].to(uint)
+                codes[s] = (start >> (sw - 1)).to(u16)
+                code_nb[s] = nb.to(u8)
+                rank_idx[sw] = (start + ((1).to(uint) << (sw - 1))).to(u16)
+            }
+            s++
+        }
+
+        // Encode payload into `this.huf_buf`: tree header + compressed stream(s)
+        let hb = this.huf_buf
+        hb.clear()
+        // Direct 4-bit weights: `num_weights = max_sym` (symbol `max_sym` is implied)
+        hb.write_byte((127 + max_sym).to(u8))
+        i = 0
+        while i < max_sym {
+            let hi = weights[i].to(uint)
+            let lo = (i + 1 < max_sym) ? weights[i + 1].to(uint) : 0
+            hb.write_byte(((hi << 4) | lo).to(u8))
+            i += 2
+        }
+
+        let four_streams = n >= 256
+        if !four_streams {
+            zstd_encode_huf_stream(p, 0, n, @ref(codes).@cast(*[u16]), @ref(code_nb).@cast(*[u8]), hb)
+        } else {
+            let chunk = (n + 3) >> 2
+            if 3 * chunk > n : return false
+            let chunk4 = n - 3 * chunk
+            this.huf_s1.clear()
+            this.huf_s2.clear()
+            this.huf_s3.clear()
+            this.huf_s4.clear()
+            zstd_encode_huf_stream(p, 0, chunk, @ref(codes).@cast(*[u16]), @ref(code_nb).@cast(*[u8]), this.huf_s1)
+            zstd_encode_huf_stream(p, chunk, chunk, @ref(codes).@cast(*[u16]), @ref(code_nb).@cast(*[u8]), this.huf_s2)
+            zstd_encode_huf_stream(p, chunk * 2, chunk, @ref(codes).@cast(*[u16]), @ref(code_nb).@cast(*[u8]), this.huf_s3)
+            zstd_encode_huf_stream(p, chunk * 3, chunk4, @ref(codes).@cast(*[u16]), @ref(code_nb).@cast(*[u8]), this.huf_s4)
+            if this.huf_s1.length > 65535 || this.huf_s2.length > 65535 || this.huf_s3.length > 65535 : return false
+            hb.write_byte((this.huf_s1.length & 0xff).to(u8))
+            hb.write_byte(((this.huf_s1.length >> 8) & 0xff).to(u8))
+            hb.write_byte((this.huf_s2.length & 0xff).to(u8))
+            hb.write_byte(((this.huf_s2.length >> 8) & 0xff).to(u8))
+            hb.write_byte((this.huf_s3.length & 0xff).to(u8))
+            hb.write_byte(((this.huf_s3.length >> 8) & 0xff).to(u8))
+            hb.write(produced_bytes(this.huf_s1, 0))
+            hb.write(produced_bytes(this.huf_s2, 0))
+            hb.write(produced_bytes(this.huf_s3, 0))
+            hb.write(produced_bytes(this.huf_s4, 0))
+        }
+
+        let comp_size = hb.length
+        // Determine header size and check if Huffman actually shrinks literals
+        let hdr_size: uint = 5
+        let size_fmt: uint = 3
+        if !four_streams && n < 1024 && comp_size < 1024 {
+            size_fmt = 0
+            hdr_size = 3
+        } else if four_streams && n < 1024 && comp_size < 1024 {
+            size_fmt = 1
+            hdr_size = 3
+        } else if four_streams && n < 16384 && comp_size < 16384 {
+            size_fmt = 2
+            hdr_size = 4
+        } else if !four_streams {
+            return false
+        }
+
+        let raw_hdr: uint = n < 32 ? 1 : (n < 4096 ? 2 : 3)
+        if hdr_size + comp_size >= raw_hdr + n : return false
+
+        // Write Compressed_Literals_Block header (lit_type = 2)
+        if size_fmt == 0 || size_fmt == 1 {
+            let v = 2 | (size_fmt << 2) | (n << 4) | (comp_size << 14)
+            out.write_byte((v & 0xff).to(u8))
+            out.write_byte(((v >> 8) & 0xff).to(u8))
+            out.write_byte(((v >> 16) & 0xff).to(u8))
+        } else if size_fmt == 2 {
+            let v = 2 | (2 << 2) | (n << 4) | (comp_size << 18)
+            out.write_u32_le(v.to(u32))
+        } else {
+            let v: u64 = 2 | (3 << 2) | (n.to(u64) << 4) | (comp_size.to(u64) << 22)
+            out.write_u32_le((v & 0xffffffff).to(u32))
+            out.write_byte(((v >> 32) & 0xff).to(u8))
+        }
+        out.write(produced_bytes(hb, 0))
+        return true
+    }
+
+    fn write_sequences_section() {
+        let out = this.blk_buf
+        let num_seq = this.seqs.length
+
+        // Number_of_Sequences header
+        if num_seq < 128 {
+            out.write_byte(num_seq.to(u8))
+        } else if num_seq < 0x7f00 {
+            out.write_byte(((num_seq >> 8) + 128).to(u8))
+            out.write_byte((num_seq & 0xff).to(u8))
+        } else {
+            let v = num_seq - 0x7f00
+            out.write_byte(255)
+            out.write_byte((v & 0xff).to(u8))
+            out.write_byte(((v >> 8) & 0xff).to(u8))
+        }
+
+        // Check if LL, OF, or ML codes are constant across all sequences (RLE mode = 1)
+        let first = this.seqs.get(0) ! panic("unreachable")
+        let ll_c0 = zstd_ll_code(first.ll.to(uint))
+        let of_c0 = zstd_high_bit(first.of_val.to(uint))
+        let ml_c0 = zstd_ml_code(first.ml.to(uint))
+        let ll_rle = true
+        let of_rle = true
+        let ml_rle = true
+        let i: uint = 1
+        while i < num_seq {
+            let sq = this.seqs.get(i) ! break
+            if ll_rle && zstd_ll_code(sq.ll.to(uint)) != ll_c0 : ll_rle = false
+            if of_rle && zstd_high_bit(sq.of_val.to(uint)) != of_c0 : of_rle = false
+            if ml_rle && zstd_ml_code(sq.ml.to(uint)) != ml_c0 : ml_rle = false
+            if !ll_rle && !of_rle && !ml_rle : break
+            i++
+        }
+
+        let ll_mode: uint = ll_rle ? 1 : 0
+        let of_mode: uint = of_rle ? 1 : 0
+        let ml_mode: uint = ml_rle ? 1 : 0
+        out.write_byte(((ll_mode << 6) | (of_mode << 4) | (ml_mode << 2)).to(u8))
+        if ll_rle : out.write_byte(ll_c0.to(u8))
+        if of_rle : out.write_byte(of_c0.to(u8))
+        if ml_rle : out.write_byte(ml_c0.to(u8))
+
+        let defs = @ref(zstd_defaults)
+        let bw = ZstdBitWriter { out: out }
+
+        // Encode sequences in reverse order (last -> first)
+        let last_seq = this.seqs.get(num_seq - 1) ! panic("unreachable")
+        let last_ll = last_seq.ll.to(uint)
+        let last_ml = last_seq.ml.to(uint)
+        let last_ov = last_seq.of_val.to(uint)
+        let last_ll_c = zstd_ll_code(last_ll)
+        let last_of_c = zstd_high_bit(last_ov)
+        let last_ml_c = zstd_ml_code(last_ml)
+
+        let ll_st: uint = ll_rle ? 0 : defs.ll_init[last_ll_c].to(uint)
+        let of_st: uint = of_rle ? 0 : defs.of_init[last_of_c].to(uint)
+        let ml_st: uint = ml_rle ? 0 : defs.ml_init[last_ml_c].to(uint)
+
+        // Last sequence extra bits in reverse of decoder order: LL, ML, OF
+        bw.write(last_ll - zstd_ll_base[last_ll_c].to(uint), zstd_ll_bits[last_ll_c].to(uint))
+        bw.write(last_ml - zstd_ml_base[last_ml_c].to(uint), zstd_ml_bits[last_ml_c].to(uint))
+        bw.write(last_ov - ((1).to(uint) << last_of_c), last_of_c)
+
+        let idx = num_seq - 1
+        while idx > 0 {
+            idx--
+            let sq = this.seqs.get(idx) ! break
+            let ll = sq.ll.to(uint)
+            let ml = sq.ml.to(uint)
+            let ov = sq.of_val.to(uint)
+            let ll_c = zstd_ll_code(ll)
+            let of_c = zstd_high_bit(ov)
+            let ml_c = zstd_ml_code(ml)
+
+            // Transition states and write state-update bits in reverse order: OF, ML, LL
+            let of_nb: uint = 0
+            let of_b: uint = 0
+            if !of_rle {
+                let e = defs.of_enc[of_c * 32 + of_st].to(uint)
+                of_st = e & 0xff
+                of_nb = (e >> 8) & 0xff
+                of_b = e >> 16
+            }
+            let ml_nb: uint = 0
+            let ml_b: uint = 0
+            if !ml_rle {
+                let e = defs.ml_enc[ml_c * 64 + ml_st].to(uint)
+                ml_st = e & 0xff
+                ml_nb = (e >> 8) & 0xff
+                ml_b = e >> 16
+            }
+            let ll_nb: uint = 0
+            let ll_b: uint = 0
+            if !ll_rle {
+                let e = defs.ll_enc[ll_c * 64 + ll_st].to(uint)
+                ll_st = e & 0xff
+                ll_nb = (e >> 8) & 0xff
+                ll_b = e >> 16
+            }
+            bw.write(of_b, of_nb)
+            bw.write(ml_b, ml_nb)
+            bw.write(ll_b, ll_nb)
+
+            // Extra bits in reverse order: LL, ML, OF
+            bw.write(ll - zstd_ll_base[ll_c].to(uint), zstd_ll_bits[ll_c].to(uint))
+            bw.write(ml - zstd_ml_base[ml_c].to(uint), zstd_ml_bits[ml_c].to(uint))
+            bw.write(ov - ((1).to(uint) << of_c), of_c)
+        }
+
+        // Initial states in reverse of decoder order: ML, OF, LL
+        if !ml_rle : bw.write(ml_st, 6)
+        if !of_rle : bw.write(of_st, 5)
+        if !ll_rle : bw.write(ll_st, 6)
+        bw.finish()
+    }
+}
+
+fn zstd_encode_huf_stream(p: *[u8], start: uint, len: uint, codes: *[u16], code_nb: *[u8], out: ByteBuffer) {
+    @unsafe
+    let bw = ZstdBitWriter { out: out }
+    let i = len
+    while i > 0 {
+        i--
+        let sym = p[start + i].to(uint)
+        bw.write(codes[sym].to(uint), code_nb[sym].to(uint))
+    }
+    bw.finish()
+}
+
+fn zstd_write_lit_hdr_raw_rle(out: ByteBuffer, lit_type: uint, size: uint) {
+    if size < 32 {
+        out.write_byte((lit_type | (size << 3)).to(u8))
+    } else if size < 4096 {
+        let v = lit_type | (1 << 2) | (size << 4)
+        out.write_byte((v & 0xff).to(u8))
+        out.write_byte(((v >> 8) & 0xff).to(u8))
+    } else {
+        let v = lit_type | (3 << 2) | (size << 4)
+        out.write_byte((v & 0xff).to(u8))
+        out.write_byte(((v >> 8) & 0xff).to(u8))
+        out.write_byte(((v >> 16) & 0xff).to(u8))
+    }
+}
+
+fn zstd_write_raw_block(p: *[u8], len: uint, is_last: bool, out: ByteBuffer) {
+    @unsafe
+    let hdr = (is_last ? 1 : 0) | (len << 3)
+    out.write_byte((hdr & 0xff).to(u8))
+    out.write_byte(((hdr >> 8) & 0xff).to(u8))
+    out.write_byte(((hdr >> 16) & 0xff).to(u8))
+    let slice = [u8]{ owner: null, data: p, length: len }
+    out.write(slice)
+}
+
+fn zstd_hash4(v: u32) uint $inline {
+    return ((v * 0x9e3779b1.to(u32)) >> (32 - ZSTD_ENC_HASH_BITS)).to(uint)
+}
+
+fn zstd_chain_for_level(level: uint) uint {
+    if level <= 1 : return 2
+    if level == 2 : return 4
+    if level == 3 : return 8
+    if level == 4 : return 16
+    if level == 5 : return 24
+    if level == 6 : return 32
+    if level == 7 : return 64
+    if level == 8 : return 128
+    return 256
+}
+
+fn zstd_is_all_byte(p: *[u8], len: uint, b: u8) bool {
+    @unsafe
+    let i: uint = 0
+    while i < len {
+        if p[i] != b : return false
+        i++
+    }
+    return true
+}
+
+fn zstd_match_len(p: *[u8], a: uint, b: uint, end: uint) uint $inline {
+    @unsafe
+    let max_len = end - b
+    let m: uint = 0
+    while m + 8 <= max_len {
+        if zstd_load_le64(p, a + m) != zstd_load_le64(p, b + m) : break
+        m += 8
+    }
+    while m < max_len && p[a + m] == p[b + m] {
+        m++
+    }
+    return m
+}

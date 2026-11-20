@@ -1,0 +1,401 @@
+use valk.compress
+use valk.core
+use valk.fs
+use valk.http
+use valk.io
+use valk.time
+
+// Deterministic pseudo-random bytes (incompressible)
+fn zstd_pseudo_random(len: uint, seed: u64 (0x123456789abcdef0)) String {
+    let out = ByteBuffer.new(len)
+    let x = seed
+    let i: uint = 0
+    while i < len {
+        x = x ^ (x << 13)
+        x = x ^ (x >> 7)
+        x = x ^ (x << 17)
+        out.write_byte((x & 0xff).to(u8))
+        i++
+    }
+    return out.into_string()
+}
+
+// Structured JSON payload with repetition and varied literals
+fn zstd_sample_json(count: uint) String {
+    let buf = ByteBuffer.new(count * 80)
+    buf.write("[")
+    let i: uint = 0
+    while i < count {
+        if i > 0 : buf.write(",")
+        buf.write("{\"id\":")
+        buf.write_uint_ascii(i)
+        buf.write(",\"name\":\"user_")
+        buf.write_uint_ascii(i % 37)
+        buf.write("\",\"active\":")
+        buf.write((i & 1) == 0 ? "true" : "false")
+        buf.write(",\"tags\":[\"alpha\",\"beta\",\"gamma\",\"valk\"]}")
+        i++
+    }
+    buf.write("]")
+    return buf.into_string()
+}
+
+// Non-ByteBuffer io.Writer for testing zstd_into / unzstd_into streaming path
+class ZstdSliceWriter is io.Writer {
+    buf: ByteBuffer (ByteBuffer.new(256))
+    max_chunk: uint (19)
+
+    + fn write(data: local &[u8]) uint !io.IoError {
+        let take = data.length > this.max_chunk ? this.max_chunk : data.length
+        this.buf.write(data.view(0, take))
+        return take
+    }
+}
+
+test "compress.zstd: round-trip across inputs and levels" {
+    let samples = Array[String]{
+        "",
+        "a",
+        "hello world",
+        "aaaa",
+        "a".repeat(20000),
+        "abc".repeat(5000),
+        "The quick brown fox jumps over the lazy dog. ".repeat(100),
+        zstd_sample_json(400),
+        zstd_pseudo_random(4096),
+        zstd_pseudo_random(64),
+        // High-byte UTF-8 and binary values 0..255
+        "héllo wörld 🚀 日本語テスト ".repeat(80),
+    }
+
+    // Add a payload with all 256 byte values repeated
+    let all_bytes = ByteBuffer.new(256 * 20)
+    let r: uint = 0
+    while r < 20 {
+        let b: uint = 0
+        while b < 256 {
+            all_bytes.write_byte(b.to(u8))
+            b++
+        }
+        r++
+    }
+    samples.append(all_bytes.into_string())
+
+    let levels = Array[uint]{ 0, 1, 2, 3, 6, 9, 15 }
+    each samples as sample {
+        each levels as level {
+            let compressed = compress.zstd(sample, level)
+            let restored = compress.unzstd(compressed) !!
+            assert(restored == sample)
+        }
+    }
+
+    // Verify real compression ratio on repetitive and structured data
+    let rle_in = "x".repeat(50000)
+    let rle_out = compress.zstd(rle_in)
+    assert(rle_out.bytes < 32)
+    assert(compress.unzstd(rle_out) !! == rle_in)
+
+    let json_in = zstd_sample_json(800)
+    let json_zst = compress.zstd(json_in, 3)
+    assert(json_zst.bytes * 4 < json_in.bytes)
+    assert(compress.unzstd(json_zst) !! == json_in)
+
+    // Incompressible data never bloats beyond tiny framing overhead
+    let rand_in = zstd_pseudo_random(8192)
+    let rand_zst = compress.zstd(rand_in, 3)
+    assert(rand_zst.bytes <= rand_in.bytes + 32)
+    assert(compress.unzstd(rand_zst) !! == rand_in)
+}
+
+test "compress.zstd: multi-block input (>256 KiB)" {
+    let big = ByteBuffer.new(300000)
+    big.write(zstd_sample_json(1800))
+    big.write("Z".repeat(140000))
+    big.write(zstd_pseudo_random(30000))
+    big.write("The quick brown fox jumps over the lazy dog.\n".repeat(2000))
+    let payload = big.into_string()
+    assert(payload.bytes > 262144)
+
+    let c1 = compress.zstd(payload, 1)
+    assert(compress.unzstd(c1) !! == payload)
+
+    let c6 = compress.zstd(payload, 6)
+    assert(c6.bytes < payload.bytes / 2)
+    assert(compress.unzstd(c6) !! == payload)
+}
+
+test "compress.zstd_into and unzstd_into" {
+    let payload = zstd_sample_json(250)
+
+    // Into ByteBuffer
+    let bbuf = ByteBuffer.new(64)
+    let c_len = compress.zstd_into(payload, bbuf, 3) !!
+    assert(c_len == bbuf.length)
+    let out_bb = ByteBuffer.new(64)
+    let d_len = compress.unzstd_into(bbuf, out_bb) !!
+    assert(d_len == payload.bytes)
+    assert(out_bb.to_string() == payload)
+
+    // Into custom chunked io.Writer
+    let cw = ZstdSliceWriter {}
+    let c_len2 = compress.zstd_into(payload, cw, 3) !!
+    assert(c_len2 == cw.buf.length)
+    let dw = ZstdSliceWriter {}
+    let d_len2 = compress.unzstd_into(cw.buf, dw) !!
+    assert(d_len2 == payload.bytes)
+    assert(dw.buf.to_string() == payload)
+}
+
+test "compress.unzstd: concatenated and skippable frames" {
+    let f1 = compress.zstd("hello ")
+    let f2 = compress.zstd("zstd ")
+    let f3 = compress.zstd("world!".repeat(50))
+
+    // Build a skippable frame (magic 0x184D2A55, 5 bytes payload)
+    let skip = ByteBuffer.new(16)
+    skip.write_u32_le(0x184d2a55)
+    skip.write_u32_le(5)
+    skip.write("hello")
+
+    let combined = ByteBuffer.new(256)
+    combined.write(f1)
+    combined.write(skip)
+    combined.write(f2)
+    combined.write(f3)
+
+    let out = compress.unzstd(combined) !!
+    assert(out == "hello zstd " + "world!".repeat(50))
+}
+
+test "compress.unzstd: errors (truncated, invalid, checksum, too_large)" {
+    // Empty input -> truncated
+    let got_trunc = false
+    compress.unzstd("") ! { got_trunc = error_is(E.code, truncated) }
+    assert(got_trunc)
+
+    let sample = zstd_sample_json(100)
+    let valid = compress.zstd(sample, 3)
+
+    // Truncated at various points
+    let cuts = Array[uint]{ 1, 3, 5, valid.bytes / 2, valid.bytes - 1 }
+    each cuts as cut {
+        let ok = false
+        compress.unzstd(valid.range(0, cut)) ! {
+            ok = error_is(E.code, truncated) || error_is(E.code, invalid_input)
+        }
+        assert(ok)
+    }
+
+    // Wrong magic -> invalid_input
+    let bad_magic = false
+    compress.unzstd("\x00\x01\x02\x03\x04\x05\x06\x07") ! { bad_magic = error_is(E.code, invalid_input) }
+    assert(bad_magic)
+
+    // Corrupted checksum (flip last byte) -> checksum
+    let bad_sum_buf = ByteBuffer.new(valid.bytes)
+    bad_sum_buf.write(valid)
+    let last_idx = bad_sum_buf.length - 1
+    let last_b = bad_sum_buf.view(last_idx, 1)[0]
+    let flipped = ByteBuffer.new(valid.bytes)
+    flipped.write(valid.range(0, last_idx))
+    flipped.write_byte(last_b ^ 0x01)
+    let got_checksum = false
+    compress.unzstd(flipped) ! { got_checksum = error_is(E.code, checksum) }
+    assert(got_checksum)
+
+    // Reserved bit set in FHD (bit 3) -> invalid_input
+    let bad_fhd = ByteBuffer.new(16)
+    bad_fhd.write_u32_le(0xfd2fb528)
+    bad_fhd.write_byte(0x28) // single_segment + reserved bit 3
+    bad_fhd.write_byte(0)
+    bad_fhd.write_byte(1)
+    bad_fhd.write_byte(0)
+    bad_fhd.write_byte(0)
+    let got_inv = false
+    compress.unzstd(bad_fhd) ! { got_inv = error_is(E.code, invalid_input) }
+    assert(got_inv)
+
+    // Decompression bomb guard (`max_size`) -> too_large
+    let got_large = false
+    compress.unzstd(valid, 100) ! { got_large = error_is(E.code, too_large) }
+    assert(got_large)
+
+    // Exact max_size succeeds
+    assert(compress.unzstd(valid, sample.bytes) !! == sample)
+}
+
+test "compress.zstd: cross-interop with system zstd CLI" {
+    // Skip gracefully if `zstd` CLI is not installed
+    let ver = core.Process.output("zstd", .{ "--version" }) ! return
+    if ver.code != 0 : return
+
+    let cases = Array[String]{
+        "",
+        "x",
+        "hello zstd world!",
+        "A".repeat(40000),
+        "0123456789abcdef".repeat(3000),
+        zstd_sample_json(1200),
+        zstd_pseudo_random(16384),
+        "héllo 🚀 naïve café 日本語 ".repeat(500),
+    }
+
+    // 1) Reference `zstd` compresses at -1, -3, -9, -19 -> Valk `compress.unzstd` decodes!
+    // Exercises FSE-compressed Huffman weights, 4-stream Huffman, treeless literals,
+    // custom FSE tables, repeat FSE tables, RLE modes, repeat offsets, and checksums.
+    let cli_levels = Array[String]{ "-1", "-3", "-9", "-19" }
+    // Also add real multi-block source-like text (>200 KiB)
+    let big_src = ByteBuffer.new(220000)
+    let rep: uint = 0
+    while rep < 1500 {
+        big_src.write("fn handle_item_")
+        big_src.write_uint_ascii(rep)
+        big_src.write("(x: uint, label: String) bool { return x > 42 && label.bytes > 0 }\n")
+        rep++
+    }
+    cases.append(big_src.into_string())
+
+    each cases as payload {
+        each cli_levels as lvl {
+            let res = core.Process.output("zstd", .{ "-c", "-q", "--check", lvl }, payload) !!
+            assert(res.code == 0)
+            let decoded = compress.unzstd(res.stdout) !!
+            assert(decoded == payload)
+        }
+
+        // Also test --no-check (no content checksum, streaming window descriptor)
+        let r_nc = core.Process.output("zstd", .{ "-c", "-q", "--no-check", "-3" }, payload) !!
+        assert(r_nc.code == 0)
+        assert(compress.unzstd(r_nc.stdout) !! == payload)
+
+        // 2) Valk `compress.zstd` compresses at levels 0, 1, 3, 9 -> Reference `zstd -d` decodes!
+        let enc_levels = Array[uint]{ 0, 1, 3, 9 }
+        each enc_levels as elvl {
+            let encoded = compress.zstd(payload, elvl)
+            let r_dec = core.Process.output("zstd", .{ "-d", "-c", "-q" }, encoded) !!
+            assert(r_dec.code == 0)
+            assert(r_dec.stdout == payload)
+        }
+    }
+}
+
+fn zstd_http_handler(req: http.Request) http.Response {
+    if req.path == "/data" {
+        return http.Response.json(zstd_sample_json(80))
+    }
+    if req.path == "/explicit-zstd" {
+        let res = http.Response.new(compress.zstd("hello zstd ".repeat(300)), 200, "text/plain")
+        res.set_header("Content-Encoding", "zstd")
+        return res
+    }
+    if req.path == "/bad-zstd" {
+        let res = http.Response.new("not valid zstd bytes", 200, "text/plain")
+        res.set_header("Content-Encoding", "zstd")
+        return res
+    }
+    return http.Response.text("plain")
+}
+
+test "HTTP: Content-Encoding zstd server negotiation and client decompression" {
+    let server = http.Server.new("127.0.0.1", 19711, zstd_http_handler)
+    server.compress = true
+    let running = co server.start(1)
+    time.sleep_ms(20)
+    let base = "http://127.0.0.1:19711"
+    let expected = zstd_sample_json(80)
+
+    // Client asking for zstd gets Content-Encoding: zstd + Vary: Accept-Encoding
+    let zopt = http.Options {}
+    zopt.set_header("Accept-Encoding", "zstd")
+    let zres = http.get(base + "/data", zopt) !!
+    assert((zres.headers.get("content-encoding") !? "") == "zstd")
+    assert((zres.headers.get("vary") !? "") == "Accept-Encoding")
+    assert(compress.unzstd(zres.body) !! == expected)
+
+    // Client accepting both zstd and gzip gets zstd
+    let both = http.Options {}
+    both.set_header("Accept-Encoding", "gzip, zstd")
+    let bres = http.get(base + "/data", both) !!
+    assert((bres.headers.get("content-encoding") !? "") == "zstd")
+    assert(compress.unzstd(bres.body) !! == expected)
+
+    // Client refusing zstd with q=0 falls back to gzip
+    let ref_z = http.Options {}
+    ref_z.set_header("Accept-Encoding", "zstd;q=0, gzip")
+    let gres = http.get(base + "/data", ref_z) !!
+    assert((gres.headers.get("content-encoding") !? "") == "gzip")
+    assert(compress.gunzip(gres.body) !! == expected)
+
+    // Default HTTP client (decompress: true) automatically decompresses Content-Encoding: zstd
+    let auto_res = http.get(base + "/explicit-zstd") !!
+    assert(auto_res.body == "hello zstd ".repeat(300))
+    assert(!auto_res.headers.has("content-encoding"))
+    assert(!auto_res.headers.has("content-length"))
+
+    // Corrupt zstd response -> invalid_response
+    let bad = false
+    http.get(base + "/bad-zstd") ! { bad = error_is(E.code, invalid_response) }
+    assert(bad)
+
+    // max_response_body_size enforced on decompressed zstd body
+    let too_big = false
+    http.get(base + "/explicit-zstd", http.Options { max_response_body_size: 100 }) ! {
+        too_big = error_is(E.code, response_too_large)
+    }
+    assert(too_big)
+
+    server.shutdown()
+    await running !!
+}
+
+test "HTTP: static files serve on-the-fly zstd and .zst sidecars" {
+    let dir = fs.create_temp_dir() !!
+    defer fs.delete_dir(dir) ! {}
+
+    let dynamic_body = zstd_sample_json(60)
+    let dynamic_path = dir + "/app.json"
+    fs.write(dynamic_path, dynamic_body) !!
+
+    let sidecar_body = "precompressed zstd payload ".repeat(100)
+    let sidecar_path = dir + "/static.txt"
+    fs.write(sidecar_path, sidecar_body) !!
+    fs.write(sidecar_path + ".zst", compress.zstd(sidecar_body, 6)) !!
+
+    let server = http.Server.new("127.0.0.1", 19712, fn(req: http.Request) http.Response {
+        if req.path == "/app.json" : return http.Response.file(dynamic_path)
+        if req.path == "/static.txt" : return http.Response.file(sidecar_path)
+        return http.Response.text("404", 404)
+    })
+    server.compress = true
+    let running = co server.start(1)
+    time.sleep_ms(20)
+    let base = "http://127.0.0.1:19712"
+
+    // On-the-fly zstd for static file
+    let zopt = http.Options {}
+    zopt.set_header("Accept-Encoding", "zstd")
+    let r1 = http.get(base + "/app.json", zopt) !!
+    assert(r1.status == 200)
+    assert((r1.headers.get("content-encoding") !? "") == "zstd")
+    assert((r1.headers.get("vary") !? "") == "Accept-Encoding")
+    assert(compress.unzstd(r1.body) !! == dynamic_body)
+    let etag = r1.headers.get("etag") !? ""
+    assert(etag.contains("-zstd"))
+
+    // Conditional 304 with the zstd ETag
+    let cond = http.Options {}
+    cond.set_header("Accept-Encoding", "zstd")
+    cond.set_header("If-None-Match", etag)
+    let r304 = http.get(base + "/app.json", cond) !!
+    assert(r304.status == 304)
+
+    // Precompressed `.zst` sidecar
+    let r2 = http.get(base + "/static.txt", zopt) !!
+    assert(r2.status == 200)
+    assert((r2.headers.get("content-encoding") !? "") == "zstd")
+    assert(compress.unzstd(r2.body) !! == sidecar_body)
+
+    server.shutdown()
+    await running !!
+}

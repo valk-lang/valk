@@ -1,0 +1,762 @@
+use mem
+
+// RFC 8878 Zstandard decoder
+
+// Forward LSB-first bit reader (used for FSE NCount headers)
+struct ZstdFwdBits {
+    data: *[u8]
+    len: uint
+    bit_pos: uint (0)
+
+    fn peek(n: uint) uint {
+        @unsafe
+        if n == 0 : return 0
+        let byte_idx = this.bit_pos >> 3
+        let bit_off = this.bit_pos & 7
+        let v: u64 = 0
+        let shift: u64 = 0
+        let i = byte_idx
+        while i < this.len && shift < 40 {
+            v = v | (this.data[i].to(u64) << shift)
+            i++
+            shift += 8
+        }
+        return ((v >> bit_off.to(u64)) & (((1).to(u64) << n.to(u64)) - 1)).to(uint)
+    }
+
+    fn consume(n: uint) !CompressError {
+        this.bit_pos += n
+        if this.bit_pos > this.len * 8 : throw .truncated
+    }
+
+    fn read(n: uint) uint !CompressError {
+        let v = this.peek(n)
+        this.consume(n) !>
+        return v
+    }
+
+    fn bytes_consumed() uint {
+        return (this.bit_pos + 7) >> 3
+    }
+}
+
+// Reverse MSB-first bit reader (used for Huffman and sequence bitstreams)
+struct ZstdRevBits {
+    data: *[u8]
+    byte_pos: uint (0)
+    buf: u64 (0)
+    buf_bits: uint (0)
+    bits_left: uint (0)
+
+    static fn init(data: *[u8], len: uint) ZstdRevBits !CompressError {
+        @unsafe
+        if len == 0 : throw .invalid_input
+        let last = data[len - 1].to(uint)
+        if last == 0 : throw .invalid_input
+        let top = zstd_high_bit(last)
+        let mask = ((1).to(u64) << top.to(u64)) - 1
+        let rb = ZstdRevBits {
+            data: data
+            byte_pos: len - 1
+            buf: last.to(u64) & mask
+            buf_bits: top
+            bits_left: (len - 1) * 8 + top
+        }
+        return rb
+    }
+
+    fn refill() $inline {
+        @unsafe
+        while this.buf_bits <= 56 && this.byte_pos > 0 {
+            this.byte_pos--
+            this.buf = (this.buf << 8) | this.data[this.byte_pos].to(u64)
+            this.buf_bits += 8
+        }
+    }
+
+    fn read(n: uint) uint !CompressError {
+        if n == 0 : return 0
+        if n > this.bits_left : throw .invalid_input
+        if this.buf_bits < n : this.refill()
+        this.buf_bits -= n
+        this.bits_left -= n
+        return ((this.buf >> this.buf_bits.to(u64)) & (((1).to(u64) << n.to(u64)) - 1)).to(uint)
+    }
+
+    fn peek_huf(max_bits: uint) uint $inline {
+        if this.buf_bits < max_bits && this.byte_pos > 0 : this.refill()
+        if this.buf_bits >= max_bits {
+            return ((this.buf >> (this.buf_bits - max_bits).to(u64)) & (((1).to(u64) << max_bits.to(u64)) - 1)).to(uint)
+        }
+        let mask = ((1).to(u64) << this.buf_bits.to(u64)) - 1
+        return ((this.buf & mask) << (max_bits - this.buf_bits).to(u64)).to(uint)
+    }
+
+    fn consume_huf(n: uint) !CompressError {
+        if n > this.bits_left : throw .invalid_input
+        this.buf_bits -= n
+        this.bits_left -= n
+    }
+}
+
+// Canonical Huffman lookup table (max 11 bits = 2048 entries).
+// Each entry packs: symbol (bits 0..7) | num_bits (bits 8..15).
+struct ZstdHufTable {
+    entries: [u16 x 2048] ({ 0... })
+    max_bits: uint (0)
+    ready: bool (false)
+
+    fn build_from_weights(weights: *[u8], count: uint) !CompressError {
+        @unsafe
+        if count == 0 || count > 255 : throw .invalid_input
+        let weight_sum: uint = 0
+        let rank_count: [u16 x 13] = { 0... }
+        let i: uint = 0
+        while i < count {
+            let w = weights[i].to(uint)
+            if w > 11 : throw .invalid_input
+            if w > 0 {
+                weight_sum += (1).to(uint) << (w - 1)
+                rank_count[w] = rank_count[w] + 1
+            }
+            i++
+        }
+        if weight_sum == 0 : throw .invalid_input
+        let max_bits = zstd_high_bit(weight_sum) + 1
+        if max_bits > 11 : throw .invalid_input
+        let left_over = ((1).to(uint) << max_bits) - weight_sum
+        if left_over == 0 || (left_over & (left_over - 1)) != 0 : throw .invalid_input
+        let last_weight = zstd_high_bit(left_over) + 1
+        if last_weight > max_bits : throw .invalid_input
+        weights[count] = last_weight.to(u8)
+        rank_count[last_weight] = rank_count[last_weight] + 1
+        let num_syms = count + 1
+
+        let rank_idx: [u16 x 13] = { 0... }
+        let w: uint = 1
+        while w <= max_bits {
+            rank_idx[w + 1] = (rank_idx[w].to(uint) + (rank_count[w].to(uint) << (w - 1))).to(u16)
+            w++
+        }
+
+        let sym: uint = 0
+        while sym < num_syms {
+            let sw = weights[sym].to(uint)
+            if sw > 0 {
+                let nb = max_bits + 1 - sw
+                let span = (1).to(uint) << (sw - 1)
+                let start = rank_idx[sw].to(uint)
+                rank_idx[sw] = (start + span).to(u16)
+                let val = (sym | (nb << 8)).to(u16)
+                let k: uint = 0
+                while k < span {
+                    this.entries[start + k] = val
+                    k++
+                }
+            }
+            sym++
+        }
+
+        this.max_bits = max_bits
+        this.ready = true
+    }
+
+    fn decode_stream(src: *[u8], src_len: uint, dst: *[u8], expected: uint) !CompressError {
+        @unsafe
+        let rb = ZstdRevBits.init(src, src_len) !>
+        let max_bits = this.max_bits
+        let out_pos: uint = 0
+        while rb.bits_left > 0 {
+            if out_pos >= expected : throw .invalid_input
+            let e = this.entries[rb.peek_huf(max_bits)].to(uint)
+            let nb = e >> 8
+            if nb == 0 : throw .invalid_input
+            rb.consume_huf(nb) !>
+            dst[out_pos] = (e & 0xff).to(u8)
+            out_pos++
+        }
+        if out_pos != expected : throw .invalid_input
+    }
+}
+
+// Reads an RFC 8878 §4.1.1 FSE NCount distribution header and builds `table`.
+// Returns the number of compressed bytes consumed.
+fn zstd_read_fse_table(src: *[u8], src_len: uint, max_sym: uint, max_log: uint, table: *ZstdFseTable) uint !CompressError {
+    if src_len == 0 : throw .truncated
+    let fb = ZstdFwdBits { data: src, len: src_len }
+    let acc_log = (fb.read(4) !>) + 5
+    if acc_log > max_log : throw .invalid_input
+
+    let remaining: int = ((1).to(int) << acc_log.to(int)) + 1
+    let threshold: int = (1).to(int) << acc_log.to(int)
+    let bit_count: uint = acc_log + 1
+    let norm: [i16 x 256] = { 0... }
+    let sym: uint = 0
+    let prev_zero = false
+
+    while remaining > 1 && sym <= max_sym {
+        if prev_zero {
+            while true {
+                let rep = fb.read(2) !>
+                sym += rep
+                if rep < 3 : break
+            }
+            if sym > max_sym : throw .invalid_input
+        }
+
+        let max_val = (2 * threshold - 1) - remaining
+        let small = fb.peek(bit_count - 1).to(int)
+        let val: int = 0
+        if small < max_val {
+            fb.consume(bit_count - 1) !>
+            val = small
+        } else {
+            val = fb.peek(bit_count).to(int)
+            fb.consume(bit_count) !>
+            if val >= threshold : val -= max_val
+        }
+
+        let count = val - 1
+        remaining -= count < 0 ? 1 : count
+        if remaining < 1 : throw .invalid_input
+        norm[sym] = count.to(i16)
+        sym++
+        prev_zero = count == 0
+
+        while remaining < threshold {
+            bit_count--
+            threshold >>= 1
+        }
+    }
+
+    if remaining != 1 : throw .invalid_input
+    if !table.build(@ref(norm).@cast(*[i16]), sym, acc_log) : throw .invalid_input
+    return fb.bytes_consumed()
+}
+
+// Per-frame persistent decoder state
+class ZstdDecoder {
+    in_data: *[u8]
+    in_len: uint
+    in_pos: uint (0)
+    out: ByteBuffer
+    limit: uint
+    huf: ZstdHufTable (ZstdHufTable {})
+    ll_table: ZstdFseTable (ZstdFseTable {})
+    of_table: ZstdFseTable (ZstdFseTable {})
+    ml_table: ZstdFseTable (ZstdFseTable {})
+    rep0: uint (1)
+    rep1: uint (4)
+    rep2: uint (8)
+    literals: ByteBuffer (ByteBuffer.new(4096))
+
+    fn read_u8() uint !CompressError {
+        @unsafe
+        if this.in_pos >= this.in_len : throw .truncated
+        let v = this.in_data[this.in_pos].to(uint)
+        this.in_pos++
+        return v
+    }
+
+    fn read_u16_le() uint !CompressError {
+        @unsafe
+        if this.in_pos + 2 > this.in_len : throw .truncated
+        let p = this.in_data
+        let i = this.in_pos
+        this.in_pos += 2
+        return p[i].to(uint) | (p[i + 1].to(uint) << 8)
+    }
+
+    fn read_u32_le() u32 !CompressError {
+        if this.in_pos + 4 > this.in_len : throw .truncated
+        let v = zstd_load_le32(this.in_data, this.in_pos)
+        this.in_pos += 4
+        return v
+    }
+
+    fn read_u64_le() u64 !CompressError {
+        if this.in_pos + 8 > this.in_len : throw .truncated
+        let v = zstd_load_le64(this.in_data, this.in_pos)
+        this.in_pos += 8
+        return v
+    }
+
+    fn decode_all() !CompressError {
+        if this.in_len == 0 : throw .truncated
+        while this.in_pos < this.in_len {
+            let magic = this.read_u32_le() !>
+            if magic >= ZSTD_SKIPPABLE_MIN && magic <= ZSTD_SKIPPABLE_MAX {
+                let skip = (this.read_u32_le() !>).to(uint)
+                if skip > this.in_len - this.in_pos : throw .truncated
+                this.in_pos += skip
+                continue
+            }
+            if magic != ZSTD_MAGIC : throw .invalid_input
+            this.decode_frame() !>
+        }
+    }
+
+    fn decode_frame() !CompressError {
+        @unsafe
+        // Reset per-frame state
+        this.huf.ready = false
+        this.ll_table.ready = false
+        this.of_table.ready = false
+        this.ml_table.ready = false
+        this.rep0 = 1
+        this.rep1 = 4
+        this.rep2 = 8
+
+        let fhd = this.read_u8() !>
+        let fcs_flag = (fhd >> 6) & 3
+        let single_segment = ((fhd >> 5) & 1) != 0
+        // Bit 3 is reserved and must be 0
+        if ((fhd >> 3) & 1) != 0 : throw .invalid_input
+        let has_checksum = ((fhd >> 2) & 1) != 0
+        let dict_id_flag = fhd & 3
+
+        let window_size: uint = 0
+        if !single_segment {
+            let wd = this.read_u8() !>
+            let exp = wd >> 3
+            let mant = wd & 7
+            let base = (1).to(uint) << (10 + exp)
+            window_size = base + (base >> 3) * mant
+        }
+
+        // Preset dictionaries are not supported
+        if dict_id_flag > 0 {
+            let dict_id: uint = 0
+            if dict_id_flag == 1 : dict_id = this.read_u8() !>
+            else if dict_id_flag == 2 : dict_id = this.read_u16_le() !>
+            else : dict_id = (this.read_u32_le() !>).to(uint)
+            if dict_id != 0 : throw .invalid_input
+        }
+
+        let has_fcs = false
+        let fcs: uint = 0
+        if fcs_flag == 0 {
+            if single_segment {
+                fcs = this.read_u8() !>
+                has_fcs = true
+            }
+        } else if fcs_flag == 1 {
+            fcs = (this.read_u16_le() !>) + 256
+            has_fcs = true
+        } else if fcs_flag == 2 {
+            fcs = (this.read_u32_le() !>).to(uint)
+            has_fcs = true
+        } else {
+            let v64 = this.read_u64_le() !>
+            if v64 > uint.$max.to(u64) : throw .too_large
+            fcs = v64.to(uint)
+            has_fcs = true
+        }
+
+        if single_segment : window_size = fcs
+        let frame_start = this.out.length
+        if has_fcs {
+            if fcs > this.limit || frame_start + fcs > this.limit : throw .too_large
+            // Pre-reserve reasonable capacity for single-frame outputs
+            if fcs <= 16 * 1024 * 1024 : this.out.reserve(fcs)
+        }
+
+        let max_block_size: uint = ZSTD_MAX_BLOCK_SIZE
+        if !single_segment && window_size < max_block_size : max_block_size = window_size
+
+        while true {
+            let b0 = this.read_u8() !>
+            let b1 = this.read_u8() !>
+            let b2 = this.read_u8() !>
+            let header = b0 | (b1 << 8) | (b2 << 16)
+            let last_block = (header & 1) != 0
+            let block_type = (header >> 1) & 3
+            let block_size = header >> 3
+
+            if block_type == 0 {
+                // Raw_Block
+                if block_size > max_block_size : throw .invalid_input
+                if block_size > this.in_len - this.in_pos : throw .truncated
+                if block_size > this.limit - this.out.length : throw .too_large
+                let src = [u8]{ owner: null, data: this.in_data.@offset(this.in_pos), length: block_size }
+                this.out.write(src)
+                this.in_pos += block_size
+            } else if block_type == 1 {
+                // RLE_Block
+                if block_size > max_block_size : throw .invalid_input
+                let b = (this.read_u8() !>).to(u8)
+                if block_size > this.limit - this.out.length : throw .too_large
+                this.out.reserve(block_size)
+                let dst = this.out.data.@cast(*[u8]).@offset(this.out.length)
+                zstd_fill_bytes(dst, b, block_size)
+                this.out.skip(block_size)
+            } else if block_type == 2 {
+                // Compressed_Block
+                if block_size > ZSTD_MAX_BLOCK_SIZE || block_size > max_block_size : throw .invalid_input
+                if block_size > this.in_len - this.in_pos : throw .truncated
+                let blk_ptr = this.in_data.@offset(this.in_pos)
+                this.in_pos += block_size
+                this.decode_compressed_block(blk_ptr, block_size, frame_start, window_size, max_block_size) !>
+            } else {
+                // Reserved block type
+                throw .invalid_input
+            }
+
+            if last_block : break
+        }
+
+        let produced = this.out.length - frame_start
+        if has_fcs && produced != fcs : throw .invalid_input
+        if has_checksum {
+            let expected_hash = this.read_u32_le() !>
+            let frame_bytes = produced_bytes(this.out, frame_start)
+            let actual_hash = (zstd_xxh64(frame_bytes, 0) & 0xffffffff).to(u32)
+            if actual_hash != expected_hash : throw .checksum
+        }
+    }
+
+    fn decode_compressed_block(blk: *[u8], blk_len: uint, frame_start: uint, window_size: uint, max_block_size: uint) !CompressError {
+        @unsafe
+        let block_start = this.out.length
+        let pos: uint = 0
+
+        // 1. Literals section
+        let lit_consumed = this.decode_literals(blk, blk_len, max_block_size) !>
+        pos += lit_consumed
+        if pos >= blk_len : throw .invalid_input
+
+        // 2. Sequences section
+        let b0 = blk[pos].to(uint)
+        pos++
+        let num_seq: uint = 0
+        if b0 == 0 {
+            // No sequences: emit all literals directly
+            let lits = this.literals
+            if lits.length > max_block_size : throw .invalid_input
+            if lits.length > this.limit - this.out.length : throw .too_large
+            this.out.write(produced_bytes(lits, 0))
+            return
+        } else if b0 < 128 {
+            num_seq = b0
+        } else if b0 < 255 {
+            if pos >= blk_len : throw .invalid_input
+            num_seq = ((b0 - 128) << 8) + blk[pos].to(uint)
+            pos++
+        } else {
+            if pos + 2 > blk_len : throw .invalid_input
+            num_seq = (blk[pos].to(uint) | (blk[pos + 1].to(uint) << 8)) + 0x7f00
+            pos += 2
+        }
+
+        if pos >= blk_len : throw .invalid_input
+        let modes = blk[pos].to(uint)
+        pos++
+        if (modes & 3) != 0 : throw .invalid_input
+        let ll_mode = (modes >> 6) & 3
+        let of_mode = (modes >> 4) & 3
+        let ml_mode = (modes >> 2) & 3
+
+        let defs = @ref(zstd_defaults)
+        pos += this.load_seq_table(blk.@offset(pos), blk_len - pos, ll_mode, 35, 9, @ref(this.ll_table), @ref(defs.ll)) !>
+        pos += this.load_seq_table(blk.@offset(pos), blk_len - pos, of_mode, 31, 8, @ref(this.of_table), @ref(defs.of)) !>
+        pos += this.load_seq_table(blk.@offset(pos), blk_len - pos, ml_mode, 52, 9, @ref(this.ml_table), @ref(defs.ml)) !>
+
+        if pos >= blk_len : throw .invalid_input
+        let rb = ZstdRevBits.init(blk.@offset(pos), blk_len - pos) !>
+
+        let ll_st = rb.read(this.ll_table.acc_log) !>
+        let of_st = rb.read(this.of_table.acc_log) !>
+        let ml_st = rb.read(this.ml_table.acc_log) !>
+
+        let lit_data = this.literals.data.@cast(*[u8])
+        let lit_len = this.literals.length
+        let lit_pos: uint = 0
+
+        let seq_i: uint = 0
+        while seq_i < num_seq {
+            let ll_e = this.ll_table.entries[ll_st].to(uint)
+            let of_e = this.of_table.entries[of_st].to(uint)
+            let ml_e = this.ml_table.entries[ml_st].to(uint)
+
+            let ll_code = ll_e & 0xff
+            let of_code = of_e & 0xff
+            let ml_code = ml_e & 0xff
+            if ll_code > 35 || of_code > 31 || ml_code > 52 : throw .invalid_input
+
+            // Read extra bits in order: OF, ML, LL
+            let of_extra = rb.read(of_code) !>
+            let of_val = ((1).to(uint) << of_code) + of_extra
+
+            let ml_nb = zstd_ml_bits[ml_code].to(uint)
+            let ml_extra = rb.read(ml_nb) !>
+            let ml = zstd_ml_base[ml_code].to(uint) + ml_extra
+
+            let ll_nb = zstd_ll_bits[ll_code].to(uint)
+            let ll_extra = rb.read(ll_nb) !>
+            let ll = zstd_ll_base[ll_code].to(uint) + ll_extra
+
+            // Update FSE states for next sequence in order: LL, ML, OF
+            if seq_i + 1 < num_seq {
+                let ll_snb = (ll_e >> 8) & 0xff
+                let ml_snb = (ml_e >> 8) & 0xff
+                let of_snb = (of_e >> 8) & 0xff
+                ll_st = (ll_e >> 16) + (rb.read(ll_snb) !>)
+                ml_st = (ml_e >> 16) + (rb.read(ml_snb) !>)
+                of_st = (of_e >> 16) + (rb.read(of_snb) !>)
+            }
+
+            // Resolve repeat offsets (RFC 8878 §3.1.1.5)
+            let offset: uint = 0
+            if of_val > 3 {
+                offset = of_val - 3
+                this.rep2 = this.rep1
+                this.rep1 = this.rep0
+                this.rep0 = offset
+            } else {
+                let idx = of_val - 1
+                if ll == 0 : idx++
+                if idx == 0 {
+                    offset = this.rep0
+                } else {
+                    if idx == 1 : offset = this.rep1
+                    else if idx == 2 : offset = this.rep2
+                    else : offset = this.rep0 - 1
+                    if offset == 0 : throw .invalid_input
+                    if idx != 1 : this.rep2 = this.rep1
+                    this.rep1 = this.rep0
+                    this.rep0 = offset
+                }
+            }
+
+            // Emit `ll` literals
+            if ll > lit_len - lit_pos : throw .invalid_input
+            if ll + ml > max_block_size - (this.out.length - block_start) : throw .invalid_input
+            if ll + ml > this.limit - this.out.length : throw .too_large
+            if ll > 0 {
+                let slice = [u8]{ owner: null, data: lit_data.@offset(lit_pos), length: ll }
+                this.out.write(slice)
+                lit_pos += ll
+            }
+
+            // Emit `ml` match bytes
+            let frame_produced = this.out.length - frame_start
+            if offset == 0 || offset > frame_produced || offset > window_size : throw .invalid_input
+            this.out.reserve(ml)
+            let dst_off = this.out.length
+            let out_ptr = this.out.data.@cast(*[u8])
+            if offset >= ml {
+                mem.copy_bytes(out_ptr.@offset(dst_off - offset), out_ptr.@offset(dst_off), ml)
+            } else {
+                let m: uint = 0
+                while m < ml {
+                    out_ptr[dst_off + m] = out_ptr[dst_off - offset + m]
+                    m++
+                }
+            }
+            this.out.skip(ml)
+
+            seq_i++
+        }
+
+        if rb.bits_left != 0 : throw .invalid_input
+
+        // Copy trailing literals
+        let rem_lit = lit_len - lit_pos
+        if rem_lit > 0 {
+            if rem_lit > max_block_size - (this.out.length - block_start) : throw .invalid_input
+            if rem_lit > this.limit - this.out.length : throw .too_large
+            let tail = [u8]{ owner: null, data: lit_data.@offset(lit_pos), length: rem_lit }
+            this.out.write(tail)
+        }
+    }
+
+    fn load_seq_table(src: *[u8], src_len: uint, mode: uint, max_sym: uint, max_log: uint, dst: *ZstdFseTable, def: *ZstdFseTable) uint !CompressError {
+        @unsafe
+        if mode == 0 {
+            dst.copy_from(def)
+            return 0
+        }
+        if mode == 1 {
+            if src_len == 0 : throw .invalid_input
+            let sym = src[0].to(uint)
+            if sym > max_sym : throw .invalid_input
+            dst.set_rle(sym)
+            return 1
+        }
+        if mode == 2 {
+            return zstd_read_fse_table(src, src_len, max_sym, max_log, dst) !>
+        }
+        // mode == 3: repeat previous block's table
+        if !dst.ready : throw .invalid_input
+        return 0
+    }
+
+    fn decode_literals(blk: *[u8], blk_len: uint, max_block_size: uint) uint !CompressError {
+        @unsafe
+        if blk_len == 0 : throw .invalid_input
+        let lh0 = blk[0].to(uint)
+        let lit_type = lh0 & 3
+        let size_fmt = (lh0 >> 2) & 3
+
+        this.literals.clear()
+
+        if lit_type == 0 || lit_type == 1 {
+            // Raw or RLE literals
+            let hdr_size: uint = 1
+            let regen_size: uint = 0
+            if size_fmt == 0 || size_fmt == 2 {
+                regen_size = lh0 >> 3
+            } else if size_fmt == 1 {
+                if blk_len < 2 : throw .invalid_input
+                hdr_size = 2
+                regen_size = (lh0 >> 4) | (blk[1].to(uint) << 4)
+            } else {
+                if blk_len < 3 : throw .invalid_input
+                hdr_size = 3
+                regen_size = (lh0 >> 4) | (blk[1].to(uint) << 4) | (blk[2].to(uint) << 12)
+            }
+            if regen_size > max_block_size : throw .invalid_input
+            if lit_type == 0 {
+                if hdr_size + regen_size > blk_len : throw .invalid_input
+                let slice = [u8]{ owner: null, data: blk.@offset(hdr_size), length: regen_size }
+                this.literals.write(slice)
+                return hdr_size + regen_size
+            }
+            // RLE literals
+            if hdr_size + 1 > blk_len : throw .invalid_input
+            let b = blk[hdr_size]
+            this.literals.reserve(regen_size)
+            zstd_fill_bytes(this.literals.data.@cast(*[u8]), b, regen_size)
+            this.literals.skip(regen_size)
+            return hdr_size + 1
+        }
+
+        // Compressed (2) or Treeless (3) Huffman literals
+        let hdr_size: uint = 0
+        let regen_size: uint = 0
+        let comp_size: uint = 0
+        let four_streams = size_fmt != 0
+        if size_fmt == 0 || size_fmt == 1 {
+            if blk_len < 3 : throw .invalid_input
+            hdr_size = 3
+            let v = lh0 | (blk[1].to(uint) << 8) | (blk[2].to(uint) << 16)
+            regen_size = (v >> 4) & 0x3ff
+            comp_size = (v >> 14) & 0x3ff
+        } else if size_fmt == 2 {
+            if blk_len < 4 : throw .invalid_input
+            hdr_size = 4
+            let v = lh0 | (blk[1].to(uint) << 8) | (blk[2].to(uint) << 16) | (blk[3].to(uint) << 24)
+            regen_size = (v >> 4) & 0x3fff
+            comp_size = (v >> 18) & 0x3fff
+        } else {
+            if blk_len < 5 : throw .invalid_input
+            hdr_size = 5
+            let v = lh0.to(u64) | (blk[1].to(u64) << 8) | (blk[2].to(u64) << 16) | (blk[3].to(u64) << 24) | (blk[4].to(u64) << 32)
+            regen_size = ((v >> 4) & 0x3ffff).to(uint)
+            comp_size = ((v >> 22) & 0x3ffff).to(uint)
+        }
+        if regen_size > max_block_size : throw .invalid_input
+        if hdr_size + comp_size > blk_len : throw .invalid_input
+
+        let payload = blk.@offset(hdr_size).@cast(*[u8])
+        let pay_pos: uint = 0
+
+        if lit_type == 2 {
+            // Read Huffman tree description
+            if comp_size == 0 : throw .invalid_input
+            let hb = payload[0].to(uint)
+            pay_pos = 1
+            let weights: [u8 x 256] = { 0... }
+            let weight_count: uint = 0
+            if hb >= 128 {
+                weight_count = hb - 127
+                let needed = (weight_count + 1) >> 1
+                if pay_pos + needed > comp_size : throw .invalid_input
+                let i: uint = 0
+                while i < weight_count {
+                    let byte = payload[pay_pos + (i >> 1)].to(uint)
+                    if (i & 1) == 0 : weights[i] = (byte >> 4).to(u8)
+                    else : weights[i] = (byte & 0x0f).to(u8)
+                    i++
+                }
+                pay_pos += needed
+            } else {
+                if hb == 0 || pay_pos + hb > comp_size : throw .invalid_input
+                weight_count = zstd_decode_fse_weights(payload.@offset(pay_pos), hb, @ref(weights).@cast(*[u8])) !>
+                pay_pos += hb
+            }
+            this.huf.build_from_weights(@ref(weights).@cast(*[u8]), weight_count) !>
+        } else {
+            if !this.huf.ready : throw .invalid_input
+        }
+
+        let streams = payload.@offset(pay_pos).@cast(*[u8])
+        let streams_len = comp_size - pay_pos
+        this.literals.reserve(regen_size)
+        let dst = this.literals.data.@cast(*[u8])
+
+        if !four_streams {
+            this.huf.decode_stream(streams, streams_len, dst, regen_size) !>
+        } else {
+            let chunk = (regen_size + 3) >> 2
+            if streams_len < 6 || 3 * chunk > regen_size : throw .invalid_input
+            let s1 = streams[0].to(uint) | (streams[1].to(uint) << 8)
+            let s2 = streams[2].to(uint) | (streams[3].to(uint) << 8)
+            let s3 = streams[4].to(uint) | (streams[5].to(uint) << 8)
+            let total_known = 6 + s1 + s2 + s3
+            if total_known >= streams_len : throw .invalid_input
+            let s4 = streams_len - total_known
+            let chunk4 = regen_size - 3 * chunk
+
+            this.huf.decode_stream(streams.@offset(6), s1, dst, chunk) !>
+            this.huf.decode_stream(streams.@offset(6 + s1), s2, dst.@offset(chunk), chunk) !>
+            this.huf.decode_stream(streams.@offset(6 + s1 + s2), s3, dst.@offset(chunk * 2), chunk) !>
+            this.huf.decode_stream(streams.@offset(6 + s1 + s2 + s3), s4, dst.@offset(chunk * 3), chunk4) !>
+        }
+
+        this.literals.skip(regen_size)
+        return hdr_size + comp_size
+    }
+}
+
+// Decodes FSE-compressed Huffman weights (2 interleaved states, RFC 8878 §4.2.1.2)
+fn zstd_decode_fse_weights(src: *[u8], src_len: uint, weights: *[u8]) uint !CompressError {
+    @unsafe
+    let fse = ZstdFseTable {}
+    let hdr_len = zstd_read_fse_table(src, src_len, 12, 6, @ref(fse)) !>
+    if hdr_len >= src_len : throw .invalid_input
+    let rb = ZstdRevBits.init(src.@offset(hdr_len), src_len - hdr_len) !>
+
+    let st1 = rb.read(fse.acc_log) !>
+    let st2 = rb.read(fse.acc_log) !>
+    let count: uint = 0
+
+    while true {
+        if count >= 255 : throw .invalid_input
+        let e1 = fse.entries[st1].to(uint)
+        weights[count] = (e1 & 0xff).to(u8)
+        count++
+        let nb1 = (e1 >> 8) & 0xff
+        if nb1 > rb.bits_left {
+            if count >= 255 : throw .invalid_input
+            weights[count] = (fse.entries[st2] & 0xff).to(u8)
+            count++
+            break
+        }
+        st1 = (e1 >> 16) + (rb.read(nb1) !>)
+
+        if count >= 255 : throw .invalid_input
+        let e2 = fse.entries[st2].to(uint)
+        weights[count] = (e2 & 0xff).to(u8)
+        count++
+        let nb2 = (e2 >> 8) & 0xff
+        if nb2 > rb.bits_left {
+            if count >= 255 : throw .invalid_input
+            weights[count] = (fse.entries[st1] & 0xff).to(u8)
+            count++
+            break
+        }
+        st2 = (e2 >> 16) + (rb.read(nb2) !>)
+    }
+    return count
+}

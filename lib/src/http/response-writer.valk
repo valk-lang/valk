@@ -45,23 +45,20 @@ fn response_gzip_type(content_type: String) bool {
 
 // Whether an `Accept-Encoding` value explicitly takes brotli (`br`) without `q=0`
 fn request_accepts_br(value: String) bool {
-    let length = value.bytes
-    let pos: uint = 0
-    while pos < length {
-        let end = value.index_of_byte(',', pos) !? length
-        let semi = value.index_of_byte(';', pos) !? length
-        let name_end = semi < end ? semi : end
-        let name = trim_blanks(value.view(pos, name_end - pos))
-        if name.equals_ignore_ascii_case("br") {
-            if !coding_refused(value.view(name_end, end - name_end)) : return true
-        }
-        pos = end + 1
-    }
-    return false
+    return request_accepts_coding(value, "br", false)
+}
+
+// Whether an `Accept-Encoding` value explicitly takes zstd without `q=0`
+fn request_accepts_zstd(value: String) bool {
+    return request_accepts_coding(value, "zstd", false)
 }
 
 // Whether an `Accept-Encoding` value takes gzip (and does not rule it out with q=0)
 fn request_accepts_gzip(value: String) bool {
+    return request_accepts_coding(value, "gzip", true)
+}
+
+fn request_accepts_coding(value: String, target: String, allow_wildcard: bool) bool {
     // Scanned in place: each comma-separated item is a coding with optional `;` parameters
     let length = value.bytes
     let pos: uint = 0
@@ -70,7 +67,7 @@ fn request_accepts_gzip(value: String) bool {
         let semi = value.index_of_byte(';', pos) !? length
         let name_end = semi < end ? semi : end
         let name = trim_blanks(value.view(pos, name_end - pos))
-        if name.equals_ignore_ascii_case("gzip") || name.equals("*") {
+        if name.equals_ignore_ascii_case(target) || (allow_wildcard && name.equals("*")) {
             if !coding_refused(value.view(name_end, end - name_end)) : return true
         }
         pos = end + 1
@@ -376,6 +373,13 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
                 this.send("", 500, "text/plain", headers)
                 return
             }
+            if isset(plan) && plan.zstd {
+                plan.zstd = false
+                plan.encoding = "zstd"
+                plan.vary = true
+                this.send_memory_file(cached_file_zstd(cached, data, this.compress_level), content_type, filename, headers, 200, plan)
+                return
+            }
             if isset(plan) && plan.gzip {
                 plan.gzip = false
                 plan.encoding = "gzip"
@@ -407,22 +411,27 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
         // A HEAD answer has no body to read the file for, nor to compress only to count its bytes
         if this.head {
             stream.close() ! core.cleanup_warning("Failed to close HTTP response file", __FILE__, __LINE__)
+            if isset(plan) && plan.zstd {
+                this.send_encoded("", 200, content_type, headers, plan, false, "zstd")
+                return
+            }
             if isset(plan) && plan.gzip {
-                this.send_encoded("", 200, content_type, headers, plan, false)
+                this.send_encoded("", 200, content_type, headers, plan, false, "gzip")
                 return
             }
             this.stream_response(ByteReader.new(""), isset(plan) ? plan.length : info.size, content_type, filename, headers, isset(plan) ? plan.status : code, plan)
             return
         }
         if isset(plan) {
-            if plan.gzip {
+            if plan.zstd || plan.gzip {
                 let data = io.read_all(stream) !? null
                 stream.close() ! core.cleanup_warning("Failed to close HTTP response file", __FILE__, __LINE__)
                 if !isset(data) || data.length != plan.size {
                     this.send("", 500, "text/plain", headers)
                     return
                 }
-                this.send_encoded(compress.gzip(data, this.compress_level), 200, content_type, headers, plan)
+                if plan.zstd : this.send_encoded(compress.zstd(data, this.compress_level), 200, content_type, headers, plan, true, "zstd")
+                else : this.send_encoded(compress.gzip(data, this.compress_level), 200, content_type, headers, plan, true, "gzip")
                 return
             }
             if plan.start > 0 {
@@ -482,7 +491,7 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
             out.write(plan.encoding)
             out.write("\r\n")
         }
-        if plan.vary && !plan.gzip : out.write("Vary: Accept-Encoding\r\n")
+        if plan.vary && !plan.gzip && !plan.zstd : out.write("Vary: Accept-Encoding\r\n")
         if plan.status == 206 {
             out.write("Content-Range: bytes ")
             out.write_uint_ascii(plan.start)
@@ -639,12 +648,20 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
         // A compressible response varies by Accept-Encoding, compressed or not
         let compressible = this.compress && ResponseWriter.status_has_body(code) && body.length >= GZIP_MIN_SIZE
             && response_gzip_type(content_type) && !(isset(headers) && headers.has("content-encoding"))
+        if compressible && this.client_accepts_zstd() {
+            let encoded = gzip_scratch
+            encoded.clear()
+            compress.zstd_into(body, encoded, this.compress_level) ! panic("Compressing into memory cannot fail")
+            this.send_encoded(encoded, code, content_type, headers, null, true, "zstd")
+            if encoded.size > GZIP_SCRATCH_KEEP : gzip_scratch = ByteBuffer.new(4096)
+            return
+        }
         if compressible && this.client_accepts_gzip() {
             // Compressed into a buffer of the thread, so no response allocates its own
             let gzipped = gzip_scratch
             gzipped.clear()
             compress.gzip_into(body, gzipped, this.compress_level) ! panic("Compressing into memory cannot fail")
-            this.send_encoded(gzipped, code, content_type, headers)
+            this.send_encoded(gzipped, code, content_type, headers, null, true, "gzip")
             if gzipped.size > GZIP_SCRATCH_KEEP : gzip_scratch = ByteBuffer.new(4096)
             return
         }
@@ -671,15 +688,17 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
         }
     }
 
-    // Sends a gzip-compressed body
+    // Sends a compressed body (`gzip` or `zstd`)
     // `sized` false leaves out the length: for a HEAD answer whose body was never compressed
-    - fn send_encoded(body: local &[u8], code: u16, content_type: String, headers: ?Headers, plan: ?FilePlan (null), sized: bool (true)) {
+    - fn send_encoded(body: local &[u8], code: u16, content_type: String, headers: ?Headers, plan: ?FilePlan (null), sized: bool (true), encoding: String ("gzip")) {
         this.responded = true
         let buf = this.output
         this.write_status_line(code)
         buf.write("Content-Type: ")
         buf.write(response_header_value_is_safe(content_type) ? content_type : "text/plain")
-        buf.write("\r\nContent-Encoding: gzip\r\nVary: Accept-Encoding\r\n")
+        buf.write("\r\nContent-Encoding: ")
+        buf.write(encoding)
+        buf.write("\r\nVary: Accept-Encoding\r\n")
         if sized : this.write_content_length(code, body.length)
         this.write_connection_header()
         if isset(plan) : this.write_file_plan_headers(plan)
@@ -689,6 +708,11 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
             this.reserve_output(body.length)
             this.output.write(body)
         }
+    }
+
+    - fn client_accepts_zstd() bool {
+        let context = this.request_context ?! return false
+        return request_accepts_zstd(context.header("accept-encoding") !? "")
     }
 
     - fn client_accepts_gzip() bool {

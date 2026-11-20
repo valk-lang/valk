@@ -28,7 +28,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 ## Errors for 'compress'
 
 ```js
-// Thrown when decompressing DEFLATE, zlib or gzip data fails.
+// Thrown when decompressing DEFLATE, zlib, gzip or zstd data fails.
 error CompressError (invalid_input, checksum, truncated, too_large) extends (io:IoError)
 ```
 
@@ -74,10 +74,18 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 + fn unzlib(data: local &[u8], max_size: uint (0)) String !CompressError
 // Writes the decompressed contents of zlib `data` to `out`; see `decompress_into`.
 + fn unzlib_into(data: local &[u8], out: Writer, max_size: uint (0)) uint !CompressError
+// Returns the decompressed contents of Zstandard (RFC 8878) `data`.
++ fn unzstd(data: local &[u8], max_size: uint (0)) String !CompressError
+// Writes the decompressed contents of Zstandard (RFC 8878) `data` to `out` and returns the bytes written.
++ fn unzstd_into(data: local &[u8], out: Writer, max_size: uint (0)) uint !CompressError
 // Returns `data` compressed in the zlib format; see `compress`.
 + fn zlib(data: local &[u8], level: uint (COMPRESS_DEFAULT_LEVEL)) String
 // Writes `data` compressed in the zlib format to `out`; see `compress_into`.
 + fn zlib_into(data: local &[u8], out: Writer, level: uint (COMPRESS_DEFAULT_LEVEL)) uint !io:IoError
+// Returns `data` compressed in the Zstandard (RFC 8878) format at `level` (0 stores, 1 is fastest, 9 is smallest).
++ fn zstd(data: local &[u8], level: uint (ZSTD_DEFAULT_LEVEL)) String
+// Writes `data` compressed in the Zstandard (RFC 8878) format at `level` to `out` and returns the bytes written.
++ fn zstd_into(data: local &[u8], out: Writer, level: uint (ZSTD_DEFAULT_LEVEL)) uint !io:IoError
 ```
 
 ## Classes for 'compress'
