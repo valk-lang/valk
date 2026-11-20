@@ -46,20 +46,32 @@ value KQ_NOTE_LINK (0x00000010)
 value KQ_NOTE_RENAME (0x00000020)
 value KQ_VNODE_NOTES (KQ_NOTE_DELETE | KQ_NOTE_WRITE | KQ_NOTE_EXTEND | KQ_NOTE_ATTRIB | KQ_NOTE_LINK | KQ_NOTE_RENAME)
 
+struct WatchChildMeta {
+    mtime: uint
+    size: uint
+    inode: uint
+}
+
 class MacWatchEntry {
     path: String
     fd: i32
     is_dir: bool
-    children: HashMap[String, uint] (.{})
+    children: HashMap[String, WatchChildMeta] (.{})
 }
 #else
+struct WatchChildMeta {
+    mtime: uint
+    size: uint
+    inode: uint
+}
+
 class PollWatchEntry {
     path: String
     is_dir: bool
     exists: bool
     mtime: uint (0)
     size: uint (0)
-    children: HashMap[String, (uint, uint)] (.{})
+    children: HashMap[String, WatchChildMeta] (.{})
 }
 #end
 
@@ -92,14 +104,8 @@ class PollWatchEntry {
         #elif OS == "macos"
         let kq = ext.kqueue()
         if kq < 0 : throw .os
-        io.set_close_on_exec(kq) ! {
-            ext.close(kq)
-            throw .os
-        }
-        io.set_nonblocking(kq, true) ! {
-            ext.close(kq)
-            throw .os
-        }
+        // kqueue descriptors are never inherited across fork/exec and reject F_SETFL O_NONBLOCK
+        io.set_close_on_exec(kq) ! {}
         return Watcher { kq: kq }
         #else
         return Watcher {}
@@ -141,7 +147,7 @@ class PollWatchEntry {
         }
         let dir = is_dir(resolved)
         let entry = MacWatchEntry { path: resolved, fd: fd, is_dir: dir }
-        if dir : mac_snapshot_dir(resolved, entry.children)
+        if dir : watch_snapshot_dir(resolved, entry.children)
         this.fd_to_entry.set(fd.to(u32), entry)
         this.path_to_fd.set(resolved, fd.to(uint))
         #else
@@ -155,7 +161,7 @@ class PollWatchEntry {
             mtime: info.modified_time
             size: info.size
         }
-        if dir : poll_snapshot_dir(resolved, entry.children)
+        if dir : watch_snapshot_dir(resolved, entry.children)
         this.entries.set(resolved, entry)
         #end
     }
@@ -206,11 +212,20 @@ class PollWatchEntry {
             if ev.is_closed() : throw .closed
             #elif OS == "macos"
             this.read_kqueue_events() !>
+            this.mac_poll_dirs()
             if !this.queue.is_empty() : continue
-            let ev = io.await_fd(this.kq, true, false, remaining)
+            let has_dirs = this.mac_has_dirs()
+            let wait_ms = remaining
+            if has_dirs && (wait_ms == 0 || wait_ms > 50) : wait_ms = 50
+            let ev = io.await_fd(this.kq, true, false, wait_ms)
             if this.closed : throw .closed
-            if ev.is_timeout() : return null
             if ev.is_closed() : throw .closed
+            if ev.is_timeout() && deadline > 0 && time.mono_ms() >= deadline {
+                this.read_kqueue_events() !>
+                this.mac_poll_dirs()
+                if !this.queue.is_empty() : continue
+                return null
+            }
             #else
             this.poll_entries()
             if !this.queue.is_empty() : continue
@@ -331,7 +346,7 @@ class PollWatchEntry {
                 }
                 let fflags = ev.fflags
                 if entry.is_dir && (fflags & (KQ_NOTE_WRITE | KQ_NOTE_EXTEND | KQ_NOTE_LINK)) != 0 {
-                    mac_diff_dir(entry, this.queue)
+                    entry.children = watch_diff_dir(entry.path, entry.children, this.queue)
                 } else if (fflags & KQ_NOTE_DELETE) != 0 {
                     this.queue.push_back(WatchEvent { path: entry.path, kind: WatchEventKind.remove })
                 } else if (fflags & KQ_NOTE_RENAME) != 0 {
@@ -343,26 +358,26 @@ class PollWatchEntry {
             }
         }
     }
+
+    fn mac_has_dirs() bool {
+        each this.fd_to_entry as entry {
+            if entry.is_dir : return true
+        }
+        return false
+    }
+
+    fn mac_poll_dirs() {
+        each this.fd_to_entry as entry {
+            if entry.is_dir {
+                entry.children = watch_diff_dir(entry.path, entry.children, this.queue)
+            }
+        }
+    }
     #else
     fn poll_entries() {
         each this.entries as entry {
             if entry.is_dir {
-                let next_map = HashMap[String, (uint, uint)]{}
-                poll_snapshot_dir(entry.path, next_map)
-                each next_map as meta, child {
-                    let prev = entry.children.get(child) !? null
-                    if !isset(prev) {
-                        this.queue.push_back(WatchEvent { path: child, kind: WatchEventKind.create })
-                    } else if prev[0] != meta[0] || prev[1] != meta[1] {
-                        this.queue.push_back(WatchEvent { path: child, kind: WatchEventKind.modify })
-                    }
-                }
-                each entry.children as _, child {
-                    if !next_map.has(child) {
-                        this.queue.push_back(WatchEvent { path: child, kind: WatchEventKind.remove })
-                    }
-                }
-                entry.children = next_map
+                entry.children = watch_diff_dir(entry.path, entry.children, this.queue)
             } else {
                 let info = stat(entry.path) ! {
                     if entry.exists {
@@ -395,46 +410,92 @@ fn inotify_mask_kind(mask: u32) ?WatchEventKind {
     if (mask & (IN_MODIFY | IN_CLOSE_WRITE | IN_ATTRIB)) != 0 : return WatchEventKind.modify
     return null
 }
-#elif OS == "macos"
-fn mac_snapshot_dir(dir: String, out: HashMap[String, uint]) {
-    let items = files_in(dir, false, true, true, false) ! return
-    each items as p {
-        let mtime = modified_time(p) !? 0
-        out.set(p, mtime)
-    }
-}
-
-fn mac_diff_dir(entry: MacWatchEntry, queue: Deque[WatchEvent]) {
-    let next_map = HashMap[String, uint]{}
-    mac_snapshot_dir(entry.path, next_map)
-    let emitted = false
-    each next_map as mtime, child {
-        let prev = entry.children.get(child) !? null
-        if !isset(prev) {
-            queue.push_back(WatchEvent { path: child, kind: WatchEventKind.create })
-            emitted = true
-        } else if prev != mtime {
-            queue.push_back(WatchEvent { path: child, kind: WatchEventKind.modify })
-            emitted = true
-        }
-    }
-    each entry.children as _, child {
-        if !next_map.has(child) {
-            queue.push_back(WatchEvent { path: child, kind: WatchEventKind.remove })
-            emitted = true
-        }
-    }
-    entry.children = next_map
-    if !emitted {
-        queue.push_back(WatchEvent { path: entry.path, kind: WatchEventKind.modify })
-    }
-}
 #else
-fn poll_snapshot_dir(dir: String, out: HashMap[String, (uint, uint)]) {
+fn watch_snapshot_dir(dir: String, out: HashMap[String, WatchChildMeta]) {
     let items = files_in(dir, false, true, true, false) ! return
     each items as p {
         let info = stat(p) ! continue
-        out.set(p, (info.modified_time, info.size))
+        out.set(p, WatchChildMeta { mtime: info.modified_time, size: info.size, inode: info.inode })
     }
+}
+
+fn watch_diff_dir(dir: String, prev_map: HashMap[String, WatchChildMeta], queue: Deque[WatchEvent]) HashMap[String, WatchChildMeta] {
+    let next_map = HashMap[String, WatchChildMeta]{}
+    watch_snapshot_dir(dir, next_map)
+
+    let added = Array[String].new()
+    let removed = Array[String].new()
+    each next_map as meta, child {
+        let prev = prev_map.get(child) !? null
+        if !isset(prev) {
+            added.append(child)
+        } else if prev.mtime != meta.mtime || prev.size != meta.size {
+            queue.push_back(WatchEvent { path: child, kind: WatchEventKind.modify })
+        }
+    }
+    each prev_map as _, child {
+        if !next_map.has(child) : removed.append(child)
+    }
+
+    // Match removed + added pairs with the same inode or (size, mtime) as renames
+    let add_matched = Array[bool].new(added.length)
+    let rem_matched = Array[bool].new(removed.length)
+    let i: uint = 0
+    while i < added.length {
+        add_matched.append(false)
+        i++
+    }
+    i = 0
+    while i < removed.length {
+        rem_matched.append(false)
+        i++
+    }
+
+    let ri: uint = 0
+    while ri < removed.length {
+        let rp = removed.get(ri) ! break
+        let rm = prev_map.get(rp) ! {
+            ri++
+            continue
+        }
+        let ai: uint = 0
+        while ai < added.length {
+            if !(add_matched.get(ai) !? true) {
+                let ap = added.get(ai) ! break
+                let am = next_map.get(ap) ! {
+                    ai++
+                    continue
+                }
+                let same_inode = rm.inode != 0 && rm.inode == am.inode
+                let same_meta = rm.size == am.size && rm.mtime == am.mtime
+                if same_inode || same_meta {
+                    rem_matched.set(ri, true) _
+                    add_matched.set(ai, true) _
+                    queue.push_back(WatchEvent { path: ap, kind: WatchEventKind.rename })
+                    break
+                }
+            }
+            ai++
+        }
+        ri++
+    }
+
+    i = 0
+    while i < added.length {
+        if !(add_matched.get(i) !? true) {
+            let ap = added.get(i) ! break
+            queue.push_back(WatchEvent { path: ap, kind: WatchEventKind.create })
+        }
+        i++
+    }
+    i = 0
+    while i < removed.length {
+        if !(rem_matched.get(i) !? true) {
+            let rp = removed.get(i) ! break
+            queue.push_back(WatchEvent { path: rp, kind: WatchEventKind.remove })
+        }
+        i++
+    }
+    return next_map
 }
 #end

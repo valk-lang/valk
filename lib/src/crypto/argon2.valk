@@ -1,3 +1,5 @@
+use mem
+
 // Argon2id (RFC 9106) password hashing and key derivation via OpenSSL 3.5's ARGON2ID KDF.
 
 value ARGON2_VERSION (0x13)
@@ -24,7 +26,8 @@ value ARGON2_DEFAULT_TAG_LEN (32)
 
     let kdf = EVP_KDF_fetch(null, "ARGON2ID".@cast(cstring), null) ?! {
         ERR_clear_error()
-        throw .invalid_input
+        // Host OpenSSL < 3.2 lacks ARGON2ID: fall back to pure-Valk RFC 9106 implementation
+        return argon2id_pure(password, salt, memory_kib, iterations, parallelism, length) !>
     }
     let ctx = EVP_KDF_CTX_new(kdf) ?! {
         EVP_KDF_free(kdf)
@@ -134,3 +137,367 @@ fn base64_nopad_encode(data: local &[u8]) String {
     let derived = argon2id(password, salt, mem_kib, iterations, parallelism, expected.bytes) ! return false
     return constant_time_equals(derived, expected)
 }
+
+// Pure-Valk RFC 9106 Argon2id v1.3 fallback (for hosts linked against OpenSSL < 3.2)
+
+fn argon2_rotr64(x: u64, r: u64) u64 $inline {
+    return (x >> r) | (x << (64 - r))
+}
+
+fn argon2_gb(v: *[u64], a: uint, b: uint, c: uint, d: uint) $inline {
+    @unsafe
+    let va = v[a]
+    let vb = v[b]
+    let vc = v[c]
+    let vd = v[d]
+
+    va = va + vb + 2 * (va & 0xffffffff) * (vb & 0xffffffff)
+    vd = argon2_rotr64(vd ^ va, 32)
+    vc = vc + vd + 2 * (vc & 0xffffffff) * (vd & 0xffffffff)
+    vb = argon2_rotr64(vb ^ vc, 24)
+
+    va = va + vb + 2 * (va & 0xffffffff) * (vb & 0xffffffff)
+    vd = argon2_rotr64(vd ^ va, 16)
+    vc = vc + vd + 2 * (vc & 0xffffffff) * (vd & 0xffffffff)
+    vb = argon2_rotr64(vb ^ vc, 63)
+
+    v[a] = va
+    v[b] = vb
+    v[c] = vc
+    v[d] = vd
+}
+
+fn argon2_perm(v: *[u64]) $inline {
+    argon2_gb(v, 0, 4, 8, 12)
+    argon2_gb(v, 1, 5, 9, 13)
+    argon2_gb(v, 2, 6, 10, 14)
+    argon2_gb(v, 3, 7, 11, 15)
+    argon2_gb(v, 0, 5, 10, 15)
+    argon2_gb(v, 1, 6, 11, 12)
+    argon2_gb(v, 2, 7, 8, 13)
+    argon2_gb(v, 3, 4, 9, 14)
+}
+
+// RFC 9106 §3.5: G(X, Y) = Q XOR R; when `xor_dst` is true, XORs into `dst` instead of overwriting
+fn argon2_compress(dst: *[u64], x: *[u64], y: *[u64], xor_dst: bool) {
+    @unsafe
+    let r: [u64 x 128] = @undefined
+    let q: [u64 x 128] = @undefined
+    let i: uint = 0
+    while i < 128 {
+        let v = x[i] ^ y[i]
+        r[i] = v
+        q[i] = v
+        i++
+    }
+
+    // Row-wise P
+    let row: uint = 0
+    while row < 8 {
+        argon2_perm(@ref(q[row * 16]).@cast(*[u64]))
+        row++
+    }
+
+    // Column-wise P (8 columns of 16 u64s each)
+    let tmp: [u64 x 16] = @undefined
+    let col: uint = 0
+    while col < 8 {
+        let base = col * 2
+        let k: uint = 0
+        while k < 8 {
+            tmp[k * 2] = q[k * 16 + base]
+            tmp[k * 2 + 1] = q[k * 16 + base + 1]
+            k++
+        }
+        argon2_perm(@ref(tmp).@cast(*[u64]))
+        k = 0
+        while k < 8 {
+            q[k * 16 + base] = tmp[k * 2]
+            q[k * 16 + base + 1] = tmp[k * 2 + 1]
+            k++
+        }
+        col++
+    }
+
+    i = 0
+    if xor_dst {
+        while i < 128 {
+            dst[i] = dst[i] ^ q[i] ^ r[i]
+            i++
+        }
+    } else {
+        while i < 128 {
+            dst[i] = q[i] ^ r[i]
+            i++
+        }
+    }
+}
+
+fn argon2_h_prime(input: local &[u8], out: local mut &[u8]) !CryptoError {
+    let tau = out.length
+    let le_tau: [u8 x 4] = {
+        (tau & 0xff).to(u8),
+        ((tau >> 8) & 0xff).to(u8),
+        ((tau >> 16) & 0xff).to(u8),
+        ((tau >> 24) & 0xff).to(u8)
+    }
+    if tau <= 64 {
+        let b = Blake2b.new(tau) !>
+        b.update(le_tau)
+        b.update(input)
+        b.finalize(out)
+        return
+    }
+    let v: [u8 x 64] = { 0... }
+    let b0 = Blake2b.new(64) !>
+    b0.update(le_tau)
+    b0.update(input)
+    b0.finalize(v)
+
+    let r = ((tau + 31) / 32) - 2
+    let pos: uint = 0
+    let step: uint = 0
+    while step < r {
+        let j: uint = 0
+        while j < 32 {
+            out[pos + j] = v[j]
+            j++
+        }
+        pos += 32
+        step++
+        if step < r {
+            let bi = Blake2b.new(64) !>
+            bi.update(v)
+            bi.finalize(v)
+        }
+    }
+    let rem = tau - pos
+    let bf = Blake2b.new(rem) !>
+    bf.update(v)
+    bf.finalize(out.view(pos, rem))
+}
+
+fn argon2_put_le32(buf: ByteBuffer, v: uint) {
+    buf.write_byte((v & 0xff).to(u8))
+    buf.write_byte(((v >> 8) & 0xff).to(u8))
+    buf.write_byte(((v >> 16) & 0xff).to(u8))
+    buf.write_byte(((v >> 24) & 0xff).to(u8))
+}
+
+fn argon2_load_block(dst: *[u64], src: local &[u8]) {
+    @unsafe
+    let i: uint = 0
+    while i < 128 {
+        let o = i * 8
+        let v: u64 = src[o].to(u64)
+            | (src[o + 1].to(u64) << 8)
+            | (src[o + 2].to(u64) << 16)
+            | (src[o + 3].to(u64) << 24)
+            | (src[o + 4].to(u64) << 32)
+            | (src[o + 5].to(u64) << 40)
+            | (src[o + 6].to(u64) << 48)
+            | (src[o + 7].to(u64) << 56)
+        dst[i] = v
+        i++
+    }
+}
+
+fn argon2_store_block(src: *[u64], dst: local mut &[u8]) {
+    @unsafe
+    let i: uint = 0
+    while i < 128 {
+        let v = src[i]
+        let o = i * 8
+        dst[o] = (v & 0xff).to(u8)
+        dst[o + 1] = ((v >> 8) & 0xff).to(u8)
+        dst[o + 2] = ((v >> 16) & 0xff).to(u8)
+        dst[o + 3] = ((v >> 24) & 0xff).to(u8)
+        dst[o + 4] = ((v >> 32) & 0xff).to(u8)
+        dst[o + 5] = ((v >> 40) & 0xff).to(u8)
+        dst[o + 6] = ((v >> 48) & 0xff).to(u8)
+        dst[o + 7] = ((v >> 56) & 0xff).to(u8)
+        i++
+    }
+}
+
+fn argon2id_pure(
+    password: local &[u8],
+    salt: local &[u8],
+    memory_kib: uint,
+    iterations: uint,
+    parallelism: uint,
+    length: uint
+) String !CryptoError {
+    @unsafe
+    let lanes = parallelism
+    let q = (memory_kib / (4 * lanes)) * 4
+    let m_prime = q * lanes
+    let seg_len = q / 4
+
+    // Compute H0 (64 bytes)
+    let h0_in = ByteBuffer.new(40 + password.length + salt.length)
+    argon2_put_le32(h0_in, lanes)
+    argon2_put_le32(h0_in, length)
+    argon2_put_le32(h0_in, memory_kib)
+    argon2_put_le32(h0_in, iterations)
+    argon2_put_le32(h0_in, ARGON2_VERSION)
+    argon2_put_le32(h0_in, 2) // Argon2id
+    argon2_put_le32(h0_in, password.length)
+    h0_in.write(password)
+    argon2_put_le32(h0_in, salt.length)
+    h0_in.write(salt)
+    argon2_put_le32(h0_in, 0) // secret
+    argon2_put_le32(h0_in, 0) // associated data
+
+    let h0: [u8 x 64] = { 0... }
+    let hb = Blake2b.new(64) !>
+    hb.update(h0_in)
+    hb.finalize(h0)
+
+    let total_bytes = m_prime * 1024
+    let blocks_raw = mem.calloc(total_bytes)
+    let blocks = blocks_raw.@cast(*[u64])
+    defer {
+        OPENSSL_cleanse(blocks_raw, total_bytes)
+        mem.free(blocks_raw)
+    }
+
+    // Initialize B[lane][0] and B[lane][1]
+    let seed_in: [u8 x 72] = { 0... }
+    let bi: uint = 0
+    while bi < 64 {
+        seed_in[bi] = h0[bi]
+        bi++
+    }
+    let blk_bytes: [u8 x 1024] = { 0... }
+    let lane: uint = 0
+    while lane < lanes {
+        seed_in[68] = (lane & 0xff).to(u8)
+        seed_in[69] = ((lane >> 8) & 0xff).to(u8)
+        seed_in[70] = ((lane >> 16) & 0xff).to(u8)
+        seed_in[71] = ((lane >> 24) & 0xff).to(u8)
+
+        seed_in[64] = 0
+        argon2_h_prime(seed_in, blk_bytes) !>
+        argon2_load_block(blocks.@offset(lane * q * 128 * 8).@cast(*[u64]), blk_bytes)
+
+        seed_in[64] = 1
+        argon2_h_prime(seed_in, blk_bytes) !>
+        argon2_load_block(blocks.@offset((lane * q + 1) * 128 * 8).@cast(*[u64]), blk_bytes)
+        lane++
+    }
+
+    let zero_blk: [u64 x 128] = { 0... }
+    let input_blk: [u64 x 128] = { 0... }
+    let tmp_blk: [u64 x 128] = { 0... }
+    let addr_blk: [u64 x 128] = { 0... }
+
+    let pass: uint = 0
+    while pass < iterations {
+        let slice: uint = 0
+        while slice < 4 {
+            let data_indep = pass == 0 && slice < 2
+            lane = 0
+            while lane < lanes {
+                let addr_counter: u64 = 0
+                let index: uint = 0
+                if pass == 0 && slice == 0 : index = 2
+                if data_indep {
+                    let z: uint = 0
+                    while z < 128 {
+                        input_blk[z] = 0
+                        z++
+                    }
+                    input_blk[0] = pass.to(u64)
+                    input_blk[1] = lane.to(u64)
+                    input_blk[2] = slice.to(u64)
+                    input_blk[3] = m_prime.to(u64)
+                    input_blk[4] = iterations.to(u64)
+                    input_blk[5] = 2 // Argon2id
+                }
+                while index < seg_len {
+                    let cur_col = slice * seg_len + index
+                    let prev_col = cur_col == 0 ? q - 1 : cur_col - 1
+                    let prev_ptr = blocks.@offset((lane * q + prev_col) * 128 * 8).@cast(*[u64])
+                    let cur_ptr = blocks.@offset((lane * q + cur_col) * 128 * 8).@cast(*[u64])
+
+                    let j1: u64 = 0
+                    let j2: u64 = 0
+                    if data_indep {
+                        let slot = index & 127
+                        if slot == 0 || (pass == 0 && slice == 0 && index == 2) {
+                            addr_counter++
+                            input_blk[6] = addr_counter
+                            argon2_compress(@ref(tmp_blk).@cast(*[u64]), @ref(zero_blk).@cast(*[u64]), @ref(input_blk).@cast(*[u64]), false)
+                            argon2_compress(@ref(addr_blk).@cast(*[u64]), @ref(zero_blk).@cast(*[u64]), @ref(tmp_blk).@cast(*[u64]), false)
+                        }
+                        let w = addr_blk[slot]
+                        j1 = w & 0xffffffff
+                        j2 = w >> 32
+                    } else {
+                        let w = prev_ptr[0]
+                        j1 = w & 0xffffffff
+                        j2 = w >> 32
+                    }
+
+                    let ref_lane = (pass == 0 && slice == 0) ? lane : (j2 % lanes.to(u64)).to(uint)
+                    let ref_area: uint = 0
+                    if pass == 0 {
+                        if slice == 0 : ref_area = index - 1
+                        else if ref_lane == lane : ref_area = slice * seg_len + index - 1
+                        else : ref_area = slice * seg_len - (index == 0 ? 1 : 0)
+                    } else {
+                        if ref_lane == lane : ref_area = q - seg_len + index - 1
+                        else : ref_area = q - seg_len - (index == 0 ? 1 : 0)
+                    }
+
+                    let x = (j1 * j1) >> 32
+                    let y = (ref_area.to(u64) * x) >> 32
+                    let rel_pos = ref_area - 1 - y.to(uint)
+                    let start_pos: uint = (pass == 0 || slice == 3) ? 0 : (slice + 1) * seg_len
+                    let ref_col = (start_pos + rel_pos) % q
+                    let ref_ptr = blocks.@offset((ref_lane * q + ref_col) * 128 * 8).@cast(*[u64])
+
+                    argon2_compress(cur_ptr, prev_ptr, ref_ptr, pass > 0)
+                    index++
+                }
+                lane++
+            }
+            slice++
+        }
+        pass++
+    }
+
+    // Finalize: XOR last column across all lanes, then H'(C, length)
+    let final_blk: [u64 x 128] = { 0... }
+    lane = 0
+    while lane < lanes {
+        let lp = blocks.@offset((lane * q + (q - 1)) * 128 * 8).@cast(*[u64])
+        let k: uint = 0
+        while k < 128 {
+            final_blk[k] = final_blk[k] ^ lp[k]
+            k++
+        }
+        lane++
+    }
+    argon2_store_block(@ref(final_blk).@cast(*[u64]), blk_bytes)
+
+    let out = String.alloc(length)
+    let out_view: mut &[u8] = [u8]{ owner: null, data: out.data.@cast(*[u8]), length: length }
+    argon2_h_prime(blk_bytes, out_view) !>
+    return out
+}
+
+#if TEST
+/// Test hook: runs the pure-Valk RFC 9106 Argon2id implementation directly.
++ fn argon2id_pure_for_test(
+    password: local &[u8],
+    salt: local &[u8],
+    memory_kib: uint,
+    iterations: uint,
+    parallelism: uint,
+    length: uint
+) String !CryptoError {
+    return argon2id_pure(password, salt, memory_kib, iterations, parallelism, length) !>
+}
+#end
