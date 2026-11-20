@@ -1,0 +1,259 @@
+use valk.core
+use valk.gc
+use valk.sync
+use valk.thread
+use valk.time
+
+class SyncCounter {
+    + value: uint (0)
+    + runs: uint (0)
+}
+
+class LazyConfig {
+    + name: String
+    + port: uint
+}
+
+class CondBox {
+    + ready: bool (false)
+    + count: uint (0)
+    + woken: uint (0)
+}
+
+test "sync.Once: runs once across coroutines and threads" {
+    let once = sync.Once.new() !!
+    assert(!once.is_done)
+    let counter = SyncCounter {}
+    once.call(fn() {
+        counter.runs++
+    })
+    assert(once.is_done)
+    assert(counter.runs == 1)
+    once.call(fn() {
+        counter.runs++
+    })
+    assert(counter.runs == 1)
+
+    // Coroutines wait while the first call is still running
+    let coro_once = sync.Once.new() !!
+    let box: atomic SyncCounter = SyncCounter {}
+    let c1 = co fn() {
+        coro_once.call(fn() {
+            time.sleep_ms(20)
+            atomic(box.runs + 1)
+            atomic_store(box.value, 99)
+        })
+        assert(atomic_load(box.value) == 99)
+    }()
+    let c2 = co fn() {
+        time.sleep_ms(5)
+        coro_once.call(fn() {
+            atomic(box.runs + 1)
+        })
+        assert(atomic_load(box.value) == 99)
+    }()
+    await c1
+    await c2
+    assert(atomic_load(box.runs) == 1)
+
+    // Cross-thread contention
+    let mt_once = sync.Once.new() !!
+    let mt_box: atomic SyncCounter = SyncCounter {}
+    let threads = Array[thread.Thread[void]]{}
+    let i: uint = 0
+    while i < 4 {
+        let th = thread.start(fn() {
+            mt_once.call(fn() {
+                time.sleep_ms(10)
+                atomic(mt_box.runs + 1)
+                atomic_store(mt_box.value, 777)
+            })
+            assert(atomic_load(mt_box.value) == 777)
+        }) !!
+        threads.append(th)
+        i++
+    }
+    each threads as th : th.await()
+    assert(mt_once.is_done)
+    assert(atomic_load(mt_box.runs) == 1)
+}
+
+test "sync.Lazy: initializes once for numbers, strings, atomic objects and nullables" {
+    let counter: atomic SyncCounter = SyncCounter {}
+    let lazy_num = sync.Lazy[uint].new(fn() uint {
+        atomic(counter.runs + 1)
+        return 42
+    }) !!
+    assert(!lazy_num.is_initialized)
+    assert(lazy_num.get() == 42)
+    assert(lazy_num.is_initialized)
+    assert(lazy_num.get() == 42)
+    assert(atomic_load(counter.runs) == 1)
+
+    // Heap-allocated String across threads with GC collection
+    let str_counter: atomic SyncCounter = SyncCounter {}
+    let lazy_str = sync.Lazy[String].new(fn() String {
+        atomic(str_counter.runs + 1)
+        return "lazy-" + "value-" + (123).to_string()
+    }) !!
+    let threads = Array[thread.Thread[String]]{}
+    let i: uint = 0
+    while i < 4 {
+        let th = thread.Thread[String].start(fn() String {
+            let s = lazy_str.get()
+            gc.collect()
+            return s
+        }) !!
+        threads.append(th)
+        i++
+    }
+    each threads as th {
+        assert(th.await() == "lazy-value-123")
+    }
+    gc.collect_shared()
+    assert(lazy_str.get() == "lazy-value-123")
+    assert(atomic_load(str_counter.runs) == 1)
+
+    // atomic object
+    let lazy_cfg = sync.Lazy[atomic LazyConfig].new(fn() atomic LazyConfig {
+        return LazyConfig { name: "app", port: 8080 }
+    }) !!
+    let cfg = lazy_cfg.get()
+    assert(cfg.name == "app" && cfg.port == 8080)
+
+    // Nullable T returning null caches null and does not re-run initializer
+    let null_counter: atomic SyncCounter = SyncCounter {}
+    let lazy_null = sync.Lazy[?String].new(fn() ?String {
+        atomic(null_counter.runs + 1)
+        return null
+    }) !!
+    assert(!isset(lazy_null.get()))
+    assert(lazy_null.is_initialized)
+    assert(!isset(lazy_null.get()))
+    assert(atomic_load(null_counter.runs) == 1)
+}
+
+test "sync.Barrier: reusable across rounds, coroutines, threads and timeouts" {
+    let invalid = false
+    sync.Barrier.new(0) ! { invalid = error_is(E.code, init) }
+    assert(invalid)
+
+    let single = sync.Barrier.new(1) !!
+    assert(single.parties == 1)
+    assert(single.wait() !!)
+    assert(single.wait() !!)
+
+    // Reusable across 3 rounds with 4 coroutines
+    let barrier = sync.Barrier.new(4) !!
+    assert(barrier.parties == 4)
+    let leaders: atomic SyncCounter = SyncCounter {}
+    let coros = Array[co()] {}
+    let c: uint = 0
+    while c < 4 {
+        let handle = co fn() {
+            let round: uint = 0
+            while round < 3 {
+                atomic(leaders.value + 1)
+                if barrier.wait() !! {
+                    atomic(leaders.runs + 1)
+                }
+                round++
+            }
+        }()
+        coros.append(handle)
+        c++
+    }
+    each coros as h : await h
+    assert(atomic_load(leaders.value) == 12)
+    assert(atomic_load(leaders.runs) == 3)
+
+    // Multi-thread 3-round barrier
+    let mt_barrier = sync.Barrier.new(4) !!
+    let mt_leaders: atomic SyncCounter = SyncCounter {}
+    let threads = Array[thread.Thread[void]]{}
+    let t: uint = 0
+    while t < 4 {
+        let th = thread.start(fn() {
+            let round: uint = 0
+            while round < 3 {
+                if mt_barrier.wait() !! {
+                    atomic(mt_leaders.runs + 1)
+                }
+                round++
+            }
+        }) !!
+        threads.append(th)
+        t++
+    }
+    each threads as th : th.await()
+    assert(atomic_load(mt_leaders.runs) == 3)
+
+    // Timeout undoes arrival so later callers still trip the barrier cleanly
+    let timed = sync.Barrier.new(2) !!
+    let timed_out = false
+    timed.wait(20) ! { timed_out = error_is(E.code, timeout) }
+    assert(timed_out)
+
+    let b1 = co fn() bool { return timed.wait(1000) !! }()
+    let b2 = co fn() bool { return timed.wait(1000) !! }()
+    let r1 = await b1
+    let r2 = await b2
+    assert(r1 != r2)
+}
+
+test "sync.Cond: signal, broadcast, timeout and cross-thread wake" {
+    // Coroutines with plain core.Mutex + signal
+    let m = core.Mutex.new() !!
+    let cond = sync.Cond.new() !!
+    let state: atomic CondBox = CondBox {}
+
+    let waiter = co fn() {
+        m.lock()
+        defer m.unlock()
+        while !atomic_load(state.ready) {
+            cond.wait(m) !!
+        }
+        atomic(state.woken + 1)
+    }()
+    time.sleep_ms(10)
+    m.lock()
+    atomic_store(state.ready, true)
+    cond.signal()
+    m.unlock()
+    await waiter
+    assert(atomic_load(state.woken) == 1)
+
+    // Timeout leaves mutex locked for the caller
+    m.lock()
+    let got_timeout = false
+    cond.wait(m, 20) ! { got_timeout = error_is(E.code, timeout) }
+    assert(got_timeout)
+    m.unlock()
+
+    // Broadcast across 4 threads with atomic core.Mutex
+    let mt_m: atomic core.Mutex = core.Mutex.new() !!
+    let mt_cond = sync.Cond.new() !!
+    let mt_state: atomic CondBox = CondBox {}
+    let threads = Array[thread.Thread[void]]{}
+    let i: uint = 0
+    while i < 4 {
+        let th = thread.start(fn() {
+            mt_m.lock()
+            defer mt_m.unlock()
+            atomic(mt_state.count + 1)
+            while !atomic_load(mt_state.ready) {
+                mt_cond.wait(mt_m) !!
+            }
+            atomic(mt_state.woken + 1)
+        }) !!
+        threads.append(th)
+        i++
+    }
+    while atomic_load(mt_state.count) < 4 : time.sleep_ms(1)
+    mt_m.lock()
+    atomic_store(mt_state.ready, true)
+    mt_cond.broadcast()
+    mt_m.unlock()
+    each threads as th : th.await()
+    assert(atomic_load(mt_state.woken) == 4)
+}

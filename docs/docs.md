@@ -2370,7 +2370,11 @@ one, `done()` when it finishes and `wait()` for all of them. A `Semaphore` limit
 how many tasks run at once: `acquire()` takes one of its permits, waiting while
 none is free, and `release()` gives it back. `sync.RwLock[T]` (`read`, `write`, `get`, `set`)
 and `sync.RwMutex` provide reader-writer synchronization where multiple readers can
-proceed concurrently while writers take exclusive access.
+proceed concurrently while writers take exclusive access. `sync.Once` runs an
+initializer at most once (`call`), `sync.Lazy[T]` lazily computes and caches a shared
+value (`get`), `sync.Barrier` synchronizes a fixed number of participants across
+rounds (`wait`), and `sync.Cond` parks waiters on a `core.Mutex` until `signal` or
+`broadcast`.
 
 ### Shared maps
 

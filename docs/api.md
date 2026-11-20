@@ -5020,6 +5020,18 @@ error SignalError (unsupported, init)
 ## Classes for 'sync'
 
 ```js
+// Synchronizes a fixed number of coroutines or threads at a rendezvous point.
++ class Barrier {
+    // Creates a reusable barrier for `count` participants.
+    + static fn new(count: uint) Barrier !SyncError
+    // The number of participants required to trip the barrier.
+    + get parties: uint
+    // Waits until all participants have called `wait` for the current round.
+    + fn wait(timeout_ms: uint (0)) bool !SyncError
+}
+```
+
+```js
 // A cancellation signal shared between coroutines and threads.
 + class CancelToken {
     // Cancels this token and its children; a second call does nothing.
@@ -5084,6 +5096,44 @@ error SignalError (unsupported, init)
     + fn snapshot() HashMap[K, V]
     // Stores what `change` makes of the current value (`null` when there is none), and returns it. `change` runs while the key's shard is locked: it must not use this map.
     + fn update(key: K, change: fn(?V)(V)) V
+}
+```
+
+```js
+// A condition variable that parks coroutines or threads until signaled.
++ class Cond {
+    // Wakes all waiters currently blocked in `wait`.
+    + fn broadcast() void
+    // Creates a new condition variable.
+    + static fn new() Cond !SyncError
+    // Wakes one waiter blocked in `wait`, if any.
+    + fn signal() void
+    // Releases `mutex`, waits for `signal` or `broadcast`, and re-acquires `mutex` before returning.
+    + fn wait(mutex: atomic Mutex, timeout_ms: uint (0)) void !SyncError
+}
+```
+
+```js
+// Lazily initializes a shared value at most once across threads and coroutines.
++ class Lazy[T] {
+    // Returns the initialized value, computing it once on the first call.
+    + fn get() T
+    // Whether the value has been initialized.
+    + get is_initialized: bool
+    // Creates a lazy cell that will compute its value on first `get()` by calling `init`.
+    + static fn new(init: atomic fn()(T)) Lazy[T] !SyncError
+}
+```
+
+```js
+// Runs an initialization function at most once across threads and coroutines.
++ class Once {
+    // Runs `func` if this `Once` has not completed yet; waits if another caller is running it.
+    + fn call(func: fn()()) void
+    // Whether initialization has completed.
+    + get is_done: bool
+    // Creates a new `Once` that has not run yet.
+    + static fn new() Once !SyncError
 }
 ```
 

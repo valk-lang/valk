@@ -16999,6 +16999,49 @@ channel cannot be created.
 ## Classes for 'sync'
 
 ```js
+// Synchronizes a fixed number of coroutines or threads at a rendezvous point.
++ class Barrier {
+    // Creates a reusable barrier for `count` participants.
+    + static fn new(count: uint) Barrier !SyncError
+    // The number of participants required to trip the barrier.
+    + get parties: uint
+    // Waits until all participants have called `wait` for the current round.
+    + fn wait(timeout_ms: uint (0)) bool !SyncError
+}
+```
+
+### Barrier
+
+Synchronizes a fixed number of coroutines or threads at a rendezvous point.
+
+Each participant calls `wait()`, which blocks until `parties` participants have arrived.
+Once all arrive, everyone wakes and the barrier resets for the next round. Exactly one
+participant per round receives `true` (the leader) and the others receive `false`.
+
+```valk
+let barrier = sync.Barrier.new(4) !!
+let is_leader = barrier.wait() !!
+```
+
+#### new
+
+Creates a reusable barrier for `count` participants.
+
+Throws `init` when `count` is 0 or its lock cannot be created.
+
+#### parties
+
+The number of participants required to trip the barrier.
+
+#### wait
+
+Waits until all participants have called `wait` for the current round.
+
+Returns `true` for exactly one participant (the leader) and `false` for the rest.
+`timeout_ms` 0 waits forever; throws `timeout` if the deadline expires before the round
+completes (undoing this caller's arrival). Inside a coroutine only the coroutine waits.
+
+```js
 // A cancellation signal shared between coroutines and threads.
 + class CancelToken {
     // Cancels this token and its children; a second call does nothing.
@@ -17232,6 +17275,133 @@ may not be in it.
 
 Stores what `change` makes of the current value (`null` when there is none), and returns
 it. `change` runs while the key's shard is locked: it must not use this map.
+
+```js
+// A condition variable that parks coroutines or threads until signaled.
++ class Cond {
+    // Wakes all waiters currently blocked in `wait`.
+    + fn broadcast() void
+    // Creates a new condition variable.
+    + static fn new() Cond !SyncError
+    // Wakes one waiter blocked in `wait`, if any.
+    + fn signal() void
+    // Releases `mutex`, waits for `signal` or `broadcast`, and re-acquires `mutex` before returning.
+    + fn wait(mutex: atomic Mutex, timeout_ms: uint (0)) void !SyncError
+}
+```
+
+### Cond
+
+A condition variable that parks coroutines or threads until signaled.
+
+Pair it with a `core.Mutex` guarding the shared state. Call `wait(mutex)` in a loop while
+holding `mutex` until the condition becomes true; `wait` releases `mutex` while waiting
+and always re-acquires it before returning (including on timeout).
+
+```valk
+mutex.lock()
+defer mutex.unlock()
+while !ready {
+    cond.wait(mutex) !!
+}
+```
+
+#### broadcast
+
+Wakes all waiters currently blocked in `wait`.
+
+#### new
+
+Creates a new condition variable.
+
+#### signal
+
+Wakes one waiter blocked in `wait`, if any.
+
+#### wait
+
+Releases `mutex`, waits for `signal` or `broadcast`, and re-acquires `mutex` before
+returning.
+
+`mutex` must be locked by the caller. `timeout_ms` 0 waits forever; throws `timeout`
+if the timeout expires first (with `mutex` re-acquired). Inside a coroutine only the
+coroutine waits.
+
+```js
+// Lazily initializes a shared value at most once across threads and coroutines.
++ class Lazy[T] {
+    // Returns the initialized value, computing it once on the first call.
+    + fn get() T
+    // Whether the value has been initialized.
+    + get is_initialized: bool
+    // Creates a lazy cell that will compute its value on first `get()` by calling `init`.
+    + static fn new(init: atomic fn()(T)) Lazy[T] !SyncError
+}
+```
+
+### Lazy
+
+Lazily initializes a shared value at most once across threads and coroutines.
+
+The initializer runs on the first `get()` call; concurrent callers wait for it to finish,
+and later calls return the cached value after a single atomic load. Values cross threads,
+so `T` must be a number, bool, string or `atomic` object.
+
+```valk
+let cfg: sync.Lazy[String] = sync.Lazy[String].new(fn() String { return "ready" }) !!
+let value = cfg.get()
+```
+
+#### get
+
+Returns the initialized value, computing it once on the first call.
+
+#### is_initialized
+
+Whether the value has been initialized.
+
+#### new
+
+Creates a lazy cell that will compute its value on first `get()` by calling `init`.
+
+```js
+// Runs an initialization function at most once across threads and coroutines.
++ class Once {
+    // Runs `func` if this `Once` has not completed yet; waits if another caller is running it.
+    + fn call(func: fn()()) void
+    // Whether initialization has completed.
+    + get is_done: bool
+    // Creates a new `Once` that has not run yet.
+    + static fn new() Once !SyncError
+}
+```
+
+### Once
+
+Runs an initialization function at most once across threads and coroutines.
+
+After the first `call` completes, later calls return immediately after a single atomic
+load without taking a lock. Concurrent callers arriving while the first `call` is still
+running wait until it finishes.
+
+```valk
+let init: sync.Once = sync.Once.new() !!
+init.call(fn() {
+    // runs once
+})
+```
+
+#### call
+
+Runs `func` if this `Once` has not completed yet; waits if another caller is running it.
+
+#### is_done
+
+Whether initialization has completed.
+
+#### new
+
+Creates a new `Once` that has not run yet.
 
 ```js
 // A value shared across threads and coroutines with concurrent readers and exclusive writers.
