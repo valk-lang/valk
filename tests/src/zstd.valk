@@ -399,3 +399,201 @@ test "HTTP: static files serve on-the-fly zstd and .zst sidecars" {
     server.shutdown()
     await running !!
 }
+
+class ZstdSlowReader is io.Reader {
+    data: String
+    pos: uint (0)
+    max_chunk: uint (17)
+
+    + fn read(buf: local mut &[u8]) uint !io.IoError {
+        if this.pos >= this.data.bytes : return 0
+        let rem = this.data.bytes - this.pos
+        let take = rem
+        if take > this.max_chunk : take = this.max_chunk
+        if take > buf.length : take = buf.length
+        let i: uint = 0
+        while i < take {
+            buf[i] = this.data[this.pos + i]
+            i++
+        }
+        this.pos += take
+        return take
+    }
+}
+
+test "compress.Format.zstd: Compressor and Decompressor streaming across sizes and chunking" {
+    let samples = Array[String]{
+        "",
+        "a",
+        "hello streaming zstd",
+        "x".repeat(131071),
+        "y".repeat(131072),
+        "z".repeat(131073),
+        zstd_sample_json(2200), // > 180 KiB
+        zstd_pseudo_random(131073),
+    }
+
+    // Large multi-block payload (> 400 KiB) mixing JSON, RLE, random, and repeated text
+    let big = ByteBuffer.new(450000)
+    big.write(zstd_sample_json(2000))
+    big.write("Q".repeat(140000))
+    big.write(zstd_pseudo_random(40000))
+    big.write("The quick brown fox jumps over the lazy dog.\n".repeat(3000))
+    let big_str = big.into_string()
+    assert(big_str.bytes > 400000)
+    samples.append(big_str)
+
+    let levels = Array[uint]{ 0, 1, 3, 9 }
+    each samples as sample {
+        each levels as level {
+            // Stream into a small-chunk writer in awkward input slices
+            let sink = ZstdSliceWriter { max_chunk: 53 }
+            let comp = compress.Compressor.new(sink, .zstd, level)
+            let off: uint = 0
+            let step: uint = 4099
+            while off < sample.bytes {
+                let take = sample.bytes - off
+                if take > step : take = step
+                let written = comp.write(sample.view(off, take)) !!
+                assert(written == take)
+                off += take
+            }
+            comp.close() !!
+            // Double close is a no-op; writing after close throws .closed
+            comp.close() !!
+            let write_after_close = false
+            comp.write("x") ! { write_after_close = error_is(E.code, closed) }
+            assert(write_after_close)
+
+            let encoded = sink.buf.into_string()
+            // Must decode identically with one-shot unzstd
+            assert(compress.unzstd(encoded) !! == sample)
+            assert(compress.decompress(encoded, .zstd) !! == sample)
+
+            // And with streaming Decompressor over small-chunk source & small read buffer
+            let dec = compress.Decompressor.new(ZstdSlowReader { data: encoded, max_chunk: 137 }, .zstd)
+            let restored = ByteBuffer.new(sample.bytes)
+            let buf = [u8]{ 0 x 97 }
+            while true {
+                let n = dec.read(buf) !!
+                if n == 0 : break
+                restored.write(buf.view(0, n))
+            }
+            assert(restored.into_string() == sample)
+            assert(dec.consumed() == encoded.bytes)
+        }
+    }
+
+    // Verify true streaming emission: writing > 128 KiB emits bytes before close()
+    let streamed_sink = ByteBuffer.new(65536)
+    let streaming_comp = compress.Compressor.new(streamed_sink, .zstd, 3)
+    streaming_comp.write(zstd_sample_json(2000)) !!
+    assert(streamed_sink.length > 6)
+    streaming_comp.write(zstd_sample_json(2000)) !!
+    let before_close = streamed_sink.length
+    streaming_comp.close() !!
+    assert(streamed_sink.length > before_close)
+    assert(compress.unzstd(streamed_sink.view(0, streamed_sink.length)) !! == zstd_sample_json(2000) + zstd_sample_json(2000))
+
+    // Format.zstd works with generic compress / compress_into / decompress_into
+    let payload = zstd_sample_json(500)
+    let c = compress.compress(payload, .zstd, 3)
+    assert(compress.decompress(c, .zstd) !! == payload)
+    let cbuf = ByteBuffer.new(0)
+    let cn = compress.compress_into(payload, cbuf, .zstd, 3) !!
+    assert(cn == cbuf.length)
+    let dbuf = ByteBuffer.new(0)
+    let dn = compress.decompress_into(cbuf.view(0, cbuf.length), dbuf, .zstd) !!
+    assert(dn == payload.bytes)
+    assert(dbuf.into_string() == payload)
+}
+
+test "compress.Format.zstd: Decompressor handles concatenated frames, skippable frames, and errors" {
+    let part1 = "first streamed frame ".repeat(300)
+    let part2 = "second streamed frame ".repeat(300)
+    let f1 = compress.zstd(part1, 3)
+    let f2 = compress.zstd(part2, 1)
+
+    // Skippable frame between f1 and f2
+    let skip_buf = ByteBuffer.new(16)
+    skip_buf.write_u32_le(0x184d2a55)
+    skip_buf.write_u32_le(5)
+    skip_buf.write("hello")
+    let combined = f1 + skip_buf.into_string() + f2
+
+    let dec = compress.Decompressor.new(ZstdSlowReader { data: combined, max_chunk: 29 }, .zstd)
+    let out = io.read_all(dec) !!
+    assert(out == part1 + part2)
+    assert(dec.consumed() == combined.bytes)
+
+    // Empty input -> read error
+    let empty_err = false
+    io.read_all(compress.Decompressor.new(ByteReader.new(""), .zstd)) ! { empty_err = error_is(E.code, read) }
+    assert(empty_err)
+
+    // Truncated stream -> read error
+    let trunc_err = false
+    io.read_all(compress.Decompressor.new(ByteReader.new(f1.range(0, f1.bytes - 3)), .zstd)) ! { trunc_err = error_is(E.code, read) }
+    assert(trunc_err)
+
+    // Corrupted checksum -> read error in Decompressor, checksum error in decompress_into
+    let bad = ByteBuffer.new(f1.bytes)
+    bad.write(f1)
+    let bad_view = bad.view(0, bad.length)
+    bad_view[bad_view.length - 1] = bad_view[bad_view.length - 1] ^ 0xff
+    let bad_str = bad.into_string()
+    let csum_reader_err = false
+    io.read_all(compress.Decompressor.new(ByteReader.new(bad_str), .zstd)) ! { csum_reader_err = error_is(E.code, read) }
+    assert(csum_reader_err)
+    let csum_into_err = false
+    compress.decompress_into(bad_str, ByteBuffer.new(0), .zstd) ! { csum_into_err = error_is(E.code, checksum) }
+    assert(csum_into_err)
+
+    // max_size enforced in streaming decompress_into / unzstd_into
+    let limit_err = false
+    compress.decompress_into(f1, ByteBuffer.new(0), .zstd, 100) ! { limit_err = error_is(E.code, too_large) }
+    assert(limit_err)
+}
+
+test "compress.Format.zstd: streaming interop with reference zstd CLI" {
+    let ver = core.Process.output("zstd", .{ "--version" }) ! return
+    if ver.code != 0 : return
+
+    let dir = fs.create_temp_dir() !!
+    defer fs.delete_dir(dir) ! {}
+
+    let big = ByteBuffer.new(350000)
+    big.write(zstd_sample_json(1800))
+    big.write("R".repeat(140000))
+    big.write(zstd_pseudo_random(32000))
+    let payload = big.into_string()
+
+    // 1) Valk streaming Compressor -> reference `zstd -d`
+    let streamed_buf = ByteBuffer.new(65536)
+    let comp = compress.Compressor.new(streamed_buf, .zstd, 3)
+    let off: uint = 0
+    while off < payload.bytes {
+        let take = payload.bytes - off
+        if take > 16384 : take = 16384
+        comp.write(payload.view(off, take)) !!
+        off += take
+    }
+    comp.close() !!
+    let zst_path = dir + "/streamed.zst"
+    let out_path = dir + "/streamed.out"
+    fs.write(zst_path, streamed_buf.into_string()) !!
+    let dec_res = core.Process.output("zstd", .{ "-q", "-f", "-d", zst_path, "-o", out_path }) !!
+    assert(dec_res.code == 0)
+    assert(fs.read(out_path) !! == payload)
+
+    // 2) Reference `zstd -9` multi-block -> Valk streaming Decompressor
+    let raw_path = dir + "/ref.raw"
+    let ref_zst = dir + "/ref.zst"
+    fs.write(raw_path, payload) !!
+    let enc_res = core.Process.output("zstd", .{ "-q", "-f", "-9", raw_path, "-o", ref_zst }) !!
+    assert(enc_res.code == 0)
+    let ref_stream = fs.stream(ref_zst) !!
+    defer ref_stream.close() ! {}
+    let dec = compress.Decompressor.new(ref_stream, .zstd)
+    assert(io.read_all(dec) !! == payload)
+}

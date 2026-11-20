@@ -9,6 +9,8 @@
 + Fix (`fs.Watcher`): `close()` on Linux now removes watches (`inotify_rm_watch`) so blocked `next()` calls wake immediately on `io_uring` instead of waiting for timeout
 + Fix (`fmt`): named tagged-union payload variants tighten to `variant(Type)` instead of preserving a space before `(`
 + Fix (`lsp`): hover, go-to-definition, and completion now work inside string interpolations (including format specifiers), inside uninstantiated `const`-generic and constrained generic structs/classes, on named tagged-union variants and destructured `match` bindings, on `#loop properties` metadata (`$tag`, `$has_tag`, `$type`, ...), and on `atomic_cas`/`atomic_load`/`atomic_store`; `documentSymbol` now includes named union variants
++ Tooling (`bench` & `gc`): `valk bench` / `core.Bencher` now reports per-op GC heap memory (`B/op` and `allocs/op`, honoring `stop_timer`/`start_timer`/`reset_timer`), backed by zero-fast-path-overhead `gc.alloc_stats()`
++ Standard library (`compress`): streaming Zstandard support (`compress.Format.zstd`) across `Compressor`, `Decompressor`, `compress`, `decompress`, `compress_into`, `decompress_into`, `zstd_into`, and `unzstd_into` with 128 KiB sliding-window encoding, block-by-block decoding, streaming XXH64 checksums, and concatenated/skippable frame support
 
 + Release 0.8.10
 + Language: property metadata tags (`$tag(...)` and backtick shorthand) exposed via `#loop properties` / `#loop object`, with `json` support for `rename`, `skip`, and `omitempty`

@@ -1,7 +1,7 @@
 use io
 use mem
 
-/// A compressed data format; all three carry the same DEFLATE data.
+/// A compressed data format.
 + enum Format {
     /// Raw DEFLATE (RFC 1951) with no header or trailer.
     deflate
@@ -10,12 +10,15 @@ use mem
     /// gzip (RFC 1952): a 10-byte header and a CRC-32 and length trailer; `.gz` files and
     /// HTTP "gzip".
     gzip
+    /// Zstandard (RFC 8878): `.zst` files and HTTP "zstd".
+    zstd
 }
 
 /// Returns `data` compressed into `format` at `level` (0 stores, 1 is fastest, 9 is smallest).
 ///
 /// Levels above 9 act as 9.
 + fn compress(data: local &[u8], format: Format, level: uint (COMPRESS_DEFAULT_LEVEL)) String {
+    if format == Format.zstd : return zstd(data, level)
     if level > 9 : level = 9
     // Chain positions are 32-bit
     if data.length >= 0x80000000 {
@@ -77,6 +80,7 @@ fn write_format_header(out: ByteBuffer, format: Format, level: uint) {
 /// so bytes after a gzip member must form another member. For `deflate` and `zlib`, bytes
 /// after the end of the stream are ignored.
 + fn decompress(data: local &[u8], format: Format, max_size: uint (0)) String !CompressError {
+    if format == Format.zstd : return unzstd(data, max_size) !>
     let out = ByteBuffer.new(data.length * 3 + 64)
     let inflater = thread_inflater()
     inflater.in_data = data.data
@@ -180,7 +184,16 @@ fn read_format_header(inflater: Inflater, format: Format) !CompressError {
 /// written before a failure stay written.
 + fn compress_into(data: local &[u8], out: io.Writer, format: Format, level: uint (COMPRESS_DEFAULT_LEVEL)) uint !io.IoError {
     // A ByteBuffer takes the whole result in one go, without the streaming buffers
-    if data.length < 0x80000000 {
+    if format == Format.zstd {
+        match out {
+            ByteBuffer as buffer => {
+                let before = buffer.length
+                zstd_append(data, buffer, level)
+                return buffer.length - before
+            }
+            default => {}
+        }
+    } else if data.length < 0x80000000 {
         match out {
             ByteBuffer as buffer => {
                 let before = buffer.length
@@ -210,7 +223,13 @@ fn read_format_header(inflater: Inflater, format: Format) !CompressError {
         let count = reader.read_inner(chunk) !>
         if count == 0 : break
         if max_size > 0 && total + count > max_size : throw .too_large
-        total += out.write(chunk.view(0, count)) !>
+        let view = chunk.view(0, count)
+        while view.length > 0 {
+            let written = out.write(view) !>
+            if written == 0 || written > view.length : throw .write
+            total += written
+            view = view.view(written, view.length - written)
+        }
     }
     return total
 }
@@ -259,15 +278,16 @@ class MeteredWriter is io.Writer {
 
 /// An `io.Writer` that compresses what is written to it and passes the result to `out`.
 ///
-/// Input is compressed in 64 KiB pieces, so compressed bytes reach `out` only after that
-/// much input or on `close`. `close` must be called to write the final block and the
-/// format's trailer; it does not close `out`.
+/// Input is compressed in blocks (64 KiB for DEFLATE formats, 128 KiB for Zstandard), so
+/// compressed bytes reach `out` as blocks fill or on `close`. `close` must be called to write
+/// the final block and the format's trailer; it does not close `out`.
 + class Compressor is io.Writer, io.Closer {
     - out: io.Writer
     - format: Format
     - level: uint
-    - deflater: Deflater
-    - block: ByteBuffer (ByteBuffer.new(131072))
+    - deflater: ?Deflater (null)
+    - zstd_enc: ?ZstdStreamEncoder (null)
+    - block: ByteBuffer (ByteBuffer.new(0))
     // Input bytes before `pending_start` were already compressed (history)
     - history: uint (0)
     - crc: u32 (0)
@@ -281,12 +301,20 @@ class MeteredWriter is io.Writer {
     /// Levels above 9 act as 9.
     + static fn new(out: io.Writer, format: Format, level: uint (COMPRESS_DEFAULT_LEVEL)) Compressor {
         if level > 9 : level = 9
+        if format == Format.zstd {
+            return Compressor {
+                out: out
+                format: format
+                level: level
+                zstd_enc: ZstdStreamEncoder.new(out, level)
+            }
+        }
         return Compressor {
             out: out
             format: format
             level: level
-            /// Raw DEFLATE (RFC 1951) with no header or trailer.
             deflater: Deflater.new(ByteBuffer.new(65536), level)
+            block: ByteBuffer.new(131072)
         }
     }
 
@@ -295,6 +323,8 @@ class MeteredWriter is io.Writer {
     /// Throws `closed` after `close`, and passes on errors from `out`; `write` is thrown when
     /// `out` accepts no bytes.
     + fn write(data: local &[u8]) uint !io.IoError {
+        let zenc = this.zstd_enc
+        if isset(zenc) : return zenc.write(data) !>
         if this.closed : throw .closed
         this.start() !>
         if this.format == Format.gzip : this.crc = crc32(data, this.crc)
@@ -318,10 +348,17 @@ class MeteredWriter is io.Writer {
     ///
     /// Calling it again does nothing. Errors from `out` are passed on.
     + fn close() !io.IoError {
+        let zenc = this.zstd_enc
+        if isset(zenc) {
+            zenc.close() !>
+            this.closed = true
+            return
+        }
         if this.closed : return
         this.start() !>
         this.compress_pending(true) !>
-        let out = this.deflater.writer.out
+        let def = this.deflater ?! panic("Compressor missing deflater")
+        let out = def.writer.out
         if this.format == Format.gzip {
             out.write_u32_le(this.crc)
             out.write_u32_le((this.total & 0xffffffff).to(u32))
@@ -335,7 +372,8 @@ class MeteredWriter is io.Writer {
     fn start() !io.IoError {
         if this.started : return
         this.started = true
-        write_format_header(this.deflater.writer.out, this.format, this.level)
+        let def = this.deflater ?! panic("Compressor missing deflater")
+        write_format_header(def.writer.out, this.format, this.level)
         this.flush_out() !>
     }
 
@@ -343,6 +381,7 @@ class MeteredWriter is io.Writer {
     // history for the next piece
     fn compress_pending(final: bool) !io.IoError {
         @unsafe
+        let def = this.deflater ?! panic("Compressor missing deflater")
         let block = this.block
         let view = block.view(0, block.length)
         let start = this.history
@@ -353,11 +392,11 @@ class MeteredWriter is io.Writer {
             end = start + 65536
             if end > block.length : end = block.length
         }
-        this.deflater.compress_range(view.data, end, start, final)
+        def.compress_range(view.data, end, start, final)
         this.flush_out() !>
         if end > deflate_window {
             block.clear_until(end - deflate_window)
-            this.deflater.slide(end - deflate_window)
+            def.slide(end - deflate_window)
             this.history = deflate_window
         } else {
             this.history = end
@@ -365,7 +404,8 @@ class MeteredWriter is io.Writer {
     }
 
     fn flush_out() !io.IoError {
-        let buffer = this.deflater.writer.out
+        let def = this.deflater ?! panic("Compressor missing deflater")
+        let buffer = def.writer.out
         let view = buffer.view(0, buffer.length)
         while view.length > 0 {
             let written = this.out.write(view) !>
@@ -378,15 +418,17 @@ class MeteredWriter is io.Writer {
 
 /// An `io.Reader` that decompresses a `format` stream read from `source`.
 ///
-/// Reading returns 0 at the end of the stream. Concatenated gzip members read as one stream.
-/// A malformed or truncated stream or a checksum mismatch throws `read` (`io.Reader` has no
-/// `truncated` code; use `decompress` to tell them apart). An error from `source` is passed
-/// through with its own code, except that `closed` from `source` counts as the end of its
-/// input. It reads ahead from `source` in blocks of up to 64 KiB.
+/// Reading returns 0 at the end of the stream. Concatenated gzip members and Zstandard frames
+/// (including skippable frames) read as one stream. A malformed or truncated stream or a
+/// checksum mismatch throws `read` (`io.Reader` has no `truncated` code; use `decompress` to
+/// tell them apart). An error from `source` is passed through with its own code, except that
+/// `closed` from `source` counts as the end of its input. It reads ahead from `source` in
+/// blocks of up to 64 KiB.
 + class Decompressor is io.Reader {
     - source: io.Reader
     - format: Format
-    - inflater: Inflater
+    - inflater: ?Inflater (null)
+    - zstd_dec: ?ZstdStreamDecoder (null)
     - header_done: bool (false)
     - finished: bool (false)
     - crc: u32 (0)
@@ -395,6 +437,13 @@ class MeteredWriter is io.Writer {
 
     /// Returns a decompressor reading `format` data from `source`.
     + static fn new(source: io.Reader, format: Format) Decompressor {
+        if format == Format.zstd {
+            return Decompressor {
+                source: source
+                format: format
+                zstd_dec: ZstdStreamDecoder.new(source)
+            }
+        }
         return Decompressor {
             source: source
             format: format
@@ -407,7 +456,10 @@ class MeteredWriter is io.Writer {
     /// Unlike the position of `source`, this excludes bytes read ahead but not yet used, so
     /// after the end of the stream it gives the offset where any following data starts.
     + fn consumed() uint {
-        return this.inflater.consumed - this.inflater.unread_count()
+        let zdec = this.zstd_dec
+        if isset(zdec) : return zdec.consumed_bytes()
+        let inf = this.inflater ?! return 0
+        return inf.consumed - inf.unread_count()
     }
 
     /// Fills `buf` with decompressed bytes and returns how many were written; 0 means the end.
@@ -433,13 +485,15 @@ class MeteredWriter is io.Writer {
     }
 
     fn read_inner(buf: local mut &[u8]) uint !CompressError {
+        let zdec = this.zstd_dec
+        if isset(zdec) : return zdec.read_inner(buf) !>
+        let inflater = this.inflater ?! panic("Decompressor missing inflater")
         while true {
             if this.finished : return 0
             if !this.header_done {
                 this.read_header() !>
                 this.header_done = true
             }
-            let inflater = this.inflater
             if inflater.pending() == 0 && !inflater.finished() {
                 inflater.produce(inflater.out_pos + buf.length) !>
             }
@@ -458,9 +512,9 @@ class MeteredWriter is io.Writer {
             }
             // The stream ended: check the trailer
             this.read_trailer() !>
-            if this.format == Format.gzip && (this.inflater.has_more() !>) {
+            if this.format == Format.gzip && (inflater.has_more() !>) {
                 // Another gzip member follows
-                this.inflater.restart()
+                inflater.restart()
                 this.header_done = false
                 this.crc = 0
                 this.total = 0
@@ -471,11 +525,12 @@ class MeteredWriter is io.Writer {
     }
 
     fn read_header() !CompressError {
-        read_format_header(this.inflater, this.format) !>
+        let inflater = this.inflater ?! panic("Decompressor missing inflater")
+        read_format_header(inflater, this.format) !>
     }
 
     fn read_trailer() !CompressError {
-        let inflater = this.inflater
+        let inflater = this.inflater ?! panic("Decompressor missing inflater")
         inflater.align()
         if this.format == Format.gzip {
             let crc = read_le32(inflater) !>

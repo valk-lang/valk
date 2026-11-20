@@ -1,0 +1,400 @@
+use io
+
+// Streaming RFC 8878 Zstandard encoder and decoder backing `Compressor` and `Decompressor`
+// for `Format.zstd`.
+
+class ZstdStreamEncoder {
+    out: io.Writer
+    level: uint
+    enc: ZstdEncoder (ZstdEncoder {})
+    block: ByteBuffer (ByteBuffer.new(262144))
+    out_buf: ByteBuffer (ByteBuffer.new(65536))
+    history: uint (0)
+    xxh: ZstdXxh64 (ZstdXxh64 {})
+    started: bool (false)
+    closed: bool (false)
+
+    static fn new(out: io.Writer, level: uint) ZstdStreamEncoder {
+        return ZstdStreamEncoder {
+            out: out
+            level: level > 9 ? 9 : level
+        }
+    }
+
+    fn start() !io.IoError {
+        if this.started : return
+        this.started = true
+        this.enc.reset_frame()
+        this.xxh.reset()
+        // Frame magic (0xFD2FB528), FHD = Content_Checksum (0x04), Window_Descriptor = 56 (128 KiB)
+        this.out_buf.write_u32_le(ZSTD_MAGIC.to(u32))
+        this.out_buf.write_byte(0x04)
+        this.out_buf.write_byte(56)
+        this.flush_out() !>
+    }
+
+    fn write(data: local &[u8]) uint !io.IoError {
+        if this.closed : throw .closed
+        this.start() !>
+        if data.length == 0 : return 0
+        this.xxh.update(data)
+
+        let block = this.block
+        let offset: uint = 0
+        while offset < data.length {
+            // Keep up to ZSTD_MAX_BLOCK_SIZE (128 KiB) pending so close() emits a single
+            // non-empty final block when total input <= 128 KiB, while streaming full
+            // 128 KiB blocks as soon as more bytes arrive.
+            let pending = block.length - this.history
+            if pending >= ZSTD_MAX_BLOCK_SIZE {
+                this.emit_full_block() !>
+                pending = block.length - this.history
+            }
+            let room = ZSTD_MAX_BLOCK_SIZE - pending
+            let take = data.length - offset
+            if take > room : take = room
+            block.write(data.view(offset, take))
+            offset += take
+        }
+        return data.length
+    }
+
+    fn close() !io.IoError {
+        if this.closed : return
+        this.start() !>
+        let pending = this.block.length - this.history
+        if pending == 0 {
+            // Empty final Raw_Block (last=1, type=0, size=0)
+            this.out_buf.write_byte(1)
+            this.out_buf.write_byte(0)
+            this.out_buf.write_byte(0)
+        } else {
+            let view = this.block.view(0, this.block.length)
+            this.enc.encode_block(view.data, this.history, pending, true, this.level, this.out_buf)
+        }
+        let checksum = (this.xxh.finish() & 0xffffffff).to(u32)
+        this.out_buf.write_u32_le(checksum)
+        this.flush_out() !>
+        this.closed = true
+    }
+
+    fn emit_full_block() !io.IoError {
+        let block = this.block
+        let start = this.history
+        let view = block.view(0, block.length)
+        this.enc.encode_block(view.data, start, ZSTD_MAX_BLOCK_SIZE, false, this.level, this.out_buf)
+        this.flush_out() !>
+        let end = start + ZSTD_MAX_BLOCK_SIZE
+        if end > ZSTD_ENC_WIN_SIZE {
+            // `start == ZSTD_ENC_WIN_SIZE` and `ZSTD_MAX_BLOCK_SIZE == ZSTD_ENC_WIN_SIZE`,
+            // so `shift == ZSTD_ENC_WIN_SIZE` preserves `pos & ZSTD_ENC_WIN_MASK`.
+            let shift = end - ZSTD_ENC_WIN_SIZE
+            block.clear_until(shift)
+            this.enc.slide(shift)
+            this.history = ZSTD_ENC_WIN_SIZE
+        } else {
+            this.history = end
+        }
+    }
+
+    fn flush_out() !io.IoError {
+        let buffer = this.out_buf
+        let view = buffer.view(0, buffer.length)
+        while view.length > 0 {
+            let written = this.out.write(view) !>
+            if written == 0 || written > view.length : throw .write
+            view = view.view(written, view.length - written)
+        }
+        buffer.clear()
+    }
+}
+
+class ZstdStreamDecoder {
+    source: io.Reader
+    in_buf: ByteBuffer (ByteBuffer.new(65536))
+    read_chunk: mut &[u8] ([u8]{ 0 x 65536 })
+    in_pos: uint (0)
+    consumed: uint (0)
+    dec: ZstdDecoder
+    out_pos: uint (0)
+    in_frame: bool (false)
+    finished: bool (false)
+    saw_any_frame: bool (false)
+    has_checksum: bool (false)
+    has_fcs: bool (false)
+    fcs: uint (0)
+    window_size: uint (0)
+    max_block_size: uint (ZSTD_MAX_BLOCK_SIZE)
+    frame_produced: uint (0)
+    xxh: ZstdXxh64 (ZstdXxh64 {})
+
+    static fn new(source: io.Reader) ZstdStreamDecoder {
+        return ZstdStreamDecoder {
+            source: source
+            dec: ZstdDecoder {
+                in_data: null.@cast(*[u8])
+                in_len: 0
+                out: ByteBuffer.new(65536)
+                limit: uint.$max
+            }
+        }
+    }
+
+    fn consumed_bytes() uint {
+        return this.consumed - (this.in_buf.length - this.in_pos)
+    }
+
+    fn refill() bool !io.IoError {
+        if this.in_pos > 0 {
+            this.in_buf.clear_until(this.in_pos)
+            this.in_pos = 0
+        }
+        let count = this.source.read(this.read_chunk) ! {
+            if error_is(E.code, closed) : return false
+            throw E
+        }
+        if count == 0 : return false
+        this.in_buf.write(this.read_chunk.view(0, count))
+        this.consumed += count
+        return true
+    }
+
+    fn ensure(n: uint) !CompressError {
+        while this.in_buf.length - this.in_pos < n {
+            if !(this.refill() !>) : throw .truncated
+        }
+    }
+
+    fn has_more() bool !io.IoError {
+        if this.in_pos < this.in_buf.length : return true
+        return this.refill() !>
+    }
+
+    fn read_u8() uint !CompressError {
+        @unsafe
+        this.ensure(1) !>
+        let v = this.in_buf.data.@cast(*[u8])[this.in_pos].to(uint)
+        this.in_pos++
+        return v
+    }
+
+    fn read_u16_le() uint !CompressError {
+        @unsafe
+        this.ensure(2) !>
+        let p = this.in_buf.data.@cast(*[u8])
+        let i = this.in_pos
+        this.in_pos += 2
+        return p[i].to(uint) | (p[i + 1].to(uint) << 8)
+    }
+
+    fn read_u32_le() u32 !CompressError {
+        this.ensure(4) !>
+        let v = zstd_load_le32(this.in_buf.data.@cast(*[u8]), this.in_pos)
+        this.in_pos += 4
+        return v
+    }
+
+    fn read_u64_le() u64 !CompressError {
+        this.ensure(8) !>
+        let v = zstd_load_le64(this.in_buf.data.@cast(*[u8]), this.in_pos)
+        this.in_pos += 8
+        return v
+    }
+
+    fn skip_bytes(n: uint) !CompressError {
+        let left = n
+        while left > 0 {
+            let avail = this.in_buf.length - this.in_pos
+            if avail == 0 {
+                if !(this.refill() !>) : throw .truncated
+                continue
+            }
+            let take = avail < left ? avail : left
+            this.in_pos += take
+            left -= take
+        }
+    }
+
+    fn start_next_frame() !CompressError {
+        while true {
+            if this.saw_any_frame {
+                if !(this.has_more() !>) {
+                    this.finished = true
+                    return
+                }
+            }
+            let magic = this.read_u32_le() !>
+            if magic >= ZSTD_SKIPPABLE_MIN && magic <= ZSTD_SKIPPABLE_MAX {
+                let skip = (this.read_u32_le() !>).to(uint)
+                this.skip_bytes(skip) !>
+                this.saw_any_frame = true
+                continue
+            }
+            if magic != ZSTD_MAGIC : throw .invalid_input
+
+            let dec = this.dec
+            dec.huf.ready = false
+            dec.ll_table.ready = false
+            dec.of_table.ready = false
+            dec.ml_table.ready = false
+            dec.rep0 = 1
+            dec.rep1 = 4
+            dec.rep2 = 8
+            dec.out.clear()
+            this.out_pos = 0
+
+            let fhd = this.read_u8() !>
+            let fcs_flag = (fhd >> 6) & 3
+            let single_segment = ((fhd >> 5) & 1) != 0
+            if ((fhd >> 3) & 1) != 0 : throw .invalid_input
+            this.has_checksum = ((fhd >> 2) & 1) != 0
+            let dict_id_flag = fhd & 3
+
+            let window_size: uint = 0
+            if !single_segment {
+                let wd = this.read_u8() !>
+                let exp = wd >> 3
+                let mant = wd & 7
+                let base = (1).to(uint) << (10 + exp)
+                window_size = base + (base >> 3) * mant
+            }
+
+            if dict_id_flag > 0 {
+                let dict_id: uint = 0
+                if dict_id_flag == 1 : dict_id = this.read_u8() !>
+                else if dict_id_flag == 2 : dict_id = this.read_u16_le() !>
+                else : dict_id = (this.read_u32_le() !>).to(uint)
+                if dict_id != 0 : throw .invalid_input
+            }
+
+            let has_fcs = false
+            let fcs: uint = 0
+            if fcs_flag == 0 {
+                if single_segment {
+                    fcs = this.read_u8() !>
+                    has_fcs = true
+                }
+            } else if fcs_flag == 1 {
+                fcs = (this.read_u16_le() !>) + 256
+                has_fcs = true
+            } else if fcs_flag == 2 {
+                fcs = (this.read_u32_le() !>).to(uint)
+                has_fcs = true
+            } else {
+                let v64 = this.read_u64_le() !>
+                if v64 > uint.$max.to(u64) : throw .too_large
+                fcs = v64.to(uint)
+                has_fcs = true
+            }
+
+            if single_segment : window_size = fcs
+            this.has_fcs = has_fcs
+            this.fcs = fcs
+            this.window_size = window_size
+            let max_blk: uint = ZSTD_MAX_BLOCK_SIZE
+            if !single_segment && window_size < max_blk : max_blk = window_size
+            this.max_block_size = max_blk
+            this.frame_produced = 0
+            this.xxh.reset()
+            this.in_frame = true
+            this.saw_any_frame = true
+            return
+        }
+    }
+
+    fn produce_one_block() !CompressError {
+        @unsafe
+        if !this.in_frame {
+            this.start_next_frame() !>
+            if this.finished : return
+        }
+
+        let b0 = this.read_u8() !>
+        let b1 = this.read_u8() !>
+        let b2 = this.read_u8() !>
+        let header = b0 | (b1 << 8) | (b2 << 16)
+        let last_block = (header & 1) != 0
+        let block_type = (header >> 1) & 3
+        let block_size = header >> 3
+
+        let dec = this.dec
+        let out_before = dec.out.length
+
+        if block_type == 0 {
+            if block_size > this.max_block_size : throw .invalid_input
+            if block_size > 0 {
+                this.ensure(block_size) !>
+                let src = [u8]{ owner: null, data: this.in_buf.data.@cast(*[u8]).@offset(this.in_pos), length: block_size }
+                dec.out.write(src)
+                this.in_pos += block_size
+            }
+        } else if block_type == 1 {
+            if block_size > this.max_block_size : throw .invalid_input
+            let b = (this.read_u8() !>).to(u8)
+            if block_size > 0 {
+                dec.out.reserve(block_size)
+                let dst = dec.out.data.@cast(*[u8]).@offset(dec.out.length)
+                zstd_fill_bytes(dst, b, block_size)
+                dec.out.skip(block_size)
+            }
+        } else if block_type == 2 {
+            if block_size > ZSTD_MAX_BLOCK_SIZE || block_size > this.max_block_size : throw .invalid_input
+            this.ensure(block_size) !>
+            let blk_ptr = this.in_buf.data.@cast(*[u8]).@offset(this.in_pos)
+            this.in_pos += block_size
+            dec.decode_compressed_block(blk_ptr, block_size, 0, this.window_size, this.max_block_size) !>
+        } else {
+            throw .invalid_input
+        }
+
+        let produced = dec.out.length - out_before
+        this.frame_produced += produced
+        if this.has_checksum && produced > 0 {
+            this.xxh.update(produced_bytes(dec.out, out_before))
+        }
+
+        if last_block {
+            if this.has_fcs && this.frame_produced != this.fcs : throw .invalid_input
+            if this.has_checksum {
+                let expected = this.read_u32_le() !>
+                let actual = (this.xxh.finish() & 0xffffffff).to(u32)
+                if actual != expected : throw .checksum
+            }
+            this.in_frame = false
+        }
+    }
+
+    fn compact() {
+        let out = this.dec.out
+        if !this.in_frame {
+            if this.out_pos >= out.length {
+                out.clear()
+                this.out_pos = 0
+            }
+            return
+        }
+        let keep = this.window_size
+        if keep > ZSTD_STREAM_MAX_WINDOW : keep = ZSTD_STREAM_MAX_WINDOW
+        if this.out_pos > keep + 65536 {
+            let drop = this.out_pos - keep
+            out.clear_until(drop)
+            this.out_pos -= drop
+        }
+    }
+
+    fn read_inner(buf: local mut &[u8]) uint !CompressError {
+        while true {
+            let avail = this.dec.out.length - this.out_pos
+            if avail > 0 {
+                let count = avail > buf.length ? buf.length : avail
+                let view = this.dec.out.view(this.out_pos, count)
+                mem_copy(view, buf)
+                this.out_pos += count
+                this.compact()
+                return count
+            }
+            if this.finished : return 0
+            this.produce_one_block() !>
+        }
+    }
+}
