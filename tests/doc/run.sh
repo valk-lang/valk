@@ -91,6 +91,11 @@ if ! grep -Fq '+ union DocEvent {' "$workdir/api.md" \
     cat "$workdir/api.md"
     exit 1
 fi
+if ! grep -Fq '+ struct DocReader is Readable {' "$workdir/api.md"; then
+    echo "# Struct interface implementation is missing from the markdown output"
+    cat "$workdir/api.md"
+    exit 1
+fi
 
 echo "> Document error types and enums"
 for expect in \

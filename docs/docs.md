@@ -1288,9 +1288,9 @@ A class decides how it is copied by having a method named `copy` or `clone`, whi
 
 ## Interfaces
 
-Interfaces define methods that different classes can provide. Interface methods
-end in `;`, or give a default body that classes without their own version use,
-and a class lists its interfaces with `is`.
+Interfaces define methods that different classes and structs can provide. Interface methods
+end in `;`, or give a default body that types without their own version use,
+and a class or struct lists its interfaces with `is`.
 
 ```rust
 interface Named {
@@ -1325,13 +1325,15 @@ interface Shape {
 }
 ```
 
-Only classes can implement interfaces. The compiler verifies that every method
+Both classes and structs can implement interfaces. Passing a struct to a constrained
+generic (`[T is Printable]`) avoids boxing; converting a struct to an interface value
+boxes it automatically. The compiler verifies that every method
 has the same arguments, return type, getter or function form, and error type as
 the interface declaration. A method that cannot fail may implement an interface
-method that can; callers of the class then never handle an error, while callers
+method that can; callers of the type then never handle an error, while callers
 of the interface do.
 
-Use `is_a` to check the concrete class held by an interface value:
+Use `is_a` to check the concrete class or struct held by an interface value:
 
 ```rust
 if printable is_a User {
@@ -1339,8 +1341,8 @@ if printable is_a User {
 }
 ```
 
-`match` does the same and also hands you the object as its own class. An
-interface can be implemented by classes the match does not know, so a
+`match` does the same and also hands you the value as its concrete type. An
+interface can be implemented by types the match does not know, so a
 `default` case is required:
 
 ```rust

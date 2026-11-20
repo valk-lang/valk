@@ -511,6 +511,7 @@ fn ir_write_interface_vtable(out: ByteBuffer, adapter: Class) !Error {
     out.append_text("\" = linkonce_odr constant [")
     out.write_uint_ascii(count)
     out.append_text(" x ptr] ")
+    let is_struct = concrete.kind == CLASS_KIND.struct
     if interface.interface_method_count == 0 {
         out.append_text("zeroinitializer")
     } else {
@@ -521,7 +522,7 @@ fn ir_write_interface_vtable(out: ByteBuffer, adapter: Class) !Error {
             let implementation = concrete.get_func(requirement.name) ?! adapter.exp.bug("Interface implementation is missing")
             if slot > 0 : out.append_text(", ")
             out.append_text("ptr ")
-            if requirement.can_error && !implementation.can_error {
+            if is_struct || (requirement.can_error && !implementation.can_error) {
                 out.append_text(ir_symbol_address(interface_thunk_name(adapter, slot)))
             } else {
                 out.append_text(ir_func_address(implementation))
@@ -543,7 +544,7 @@ fn ir_write_interface_vtable(out: ByteBuffer, adapter: Class) !Error {
     while slot < interface.interface_method_count {
         let requirement = interface_method_at(interface, slot) ?! adapter.exp.bug("Interface method slot is missing")
         let implementation = concrete.get_func(requirement.name) ?! adapter.exp.bug("Interface implementation is missing")
-        if requirement.can_error && !implementation.can_error {
+        if is_struct || (requirement.can_error && !implementation.can_error) {
             ir_write_interface_thunk(out, adapter, requirement, implementation, slot) !>
         }
         slot++
@@ -554,11 +555,18 @@ fn interface_thunk_name(adapter: Class, slot: uint) String {
     return "valk.interface.thunk." + adapter.name + "." + slot
 }
 
-// Calls an infallible implementation and returns its result in the fallible ABI with error code 0
+// Bridges interface vtable calls to a struct method (rebuilding its `{ owner, ptr }`
+// receiver from the heap box) and/or adapts an infallible method to a fallible slot.
 fn ir_write_interface_thunk(out: ByteBuffer, adapter: Class, requirement: Func, implementation: Func, slot: uint) !Error {
     let build = adapter.ns.build
+    let concrete = adapter.interface_concrete ?! adapter.exp.bug("Interface adapter is missing concrete type")
+    let is_struct = concrete.kind == CLASS_KIND.struct
+    let wrap_error = requirement.can_error && !implementation.can_error
     let name = interface_thunk_name(adapter, slot)
     let rett = requirement.get_rett()
+    let req_by_ptr = ir_func_rett_by_pointer(requirement)
+    let impl_by_ptr = ir_func_rett_by_pointer(implementation)
+    let req_rett_ir = ir_func_rett_type(requirement) !>
     let is_win = build.options.target.os == "win"
     if is_win {
         out.append_text("$\"")
@@ -566,24 +574,24 @@ fn ir_write_interface_thunk(out: ByteBuffer, adapter: Class, requirement: Func, 
         out.append_text("\" = comdat any\n")
     }
     out.append_text("define linkonce_odr ")
-    out.append_text(ir_error_abi_type(rett) !>)
+    out.append_text(req_rett_ir)
     out.append_text(" @\"")
     out.append_text(name)
     out.append_text("\"(")
 
-    let ir = IRFunc { func: implementation }
-    let mark = ir.arg_list.length
-    let by_pointer = ir_func_rett_by_pointer(implementation)
-    let result_slot = by_pointer ? ir_emit_alloca(ir, ir_type(rett) !>, rett.storage_alignment() !>) : ""
-    if by_pointer : ir.write_arg(mark, "ptr", result_slot)
+    let first_param = true
+    if req_by_ptr {
+        out.append_text(r"ptr %sret")
+        first_param = false
+    }
     each implementation.args as arg, i {
-        let type = ir_param_type(arg.type) !>
+        let param_ir = (i == 0 && is_struct) ? "ptr" : (ir_param_type(arg.type) !>)
         let arg_name = ir_arg_name(build, i)
-        if i > 0 : out.append_text(", ")
-        out.append_text(type)
+        if !first_param : out.append_text(", ")
+        first_param = false
+        out.append_text(param_ir)
         out.append_text(" ")
         out.append_text(arg_name)
-        ir.write_arg(mark, type, arg_name)
     }
     out.append_text(")")
     if is_win {
@@ -592,10 +600,42 @@ fn ir_write_interface_thunk(out: ByteBuffer, adapter: Class, requirement: Func, 
         out.append_text("\")")
     }
     out.append_text(" {\n")
+
+    let ir = IRFunc { func: implementation }
     ir.label("entry")
-    let rendered = ir_emit_arg_call(ir, ir_func_rett_type(implementation) !>, ir_func_address(implementation), mark)
-    if by_pointer : rendered = ir_emit_load(ir, ir_type(rett) !>, result_slot)
-    ir_emit_error_return(ir, rendered, rett, "0") !>
+    let mark = ir.arg_list.length
+    let result_slot = ""
+    if impl_by_ptr {
+        if req_by_ptr && !wrap_error {
+            result_slot = r"%sret"
+        } else {
+            result_slot = ir_emit_alloca(ir, ir_type(rett) !>, rett.storage_alignment() !>)
+        }
+        ir.write_arg(mark, "ptr", result_slot)
+    }
+    each implementation.args as arg, i {
+        let arg_name = ir_arg_name(build, i)
+        if i == 0 && is_struct {
+            let box_class = get_struct_interface_box_class(concrete) !>
+            let val_prop = box_class.props.get(0) ! adapter.exp.bug("Struct interface box is missing value property")
+            let field_addr = val_prop.offset == 0 ? arg_name : ir_offset_address(ir, arg_name, val_prop.offset.to(uint))
+            let with_owner = ir_emit_insert(ir, "{ ptr, ptr }", "undef", "ptr", arg_name, 0)
+            let recv = ir_emit_insert(ir, "{ ptr, ptr }", with_owner, "ptr", field_addr, 1)
+            ir.write_arg(mark, "{ ptr, ptr }", recv)
+        } else {
+            ir.write_arg(mark, ir_param_type(arg.type) !>, arg_name)
+        }
+    }
+    let impl_rett_ir = ir_func_rett_type(implementation) !>
+    let rendered = ir_emit_arg_call(ir, impl_rett_ir, ir_func_address(implementation), mark)
+    if wrap_error {
+        if impl_by_ptr : rendered = ir_emit_load(ir, ir_type(rett) !>, result_slot)
+        ir_emit_error_return(ir, rendered, rett, "0") !>
+    } else if req_by_ptr || req_rett_ir == "void" {
+        ir.line("ret void")
+    } else {
+        ir.line4("ret ", req_rett_ir, " ", rendered)
+    }
     out.append_buffer(ir.code)
     out.append_text("}\n")
 }
@@ -734,7 +774,23 @@ fn ir_emit_interface_object(ir: IRFunc, value: Value) String !Error {
     if ir.terminated : return "undef"
     let interface_value = rendered
     if on.rett.is_tagged_nullable() : interface_value = ir_extract_tagged_nullable_value(ir, rendered, on.rett) !>
-    return ir_interface_object(ir, interface_value)
+    let obj = ir_interface_object(ir, interface_value)
+    let target_class = value.rett.get_non_nullable().get_class_or_null()
+    if isset(target_class) && target_class.kind == CLASS_KIND.struct {
+        let box_class = get_struct_interface_box_class(target_class) !>
+        let val_prop = box_class.props.get(0) ! value.bug("Struct interface box is missing value property")
+        let field_addr = val_prop.offset == 0 ? obj : ir_offset_address(ir, obj, val_prop.offset.to(uint))
+        let lowered = ir_type(value.rett) !>
+        let loaded = ir_emit_load(ir, lowered, field_addr)
+        if value.rett.has_gc_refs() {
+            let slot = ir_emit_alloca(ir, lowered, value.rett.storage_alignment() !>)
+            ir_emit_store(ir, lowered, loaded, slot)
+            ir_clean_type_gc_fields(ir, value.rett, slot) !>
+            return ir_emit_load(ir, lowered, slot)
+        }
+        return loaded
+    }
+    return obj
 }
 
 fn ir_interface_method_target(ir: IRFunc, value: String, method: Func) String {
