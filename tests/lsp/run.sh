@@ -797,6 +797,15 @@ case "$out" in
         ;;
 esac
 
+# Constrained generic body: hover and member completion work before any caller exists
+check "constrained generic: hover shows interface bound" \
+    '"value":"```valk\nLspReader\n```"' \
+    "$(request textDocument/hover constrained.valk 5 12)"
+
+check "constrained generic: completion lists interface method" \
+    '"label":"read_chunk"' \
+    "$(request textDocument/completion constrained.valk 5 15)"
+
 # A message with broken headers is skipped; the messages after it are still answered
 for broken in 'X-Junk-Without-Colon\r\n\r\n' 'X-No-Length: 1\r\n\r\n{"x":1}' 'Content-Length: abc\r\n\r\n{"x":1}' '{ "body without headers": 1 }\r\n\r\n'; do
     count=$((count + 1))

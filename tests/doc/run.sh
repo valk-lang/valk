@@ -79,6 +79,12 @@ if ! grep -Fq '+ fn pick() uint $deprecated' "$workdir/api.md"; then
     cat "$workdir/api.md"
     exit 1
 fi
+if ! grep -Fq 'class ReaderBox[T is Readable]' "$workdir/api.md" \
+    || ! grep -Fq 'fn read_twice[T is Readable + $eq]' "$workdir/api.md"; then
+    echo "# Generic constraints are missing from the markdown signature"
+    cat "$workdir/api.md"
+    exit 1
+fi
 
 echo "> Document error types and enums"
 for expect in \

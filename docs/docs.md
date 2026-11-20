@@ -1411,6 +1411,20 @@ fn first(items: Array[$T]) T { return items.get(0) !! }
 fn unwrap(value: ?$T) T { return value ?? panic("missing") }
 ```
 
+Generic type parameters can carry `is` constraints referencing interfaces or built-in bounds (`$eq`, `$hash`, `$order`, `$integer`, `$float`, `$number`), combined with `+`. Constraints are checked at call and instantiation sites, and on `extend` blocks they limit the extension to matching instantiations:
+
+```rust
+fn write_text[W is io.Writer](out: W, text: String) uint !io.IoError {
+    return out.write(text) !>
+}
+
+fn clamp[T is $number + $order](value: T, lo: T, hi: T) T {
+    if value < lo : return lo
+    if value > hi : return hi
+    return value
+}
+```
+
 ## Modes
 
 Use `mode` to wrap an existing class and change its behavior. A mode cannot add
