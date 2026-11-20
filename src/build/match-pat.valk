@@ -1,0 +1,616 @@
+enum MATCH_PAT: u8 {
+    wildcard
+    bind
+    value
+    tuple
+    struct_pat
+    variant
+}
+
+class MatchFieldPat {
+    name: String
+    pat: MatchPat
+    exp: Exp
+}
+
+class MatchPat {
+    kind: MATCH_PAT
+    exp: Exp
+    name: String ("")
+    value_exp: ?Exp (null)
+    type_exp: ?Exp (null)
+    sub_pats: ?Array[MatchPat] (null)
+    fields: ?Array[MatchFieldPat] (null)
+}
+
+class MatchPatEval {
+    cond: ?Value (null)
+    assigns: Array[Value] (.{})
+    irrefutable: bool (true)
+    variant_tag: ?uint (null)
+}
+
+fn match_pat_and(a: ?Value, b: ?Value, bool_t: Type) ?Value {
+    if !isset(a) : return b
+    if !isset(b) : return a
+    return vgen_op(a, b, VALUE_OP.and, bool_t)
+}
+
+fn match_pat_make_id_exp(src: Source, start: u32, end: u32, name: String, ns: ?String (null)) Exp {
+    let id = Exp {
+        type: EXP.id
+        str1: name
+        str2: ns
+        src: src
+        i: start
+        len: end > start ? (end - start) : 0
+    }
+    return id
+}
+
+fn match_pat_make_named_type(src: Source, start: u32, end: u32, id: Exp, gens: ?Exp (null)) Exp {
+    let te = Exp {
+        type: EXP.type
+        kind: TYPE_KIND.named
+        src: src
+        i: start
+        len: end > start ? (end - start) : 0
+    }
+    te.set(TYPE_EXP.id, id)
+    if isset(gens) : te.set(TYPE_EXP.generics, gens)
+    return te
+}
+
+fn match_pat_make_dot_value(src: Source, start: u32, end: u32, head_name: String, ns: ?String, member: String) Exp {
+    let id = match_pat_make_id_exp(src, start, end, head_name, ns)
+    let id_val = Exp {
+        type: EXP.value
+        kind: VALUE_KIND.id
+        src: src
+        i: start
+        len: end > start ? (end - start) : 0
+    }
+    id_val.set(VALUE_EXP.left, id)
+    let dot = Exp {
+        type: EXP.value
+        kind: VALUE_KIND.dot
+        str1: member
+        src: src
+        i: start
+        len: end > start ? (end - start) : 0
+    }
+    dot.set(VALUE_EXP.left, id_val)
+    return dot
+}
+
+fn parse_match_struct_pat(p: Parser, type_exp: ?Exp, start: u32) MatchPat !Error {
+    p.expect("{", true, true) !>
+    let fields = Array[MatchFieldPat]{}
+    while true {
+        let t = p.tok(true, true, false) !>
+        if t == TOK.end : p.error("Unexpected end of file in destructuring pattern, missing '}'")
+        if t == TOK.sign && p.word_is("}") {
+            p.tok(true, true) !>
+            break
+        }
+        if t == TOK.sign && p.word_is("..") {
+            p.tok(true, true) !>
+            let after = p.tok(true, true, false) !>
+            if after == TOK.sign && p.word_is(",") : p.tok(true, true) !>
+            p.expect("}", true, true) !>
+            break
+        }
+        let fstart = p.pos.i
+        let fname = p.read_word(true, true) !>
+        let fexp = Exp {
+            type: EXP.value
+            src: p.pos.src
+            i: fstart
+            len: p.token_end > fstart ? (p.token_end - fstart) : 0
+        }
+        let sep = p.tok(true, true, false) !>
+        let sub: ?MatchPat = null
+        if sep == TOK.sign && p.word_is(":") {
+            p.tok(true, true) !>
+            sub = parse_match_pat(p) !>
+        } else {
+            sub = MatchPat {
+                kind: MATCH_PAT.bind
+                name: fname
+                exp: fexp
+            }
+        }
+        fields.append(MatchFieldPat {
+            name: fname
+            pat: sub ?! p.error("Missing field pattern")
+            exp: fexp
+        })
+        let next = p.tok(true, true, false) !>
+        if next == TOK.sign && p.word_is(",") {
+            p.tok(true, true) !>
+        } else if next == TOK.sign && p.word_is("}") {
+            p.tok(true, true) !>
+            break
+        }
+    }
+    let exp = Exp {
+        type: EXP.value
+        src: p.pos.src
+        i: start
+        len: p.token_end > start ? (p.token_end - start) : 0
+    }
+    return MatchPat {
+        kind: MATCH_PAT.struct_pat
+        exp: exp
+        type_exp: type_exp
+        fields: fields
+    }
+}
+
+fn parse_match_pat_args(p: Parser) Array[MatchPat] !Error {
+    p.expect("(", false, false) !>
+    let subs = Array[MatchPat]{}
+    let next = p.tok(true, true, false) !>
+    if next == TOK.sign && p.word_is(")") {
+        p.error("Empty payload pattern '()' is not allowed; omit '()' for unit variants")
+    }
+    while true {
+        subs.append(parse_match_pat(p) !>)
+        if !read_comma_list_next(p, ")", "match pattern") !> : break
+    }
+    return subs
+}
+
+fn parse_match_pat(p: Parser) MatchPat !Error {
+    let t = p.tok(true, true, false) !>
+    let start = p.pos.i
+
+    // Wildcard `_`
+    if t == TOK.word && p.word_is("_") {
+        p.tok(true, true) !>
+        let exp = p.create_exp(EXP.value)
+        exp.i = start
+        exp.set_end(p.token_end)
+        return MatchPat { kind: MATCH_PAT.wildcard, exp: exp }
+    }
+
+    // Tuple pattern `(p1, p2, ...)`
+    if t == TOK.sign && p.word_is("(") {
+        p.tok(true, true) !>
+        let subs = Array[MatchPat]{}
+        let next = p.tok(true, true, false) !>
+        if next == TOK.sign && p.word_is(")") : p.error("Empty tuple pattern '()' is not allowed")
+        while true {
+            subs.append(parse_match_pat(p) !>)
+            if !read_comma_list_next(p, ")", "tuple pattern") !> : break
+        }
+        let exp = Exp {
+            type: EXP.value
+            src: p.pos.src
+            i: start
+            len: p.token_end > start ? (p.token_end - start) : 0
+        }
+        if subs.length == 1 : return subs.get(0) ! p.error("Missing pattern")
+        return MatchPat { kind: MATCH_PAT.tuple, exp: exp, sub_pats: subs }
+    }
+
+    // Bare `{ ... }` struct pattern
+    if t == TOK.sign && p.word_is("{") {
+        return parse_match_struct_pat(p, null, start) !>
+    }
+
+    // `.{ ... }` or `.variant` / `.variant(p1, ...)` / `.enum_item`
+    if t == TOK.sign && p.word_is(".") {
+        p.tok(true, true) !>
+        let next = p.tok(false, false, false) !>
+        if next == TOK.sign && p.word_is("{") {
+            return parse_match_struct_pat(p, null, start) !>
+        }
+        let name = p.read_word(false, false) !>
+        let after = p.tok(true, false, false) !>
+        let subs: ?Array[MatchPat] = null
+        if after == TOK.sign && p.word_is("(") {
+            subs = parse_match_pat_args(p) !>
+        }
+        let exp = Exp {
+            type: EXP.value
+            kind: VALUE_KIND.typehint_member
+            str1: name
+            src: p.pos.src
+            i: start
+            len: p.token_end > start ? (p.token_end - start) : 0
+        }
+        return MatchPat {
+            kind: MATCH_PAT.variant
+            exp: exp
+            name: name
+            value_exp: isset(subs) ? null : exp
+            sub_pats: subs
+        }
+    }
+
+    // Literals (`true`, `false`, `null`, numbers, strings, chars, negative numbers)
+    if t == TOK.int || t == TOK.float || t == TOK.hex || t == TOK.octal || t == TOK.string || t == TOK.char
+        || (t == TOK.word && (p.word_is("true") || p.word_is("false") || p.word_is("null")))
+        || (t == TOK.sign && p.word_is("-")) {
+        let vexp = read_value_exp(p, true, false) !>
+        return MatchPat {
+            kind: MATCH_PAT.value
+            exp: vexp
+            value_exp: vexp
+        }
+    }
+
+    // Identifier: binding `x`, or `Type { ... }`, or `Union.variant(...)`, or `Enum.item`
+    if t == TOK.word {
+        p.tok(true, true) !>
+        let w1 = p.word()
+        let w1_start = p.word_i
+        let w1_end = p.token_end
+        let next = p.tok(true, false, false) !>
+
+        // Plain identifier binding
+        if next != TOK.sign || (!p.word_is("{") && !p.word_is("[") && !p.word_is(".")) {
+            let exp = Exp {
+                type: EXP.value
+                src: p.pos.src
+                i: w1_start
+                len: w1_end > w1_start ? (w1_end - w1_start) : 0
+            }
+            return MatchPat {
+                kind: MATCH_PAT.bind
+                exp: exp
+                name: w1
+            }
+        }
+
+        // Qualified type / variant / enum pattern:
+        //   Type { ... }
+        //   Type[T] { ... }
+        //   ns.Type { ... }
+        //   Union.variant / Union.variant(...)
+        //   Union[T].variant / Union[T].variant(...)
+        //   ns.Union.variant / ns.Union.variant(...)
+        let ns_name: ?String = null
+        let type_name = w1
+        let gens: ?Exp = null
+        if next == TOK.sign && p.word_is("[") {
+            p.tok(true, false) !>
+            let tmp = p.create_exp(EXP.type)
+            read_named_type_brackets(p, tmp) !>
+            gens = tmp.get(TYPE_EXP.generics)
+            next = p.tok(true, false, false) !>
+        }
+        if next == TOK.sign && p.word_is("{") {
+            let id = match_pat_make_id_exp(p.pos.src, w1_start, p.token_end, type_name, ns_name)
+            let te = match_pat_make_named_type(p.pos.src, w1_start, p.token_end, id, gens)
+            return parse_match_struct_pat(p, te, w1_start) !>
+        }
+        if next == TOK.sign && p.word_is(".") {
+            p.tok(true, false) !>
+            let seg = p.read_word(false, false) !>
+            let after = p.tok(true, false, false) !>
+            // `ns.Type[T] { ... }` or `ns.Type { ... }` or `ns.Union.variant`
+            if !isset(gens) && after == TOK.sign && (p.word_is("{") || p.word_is("[") || p.word_is(".")) {
+                ns_name = type_name
+                type_name = seg
+                if p.word_is("[") {
+                    p.tok(true, false) !>
+                    let tmp = p.create_exp(EXP.type)
+                    read_named_type_brackets(p, tmp) !>
+                    gens = tmp.get(TYPE_EXP.generics)
+                    after = p.tok(true, false, false) !>
+                }
+                if after == TOK.sign && p.word_is("{") {
+                    let id = match_pat_make_id_exp(p.pos.src, w1_start, p.token_end, type_name, ns_name)
+                    let te = match_pat_make_named_type(p.pos.src, w1_start, p.token_end, id, gens)
+                    return parse_match_struct_pat(p, te, w1_start) !>
+                }
+                if after == TOK.sign && p.word_is(".") {
+                    p.tok(true, false) !>
+                    seg = p.read_word(false, false) !>
+                    after = p.tok(true, false, false) !>
+                } else {
+                    p.error("Unexpected pattern after '" + w1 + "." + type_name + "'")
+                }
+            }
+            let id = match_pat_make_id_exp(p.pos.src, w1_start, p.token_end, type_name, ns_name)
+            let te = match_pat_make_named_type(p.pos.src, w1_start, p.token_end, id, gens)
+            let subs: ?Array[MatchPat] = null
+            if after == TOK.sign && p.word_is("(") {
+                subs = parse_match_pat_args(p) !>
+            }
+            let exp = Exp {
+                type: EXP.value
+                src: p.pos.src
+                i: w1_start
+                len: p.token_end > w1_start ? (p.token_end - w1_start) : 0
+            }
+            let vexp: ?Exp = isset(subs) || isset(gens) ? null : match_pat_make_dot_value(p.pos.src, w1_start, p.token_end, type_name, ns_name, seg)
+            return MatchPat {
+                kind: MATCH_PAT.variant
+                exp: exp
+                name: seg
+                type_exp: te
+                value_exp: vexp
+                sub_pats: subs
+            }
+        }
+        p.error("Unexpected token in match pattern: '" + p.word() + "'")
+    }
+
+    p.error("Unexpected token in match pattern: '" + p.word() + "'")
+}
+
+fn match_word_followed_by_brace(p: Parser) bool !Error {
+    let t = p.tok(true, true, false) !>
+    if t != TOK.word : return false
+    let saved = p.pos.copy()
+    let saved_peek = p.peek_valid
+    p.tok(true, true) !>
+    let next = p.tok(true, false, false) !>
+    let is_struct_pat = false
+    if next == TOK.sign && p.word_is("{") {
+        is_struct_pat = true
+    } else if next == TOK.sign && p.word_is(".") {
+        p.tok(true, false) !>
+        let nt = p.tok(false, false) !>
+        if nt == TOK.word {
+            let n2 = p.tok(true, false, false) !>
+            if n2 == TOK.sign && (p.word_is("{") || p.word_is("[")) : is_struct_pat = true
+        }
+    } else if next == TOK.sign && p.word_is("[") {
+        let depth: uint = 0
+        while true {
+            let bt = p.tok(true, true) !>
+            if bt == TOK.end : break
+            if bt == TOK.sign && p.word_is("[") : depth++
+            else if bt == TOK.sign && p.word_is("]") {
+                depth--
+                if depth == 0 : break
+            }
+        }
+        let after = p.tok(true, false, false) !>
+        if after == TOK.sign && p.word_is("{") : is_struct_pat = true
+    }
+    p.pos = saved
+    p.peek_valid = saved_peek
+    return is_struct_pat
+}
+
+// Check if the next tokens in a top-level match arm form a destructuring pattern
+// (struct `{ ... }` / `.{ ... }` / `Type { ... }`, tuple `(...)`, or named-union variant).
+fn match_arm_starts_struct_or_tuple_pat(p: Parser, on_type: Type) bool !Error {
+    let t = p.tok(true, true, false) !>
+    if t == TOK.sign && p.word_is("{") : return true
+    if t == TOK.sign && p.word_is("(") && on_type.is_tuple_type() : return true
+    if t == TOK.sign && p.word_is(".") {
+        let saved = p.pos.copy()
+        let saved_peek = p.peek_valid
+        p.tok(true, true) !>
+        let next = p.tok(false, false, false) !>
+        let is_dot_brace = next == TOK.sign && p.word_is("{")
+        p.pos = saved
+        p.peek_valid = saved_peek
+        if is_dot_brace : return true
+    }
+    let c = on_type.get_class_or_null()
+    if isset(c) && (c.kind == CLASS_KIND.struct || c.kind == CLASS_KIND.class) {
+        return match_word_followed_by_brace(p) !>
+    }
+    return false
+}
+
+fn eval_match_pat(
+    subject: Value,
+    pat: MatchPat,
+    case_scope: Scope,
+    outer_scope: Scope,
+    ctx: Context,
+    origin_on: Value,
+    allow_nullable_irrefutable: bool (false)
+) MatchPatEval !Error {
+    let bool_t = type_bool(ctx.build)
+
+    if pat.kind == MATCH_PAT.wildcard {
+        return MatchPatEval { irrefutable: true }
+    }
+
+    if pat.kind == MATCH_PAT.bind {
+        let member = subject.rett
+        if case_scope.has_local(pat.name) : pat.exp.error("Name already used: " + pat.name)
+        let decl = Decl.new(ctx.get_func() !>, member, false, pat.name)
+        decl.exp = pat.exp
+        decl.lock_scope = scope_find_lock(outer_scope)
+        decl.escape_origins = value_escape_origins(origin_on)
+        case_scope.add_decl(decl)
+        case_scope.set_idf(pat.name, Idf.for_decl(decl))
+        let assign = vgen_assign(vgen_decl(decl), subject, ASSIGN_OP.set, ctx.build, pat.exp)
+        return MatchPatEval {
+            assigns: Array[Value]{ assign }
+            irrefutable: true
+        }
+    }
+
+    if pat.kind == MATCH_PAT.value {
+        let vexp = pat.value_exp ?! pat.exp.bug("Match value pattern is missing expression")
+        let is_null = vexp.type == EXP.value && vexp.value_kind == VALUE_KIND.null
+        if is_null && subject.rett.is_nullable_type() {
+            let eq = vgen_unary(vgen_isset_val(subject, bool_t), VALUE_OP.not, bool_t)
+            eq.exp = pat.exp
+            return MatchPatEval { cond: eq, irrefutable: false }
+        }
+        let inner = subject.rett.is_nullable_type() ? value_force_remove_nullable(subject) : subject
+        let val = value_from_exp(vexp, outer_scope, ctx.with_suggested_type(inner.rett)) !>
+        val = value_try_convert(val, outer_scope, ctx, inner.rett) !>
+        inner.rett.compat_check(val.rett, vexp) !>
+        let eq = value_compare_values(inner, val, VALUE_OP.eq, outer_scope, ctx, pat.exp) !>
+        if subject.rett.is_nullable_type() {
+            eq = vgen_op(vgen_isset_val(subject, bool_t), eq, VALUE_OP.and, bool_t)
+        }
+        eq.exp = pat.exp
+        return MatchPatEval { cond: eq, irrefutable: false }
+    }
+
+    if pat.kind == MATCH_PAT.tuple {
+        let subj_nn = subject.rett.get_non_nullable()
+        if !subj_nn.is_tuple_type() {
+            pat.exp.error("Cannot destructure non-tuple type '" + subject.rett.compat_display_name() + "' as a tuple")
+        }
+        let members = subj_nn.get_members() ?! pat.exp.bug("Tuple type is missing members")
+        let subs = pat.sub_pats ?! pat.exp.bug("Tuple pattern is missing sub-patterns")
+        if subs.length != members.length {
+            pat.exp.error("Tuple pattern has " + subs.length + " element(s), but '" + subj_nn.compat_display_name() + "' has " + members.length)
+        }
+        let unwrapped = subject.rett.is_nullable_type() ? value_force_remove_nullable(subject) : subject
+        let cond: ?Value = null
+        let assigns = Array[Value]{}
+        let irrefutable = !subject.rett.is_nullable_type() || allow_nullable_irrefutable
+        each subs as sub_pat, i {
+            let member_t = members.get(i) ! pat.exp.bug("Tuple member missing")
+            let elem_t = subject.rett.storage_view_of(member_t)
+            let elem = vgen_multi_part(unwrapped, i, elem_t, sub_pat.exp)
+            let res = eval_match_pat(elem, sub_pat, case_scope, outer_scope, ctx, origin_on) !>
+            cond = match_pat_and(cond, res.cond, bool_t)
+            each res.assigns as a : assigns.append(a)
+            if !res.irrefutable : irrefutable = false
+        }
+        if subject.rett.is_nullable_type() {
+            cond = match_pat_and(vgen_isset_val(subject, bool_t), cond, bool_t)
+        }
+        return MatchPatEval { cond: cond, assigns: assigns, irrefutable: irrefutable }
+    }
+
+    if pat.kind == MATCH_PAT.struct_pat {
+        let subj_nn = subject.rett.get_non_nullable()
+        let c = subj_nn.get_class_or_null()
+        if !isset(c) || (c.kind != CLASS_KIND.struct && c.kind != CLASS_KIND.class) {
+            pat.exp.error("Cannot destructure type '" + subject.rett.compat_display_name() + "' with a struct/class pattern")
+        }
+        let texp = pat.type_exp
+        if isset(texp) {
+            let expected_t = type_from_exp(texp, outer_scope) !>
+            if expected_t.get_class_or_null() != c {
+                texp.error("Pattern type '" + expected_t.compat_display_name() + "' does not match subject type '" + subj_nn.compat_display_name() + "'")
+            }
+        }
+        let fields = pat.fields ?! pat.exp.bug("Struct pattern is missing fields")
+        let unwrapped = subject.rett.is_nullable_type() ? value_force_remove_nullable(subject) : subject
+        let cond: ?Value = null
+        let assigns = Array[Value]{}
+        let irrefutable = !subject.rett.is_nullable_type() || allow_nullable_irrefutable
+        let seen = Array[String]{}
+        each fields as fp {
+            if seen.contains(fp.name) : fp.exp.error("Duplicate field '" + fp.name + "' in destructuring pattern")
+            seen.append(fp.name)
+            let prop = c.get_prop_by_name(fp.name) !? null
+            if !isset(prop) : fp.exp.error("Type '" + c.pretty_name() + "' has no property named: '" + fp.name + "'")
+            act_check(fp.exp, prop.act, prop.exp, false, "property") !>
+            let fval = vgen_prop(prop, unwrapped, ctx)
+            fval.rett = unwrapped.rett.storage_view_of(prop.type)
+            fval.exp = fp.exp
+            fval = value_check_borrowed_property(fval, ctx, fp.exp) !>
+            let res = eval_match_pat(fval, fp.pat, case_scope, outer_scope, ctx, origin_on) !>
+            cond = match_pat_and(cond, res.cond, bool_t)
+            each res.assigns as a : assigns.append(a)
+            if !res.irrefutable : irrefutable = false
+        }
+        if subject.rett.is_nullable_type() {
+            cond = match_pat_and(vgen_isset_val(subject, bool_t), cond, bool_t)
+        }
+        return MatchPatEval { cond: cond, assigns: assigns, irrefutable: irrefutable }
+    }
+
+    if pat.kind == MATCH_PAT.variant {
+        if subject.rett.is_named_variant_union() {
+            let union_t = subject.rett.get_non_nullable()
+            let c = union_t.get_class_or_null() ?! pat.exp.bug("Named union is missing Class")
+            let texp = pat.type_exp
+            if isset(texp) {
+                let pt = type_from_exp(texp, outer_scope) !>
+                if pt.get_class_or_null() != c {
+                    texp.error("Variant pattern type '" + pt.compat_display_name() + "' does not match '" + union_t.compat_display_name() + "'")
+                }
+            }
+            let variant = c.get_union_variant(pat.name) ?! pat.exp.error("Union '" + c.pretty_name() + "' has no variant named: '" + pat.name + "'")
+            let variants = c.union_variants
+            let covers_subject = allow_nullable_irrefutable || (isset(variants) && variants.length == 1)
+            let tag_cond = vgen_union_is(subject, variant.tag, pat.exp)
+            let subs = pat.sub_pats
+            if variant.payload_types.length == 0 {
+                if isset(subs) : pat.exp.error("Unit variant '" + c.pretty_name() + "." + variant.name + "' has no payload")
+                return MatchPatEval {
+                    cond: tag_cond
+                    irrefutable: covers_subject
+                    variant_tag: variant.tag
+                }
+            }
+            if !isset(subs) {
+                pat.exp.error("Variant '" + c.pretty_name() + "." + variant.name + "' carries a payload; write '." + variant.name + "(...)'")
+            }
+            if subs.length == 1 {
+                let only = subs.get(0) ! pat.exp.bug("Missing sub-pattern")
+                if only.kind == MATCH_PAT.wildcard {
+                    return MatchPatEval {
+                        cond: tag_cond
+                        irrefutable: covers_subject
+                        variant_tag: variant.tag
+                    }
+                }
+            }
+            if subs.length != variant.payload_types.length {
+                pat.exp.error("Variant '" + c.pretty_name() + "." + variant.name + "' expects " + variant.payload_types.length + " payload pattern(s), got " + subs.length)
+            }
+            if variant.payload_types.length == 1 {
+                let extracted = vgen_union_extract(subject, variant.payload_type, ctx, pat.exp) !>
+                extracted.rett = subject.rett.storage_view_of(variant.payload_type)
+                let only = subs.get(0) ! pat.exp.bug("Missing single sub-pattern")
+                let res = eval_match_pat(extracted, only, case_scope, outer_scope, ctx, origin_on) !>
+                return MatchPatEval {
+                    cond: match_pat_and(tag_cond, res.cond, bool_t)
+                    assigns: res.assigns
+                    irrefutable: covers_subject && res.irrefutable
+                    variant_tag: variant.tag
+                }
+            }
+            let cond: ?Value = tag_cond
+            let assigns = Array[Value]{}
+            let irrefutable = covers_subject
+            each subs as sub_pat, i {
+                let extracted = vgen_union_extract(subject, variant.payload_type, ctx, sub_pat.exp) !>
+                extracted.rett = subject.rett.storage_view_of(variant.payload_type)
+                let member_t = variant.payload_types.get(i) ! pat.exp.bug("Missing variant payload type")
+                let elem_t = subject.rett.storage_view_of(member_t)
+                let elem = vgen_multi_part(extracted, i, elem_t, sub_pat.exp)
+                let res = eval_match_pat(elem, sub_pat, case_scope, outer_scope, ctx, origin_on) !>
+                cond = match_pat_and(cond, res.cond, bool_t)
+                each res.assigns as a : assigns.append(a)
+                if !res.irrefutable : irrefutable = false
+            }
+            return MatchPatEval {
+                cond: cond
+                assigns: assigns
+                irrefutable: irrefutable
+                variant_tag: variant.tag
+            }
+        }
+
+        // Not a named-variant union: treat `.name` / `Enum.item` as a value comparison
+        if isset(pat.sub_pats) {
+            pat.exp.error("Variant pattern '." + pat.name + "(...)' is only valid on a named tagged union")
+        }
+        let vexp = pat.value_exp ?! pat.exp.error("Cannot match '" + pat.name + "' against '" + subject.rett.compat_display_name() + "'")
+        let inner = subject.rett.is_nullable_type() ? value_force_remove_nullable(subject) : subject
+        let val = value_from_exp(vexp, outer_scope, ctx.with_suggested_type(inner.rett)) !>
+        val = value_try_convert(val, outer_scope, ctx, inner.rett) !>
+        inner.rett.compat_check(val.rett, vexp) !>
+        let eq = value_compare_values(inner, val, VALUE_OP.eq, outer_scope, ctx, pat.exp) !>
+        if subject.rett.is_nullable_type() {
+            eq = vgen_op(vgen_isset_val(subject, bool_t), eq, VALUE_OP.and, bool_t)
+        }
+        eq.exp = pat.exp
+        return MatchPatEval { cond: eq, irrefutable: false }
+    }
+
+    pat.exp.bug("Unhandled match pattern kind")
+}

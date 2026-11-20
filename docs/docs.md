@@ -780,6 +780,29 @@ union Json : int | String | bool | null | Array[Json] | Map[Json] {}
 let doc: Json = Map[Json]{ "tags" => Array[Json]{ "a", "b" } }
 ```
 
+Omit `: ...` to declare a union with **named variants** (unit, single-payload, or multi-payload, optionally generic). Construct variants with `Union.variant(...)` or `.variant(...)` when the type is known, and destructure variants, tuples, structs, and classes in `match` arms:
+
+```rust
+union Event {
+    quit
+    click(int, int)
+    key(String)
+}
+
+let ev: Event = .click(10, 20)
+match ev {
+    .quit => println("quit")
+    .click(0, y) => println("y=%y")
+    .click(x, y) => println("%x,%y")
+    .key(k) => println(k)
+}
+
+match point {
+    Point { x: 0, y } => println("y=%y")
+    .{ x, .. } => println("x=%x")
+}
+```
+
 ## Functions
 
 ```rust

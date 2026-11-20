@@ -85,6 +85,12 @@ if ! grep -Fq 'class ReaderBox[T is Readable]' "$workdir/api.md" \
     cat "$workdir/api.md"
     exit 1
 fi
+if ! grep -Fq '+ union DocEvent {' "$workdir/api.md" \
+    || ! grep -Fq '    click(int, int)' "$workdir/api.md"; then
+    echo "# Named union variants are missing from the markdown output"
+    cat "$workdir/api.md"
+    exit 1
+fi
 
 echo "> Document error types and enums"
 for expect in \
