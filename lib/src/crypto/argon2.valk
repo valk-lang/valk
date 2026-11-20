@@ -1,0 +1,136 @@
+// Argon2id (RFC 9106) password hashing and key derivation via OpenSSL 3.5's ARGON2ID KDF.
+
+value ARGON2_VERSION (0x13)
+value ARGON2_DEFAULT_SALT_LEN (16)
+value ARGON2_DEFAULT_TAG_LEN (32)
+
+/// Derives `length` raw bytes using Argon2id (RFC 9106 v1.3).
+///
+/// `memory_kib` is the memory cost in KiB (at least `8 * parallelism`), `iterations` is the
+/// time cost (at least 1), `parallelism` is the lane count (at least 1), `salt` must be at
+/// least 8 bytes, and `length` at least 4 bytes. Throws `invalid_input` on invalid parameters.
++ fn argon2id(
+    password: local &[u8],
+    salt: local &[u8],
+    memory_kib: uint (65536),
+    iterations: uint (3),
+    parallelism: uint (1),
+    length: uint (32)
+) String !CryptoError {
+    @unsafe
+    if salt.length < 8 || iterations == 0 || parallelism == 0 || length < 4 : throw .invalid_input
+    if parallelism > 0xffffff || iterations > 0xffffffff || memory_kib > 0xffffffff || length > 0xffffffff : throw .invalid_input
+    if memory_kib < 8 * parallelism : throw .invalid_input
+
+    let kdf = EVP_KDF_fetch(null, "ARGON2ID".@cast(cstring), null) ?! {
+        ERR_clear_error()
+        throw .invalid_input
+    }
+    let ctx = EVP_KDF_CTX_new(kdf) ?! {
+        EVP_KDF_free(kdf)
+        ERR_clear_error()
+        throw .invalid_input
+    }
+
+    let empty = ""
+    let pass_ptr: ptr = password.length > 0 ? password.data : empty.data
+    let salt_ptr: ptr = salt.data
+    let iter_v = iterations.to(u32)
+    let mem_v = memory_kib.to(u32)
+    let lanes_v = parallelism.to(u32)
+    let threads_v: u32 = 1
+    let version_v: u32 = ARGON2_VERSION
+    let size_v = length.to(u32)
+
+    let params: [OSSL_PARAM x 9] = {
+        OSSL_PARAM { key: "pass".@cast(cstring), data_type: OSSL_PARAM_OCTET_STRING, data: pass_ptr, data_size: password.length, return_size: 0 }
+        OSSL_PARAM { key: "salt".@cast(cstring), data_type: OSSL_PARAM_OCTET_STRING, data: salt_ptr, data_size: salt.length, return_size: 0 }
+        OSSL_PARAM { key: "iter".@cast(cstring), data_type: OSSL_PARAM_UNSIGNED_INTEGER, data: @ref(iter_v), data_size: size_of(u32), return_size: 0 }
+        OSSL_PARAM { key: "memcost".@cast(cstring), data_type: OSSL_PARAM_UNSIGNED_INTEGER, data: @ref(mem_v), data_size: size_of(u32), return_size: 0 }
+        OSSL_PARAM { key: "lanes".@cast(cstring), data_type: OSSL_PARAM_UNSIGNED_INTEGER, data: @ref(lanes_v), data_size: size_of(u32), return_size: 0 }
+        OSSL_PARAM { key: "threads".@cast(cstring), data_type: OSSL_PARAM_UNSIGNED_INTEGER, data: @ref(threads_v), data_size: size_of(u32), return_size: 0 }
+        OSSL_PARAM { key: "version".@cast(cstring), data_type: OSSL_PARAM_UNSIGNED_INTEGER, data: @ref(version_v), data_size: size_of(u32), return_size: 0 }
+        OSSL_PARAM { key: "size".@cast(cstring), data_type: OSSL_PARAM_UNSIGNED_INTEGER, data: @ref(size_v), data_size: size_of(u32), return_size: 0 }
+        OSSL_PARAM { key: null, data_type: 0, data: null, data_size: 0, return_size: 0 }
+    }
+
+    let out = String.alloc(length)
+    let ok = EVP_KDF_derive(ctx, out.data, length, @ref(params[0])) == 1
+    EVP_KDF_CTX_free(ctx)
+    EVP_KDF_free(kdf)
+    if !ok {
+        ERR_clear_error()
+        throw .invalid_input
+    }
+    return out
+}
+
+fn base64_nopad_encode(data: local &[u8]) String {
+    let encoded = base64_encode(data)
+    let end = encoded.bytes
+    while end > 0 && encoded[end - 1] == '=' : end--
+    return end == encoded.bytes ? encoded : encoded.range(0, end)
+}
+
+/// Hashes `password` with Argon2id and a fresh 16-byte random salt in PHC string format.
+///
+/// Defaults follow OWASP recommendations (`memory_kib: 19456` = 19 MiB, `iterations: 2`,
+/// `parallelism: 1`). Verify passwords against the returned `$argon2id$v=19$...` string
+/// with `argon2id_verify`.
++ fn argon2id_hash(
+    password: local &[u8],
+    memory_kib: uint (19456),
+    iterations: uint (2),
+    parallelism: uint (1)
+) String !CryptoError {
+    let salt = random_bytes(ARGON2_DEFAULT_SALT_LEN)
+    let tag = argon2id(password, salt, memory_kib, iterations, parallelism, ARGON2_DEFAULT_TAG_LEN) !>
+    return "$argon2id$v=19$m=" + memory_kib + ",t=" + iterations + ",p=" + parallelism
+        + "$" + base64_nopad_encode(salt) + "$" + base64_nopad_encode(tag)
+}
+
+/// Returns whether `password` matches an Argon2id PHC string (`$argon2id$v=19$...`).
+///
+/// Malformed strings return `false`. Comparison runs in constant time.
++ fn argon2id_verify(password: local &[u8], encoded: local &[u8]) bool {
+    if !encoded.starts_with("$argon2id$") : return false
+    let rest = encoded.view(10, encoded.length - 10)
+
+    // Optional `v=19$` segment
+    if rest.starts_with("v=") {
+        let sep = rest.index_of_byte('$') ! return false
+        let ver = rest.view(2, sep - 2).to_uint() ! return false
+        if ver != ARGON2_VERSION : return false
+        rest = rest.view(sep + 1, rest.length - sep - 1)
+    }
+
+    // Parameters: `m=<mem>,t=<iter>,p=<lanes>`
+    let p_end = rest.index_of_byte('$') ! return false
+    let param_str = rest.view(0, p_end)
+    rest = rest.view(p_end + 1, rest.length - p_end - 1)
+
+    let m_sep = param_str.index_of_byte(',') ! return false
+    let m_part = param_str.view(0, m_sep)
+    let after_m = param_str.view(m_sep + 1, param_str.length - m_sep - 1)
+    let t_sep = after_m.index_of_byte(',') ! return false
+    let t_part = after_m.view(0, t_sep)
+    let p_part = after_m.view(t_sep + 1, after_m.length - t_sep - 1)
+
+    if !m_part.starts_with("m=") || !t_part.starts_with("t=") || !p_part.starts_with("p=") : return false
+    let mem_kib = m_part.view(2, m_part.length - 2).to_uint() ! return false
+    let iterations = t_part.view(2, t_part.length - 2).to_uint() ! return false
+    let parallelism = p_part.view(2, p_part.length - 2).to_uint() ! return false
+
+    // Salt and tag (unpadded standard base64)
+    let s_end = rest.index_of_byte('$') ! return false
+    let salt_b64 = rest.view(0, s_end)
+    let tag_b64 = rest.view(s_end + 1, rest.length - s_end - 1)
+    if tag_b64.index_of_byte('$') !? uint.$max != uint.$max : return false
+
+    let salt = base64_decode(salt_b64) ! return false
+    let expected = base64_decode(tag_b64) ! return false
+    if salt.bytes < 8 || expected.bytes < 4 : return false
+
+    let derived = argon2id(password, salt, mem_kib, iterations, parallelism, expected.bytes) ! return false
+    return constant_time_equals(derived, expected)
+}

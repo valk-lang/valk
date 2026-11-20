@@ -7479,6 +7479,12 @@ verifies any salt length, so signatures made with the largest salt (Python's
 ## Functions for 'crypto'
 
 ```js
+// Derives `length` raw bytes using Argon2id (RFC 9106 v1.3).
++ fn argon2id(password: local &[u8], salt: local &[u8], memory_kib: uint (65536), iterations: uint (3), parallelism: uint (1), length: uint (32)) String !CryptoError
+// Hashes `password` with Argon2id and a fresh 16-byte random salt in PHC string format.
++ fn argon2id_hash(password: local &[u8], memory_kib: uint (19456), iterations: uint (2), parallelism: uint (1)) String !CryptoError
+// Returns whether `password` matches an Argon2id PHC string (`$argon2id$v=19$...`).
++ fn argon2id_verify(password: local &[u8], encoded: local &[u8]) bool
 // Decodes standard base64 (`+` and `/`) into the raw bytes it represents.
 + fn base64_decode(data: local &[u8]) String !CryptoError
 // Decodes standard base64 into `out` and returns the bytes written.
@@ -7587,6 +7593,14 @@ verifies any salt length, so signatures made with the largest salt (Python's
 + fn sha384_hex_in(data: local &[u8], out: local mut &[u8]) uint
 // Writes the SHA-384 digest of `data` as lowercase hex to `out`; returns the bytes written.
 + fn sha384_hex_into(data: local &[u8], out: Writer) uint !io:IoError
+// Returns the raw 32-byte SHA3-256 digest of `data`.
++ fn sha3_256(data: local &[u8]) String
+// Returns the SHA3-256 digest of `data` as 64 lowercase hex characters.
++ fn sha3_256_hex(data: local &[u8]) String
+// Returns the raw 64-byte SHA3-512 digest of `data`.
++ fn sha3_512(data: local &[u8]) String
+// Returns the SHA3-512 digest of `data` as 128 lowercase hex characters.
++ fn sha3_512_hex(data: local &[u8]) String
 // Returns the SHA-512 digest of `data` as lowercase hex.
 + fn sha512_hex(data: local &[u8]) String
 // Writes the SHA-512 digest of `data` as hex into `out`; see `hash_hex_in`.
@@ -7595,7 +7609,31 @@ verifies any salt length, so signatures made with the largest salt (Python's
 + fn sha512_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 // Decrypts what `seal` returned, with the same `key` and `aad`.
 + fn unseal(key: local &[u8], sealed: local &[u8], aad: local &[u8] ("")) String !CipherError
+// Overwrites every byte of `buf` with zero in a way the compiler will not optimize away.
++ fn zero_bytes(buf: local mut &[u8]) void
 ```
+
+### argon2id
+
+Derives `length` raw bytes using Argon2id (RFC 9106 v1.3).
+
+`memory_kib` is the memory cost in KiB (at least `8 * parallelism`), `iterations` is the
+time cost (at least 1), `parallelism` is the lane count (at least 1), `salt` must be at
+least 8 bytes, and `length` at least 4 bytes. Throws `invalid_input` on invalid parameters.
+
+### argon2id_hash
+
+Hashes `password` with Argon2id and a fresh 16-byte random salt in PHC string format.
+
+Defaults follow OWASP recommendations (`memory_kib: 19456` = 19 MiB, `iterations: 2`,
+`parallelism: 1`). Verify passwords against the returned `$argon2id$v=19$...` string
+with `argon2id_verify`.
+
+### argon2id_verify
+
+Returns whether `password` matches an Argon2id PHC string (`$argon2id$v=19$...`).
+
+Malformed strings return `false`. Comparison runs in constant time.
 
 ### base64_decode
 
@@ -7904,6 +7942,22 @@ Writes the SHA-384 digest of `data` as hex into `out`; see `hash_hex_in`.
 
 Writes the SHA-384 digest of `data` as lowercase hex to `out`; returns the bytes written.
 
+### sha3_256
+
+Returns the raw 32-byte SHA3-256 digest of `data`.
+
+### sha3_256_hex
+
+Returns the SHA3-256 digest of `data` as 64 lowercase hex characters.
+
+### sha3_512
+
+Returns the raw 64-byte SHA3-512 digest of `data`.
+
+### sha3_512_hex
+
+Returns the SHA3-512 digest of `data` as 128 lowercase hex characters.
+
 ### sha512_hex
 
 Returns the SHA-512 digest of `data` as lowercase hex.
@@ -7922,6 +7976,12 @@ Decrypts what `seal` returned, with the same `key` and `aad`.
 
 Throws `auth` when the data was altered or sealed with another key, and `invalid_input`
 when the key is not 32 bytes.
+
+### zero_bytes
+
+Overwrites every byte of `buf` with zero in a way the compiler will not optimize away.
+
+Use to clear keys, passwords, and other secret buffers once they are no longer needed.
 
 ## Classes for 'crypto'
 
@@ -8135,6 +8195,8 @@ Feeds more input into the hash.
 + class PrivateKey {
     // Returns the key size in bits: the modulus for RSA, the curve size for EC, 253 for Ed25519.
     + fn bits() uint
+    // Derives a shared secret with `peer` using ECDH (P-256, P-384, or P-521).
+    + fn derive_secret(peer: PublicKey) String !KeyError
     // Reads a DER private key, PKCS#8 or the older RSA and EC forms.
     + static fn from_der(der: local &[u8]) PrivateKey !KeyError
     // Returns the Ed25519 key whose 32-byte private seed is `seed`.
@@ -8168,6 +8230,13 @@ Create one with `generate_rsa`, `generate_ec` or `generate_ed25519`, or read one
 #### bits
 
 Returns the key size in bits: the modulus for RSA, the curve size for EC, 253 for Ed25519.
+
+#### derive_secret
+
+Derives a shared secret with `peer` using ECDH (P-256, P-384, or P-521).
+
+Both keys must be EC keys on the same curve. Returns the raw shared secret bytes;
+pass the result through a KDF such as `hkdf` before using it as a symmetric key.
 
 #### from_der
 
@@ -8389,6 +8458,62 @@ Returns the hasher to its initial state, discarding all input fed so far.
 Feeds more input into the hash.
 
 ```js
+// A streaming SHA-3 (FIPS 202) hash supporting SHA3-256 and SHA3-512.
++ class Sha3 is Hasher {
+    // Returns the sponge block rate in bytes (136 for SHA3-256, 72 for SHA3-512).
+    + fn block_size() uint
+    // Returns the digest size in bytes (32 or 64).
+    + fn digest_size() uint
+    // Writes the digest into `out` and returns its size in bytes.
+    + fn finish(out: local mut &[u8]) uint
+    // Discards all input fed so far and resets the sponge state.
+    + fn reset() void
+    // Creates a streaming SHA3-256 hasher (32-byte digest, 136-byte block rate).
+    + static fn sha3_256() Sha3
+    // Creates a streaming SHA3-512 hasher (64-byte digest, 72-byte block rate).
+    + static fn sha3_512() Sha3
+    // Feeds more input bytes into the hash.
+    + fn update(data: local &[u8]) void
+}
+```
+
+### Sha3
+
+A streaming SHA-3 (FIPS 202) hash supporting SHA3-256 and SHA3-512.
+
+Implements `Hasher`. Create one with `Sha3.sha3_256()` or `Sha3.sha3_512()`.
+
+#### block_size
+
+Returns the sponge block rate in bytes (136 for SHA3-256, 72 for SHA3-512).
+
+#### digest_size
+
+Returns the digest size in bytes (32 or 64).
+
+#### finish
+
+Writes the digest into `out` and returns its size in bytes.
+
+`out` must hold at least `digest_size()` bytes; a shorter buffer panics.
+
+#### reset
+
+Discards all input fed so far and resets the sponge state.
+
+#### sha3_256
+
+Creates a streaming SHA3-256 hasher (32-byte digest, 136-byte block rate).
+
+#### sha3_512
+
+Creates a streaming SHA3-512 hasher (64-byte digest, 72-byte block rate).
+
+#### update
+
+Feeds more input bytes into the hash.
+
+```js
 // A streaming SHA-512 or SHA-384 `Hasher`.
 + class Sha512 is Hasher, KeyedHasher {
     // Returns 128, the SHA-512 block size in bytes.
@@ -8437,6 +8562,55 @@ Returns a hasher that computes SHA-384.
 #### update
 
 Feeds more input into the hash.
+
+```js
+// An X25519 (RFC 7748) key pair for Diffie-Hellman key agreement.
++ class X25519Key {
+    // Computes the 32-byte X25519 shared secret with `peer_public_key` (32 bytes).
+    + fn derive(peer_public_key: local &[u8]) String !KeyError
+    // Loads an X25519 key pair from a 32-byte raw private scalar.
+    + static fn from_raw(private_bytes: local &[u8]) X25519Key !KeyError
+    // Generates a new random X25519 key pair.
+    + static fn generate() X25519Key !KeyError
+    // Returns the 32-byte raw private key.
+    + fn private_key() String !KeyError
+    // Returns the 32-byte raw public key.
+    + fn public_key() String !KeyError
+}
+```
+
+### X25519Key
+
+An X25519 (RFC 7748) key pair for Diffie-Hellman key agreement.
+
+Generate a fresh key with `X25519Key.generate()`, exchange the 32-byte `public_key()`
+with the peer, and call `derive(peer_public_key)` to compute the 32-byte shared secret.
+Pass the derived secret through a KDF such as `hkdf` before using it as a symmetric key.
+
+#### derive
+
+Computes the 32-byte X25519 shared secret with `peer_public_key` (32 bytes).
+
+Throws `invalid_input` if `peer_public_key` is not 32 bytes, or `failed` for
+low-order / all-zero peer keys.
+
+#### from_raw
+
+Loads an X25519 key pair from a 32-byte raw private scalar.
+
+Throws `invalid_input` if `private_bytes` is not 32 bytes long.
+
+#### generate
+
+Generates a new random X25519 key pair.
+
+#### private_key
+
+Returns the 32-byte raw private key.
+
+#### public_key
+
+Returns the 32-byte raw public key.
 
 # ext
 

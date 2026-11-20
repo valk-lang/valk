@@ -3207,9 +3207,11 @@ Note: `valk.template` works at runtime and therefore cannot detect incorrect tem
 
 ## Crypto
 
-Supported utilities include bcrypt, BLAKE2b, Base64, MD5, SHA-1, SHA-256,
-SHA-384, SHA-512, HMAC, PBKDF2, HKDF, secure random values, authenticated
-encryption (AES-GCM, ChaCha20-Poly1305) and signatures (Ed25519, ECDSA, RSA).
+Supported utilities include Argon2id, bcrypt, BLAKE2b, Base64, MD5, SHA-1,
+SHA-256, SHA-384, SHA-512, SHA3-256, SHA3-512, HMAC, PBKDF2, HKDF, secure
+random values, `zero_bytes`, authenticated encryption (AES-GCM,
+ChaCha20-Poly1305), key exchange (X25519, ECDH) and signatures (Ed25519, ECDSA,
+RSA).
 
 ```rust
 use valk.crypto
