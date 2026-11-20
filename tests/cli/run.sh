@@ -856,6 +856,40 @@ if ! "$VALK" fmt "$workdir/check.valk" --check >/dev/null 2>&1; then
     exit 1
 fi
 
+echo "> valk fmt normalizes 0.8.10 syntax (tags, const generics, is constraints, named unions)"
+cat > "$workdir/fmt-0810.valk" <<'EOF'
+class   Foo[ T  is  Bar + $eq , const  N : uint ]  is  Baz {
+    id : int   `  json : "user_id" ,  omitempty  `
+    name : String ( "hi" )   $tag( json : "full_name" ,  omitempty )
+}
+
+union   Res[ T , E ] {
+    ok ( T )
+    err ( E )
+    empty
+}
+EOF
+"$VALK" fmt "$workdir/fmt-0810.valk" >/dev/null 2>&1 || {
+    echo "# valk fmt failed on 0.8.10 syntax"
+    exit 1
+}
+for want in \
+    'class Foo[T is Bar + $eq, const N: uint] is Baz {' \
+    '    id: int `json: "user_id", omitempty`' \
+    '    name: String ("hi") $tag(json: "full_name", omitempty)' \
+    '    ok(T)' \
+    '    err(E)'; do
+    if ! grep -Fq "$want" "$workdir/fmt-0810.valk"; then
+        echo "# valk fmt output missing expected line: $want"
+        cat "$workdir/fmt-0810.valk"
+        exit 1
+    fi
+done
+if ! "$VALK" fmt "$workdir/fmt-0810.valk" --check >/dev/null 2>&1; then
+    echo "# valk fmt was not idempotent on 0.8.10 syntax"
+    exit 1
+fi
+
 echo "> valk --version"
 if [[ "$("$VALK" --version 2>&1)" != "valk-"* ]]; then
     echo "# valk --version must print the version"

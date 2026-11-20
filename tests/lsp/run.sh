@@ -806,6 +806,60 @@ check "constrained generic: completion lists interface method" \
     '"label":"read_chunk"' \
     "$(request textDocument/completion constrained.valk 5 15)"
 
+# 0.8.10 syntax: string interpolation + format specifiers, const+constrained generics,
+# named union variants, #loop properties completion, bench, and atomic_cas
+check "0.8.10: hover works inside formatted string interpolation" \
+    '"value":"```valk\nString\n```"' \
+    "$(request textDocument/hover v0810.valk 9 39)"
+
+check "0.8.10: definition works inside formatted string interpolation" \
+    '"line":6,"character":' \
+    "$(request textDocument/definition v0810.valk 9 39)"
+
+check "0.8.10: hover on const generic param inside uninstantiated struct" \
+    '"value":"```valk\nuint\n```"' \
+    "$(request textDocument/hover v0810.valk 17 15)"
+
+check "0.8.10: definition on const generic param jumps to declaration" \
+    '"line":13,"character":' \
+    "$(request textDocument/definition v0810.valk 17 15)"
+
+check "0.8.10: hover on constrained method inside const-generic struct" \
+    '"value":"```valk\nfn describe() String\n```"' \
+    "$(request textDocument/hover v0810.valk 21 20)"
+
+check "0.8.10: completion on constrained method inside const-generic struct" \
+    '"label":"describe"' \
+    "$(request textDocument/completion v0810.valk 21 17)"
+
+check "0.8.10: documentSymbol includes named union variants" \
+    '"name":"rgb","detail":"(u8, u8, u8)"' \
+    "$(request_doc textDocument/documentSymbol v0810.valk)"
+
+check "0.8.10: hover on named union variant in match arm" \
+    '"value":"```valk\nColor.red\n```"' \
+    "$(request textDocument/hover v0810.valk 31 14)"
+
+check "0.8.10: definition on named union variant in match arm" \
+    '"line":26,"character":' \
+    "$(request textDocument/definition v0810.valk 31 14)"
+
+check "0.8.10: hover on destructured variant binding in match arm" \
+    '"value":"```valk\nu8\n```"' \
+    "$(request textDocument/hover v0810.valk 32 17)"
+
+check '0.8.10: #loop properties completion lists $tag and $has_tag' \
+    '"label":"$tag"' \
+    "$(request textDocument/completion v0810.valk 39 16)"
+
+check "0.8.10: hover on Bencher inside bench block" \
+    '"value":"```valk\nfn loop() bool\n```' \
+    "$(request textDocument/hover v0810.valk 46 14)"
+
+check "0.8.10: hover on atomic_cas builtin" \
+    '"value":"```valk\nfn atomic_cas(target: T, expected: T, desired: T) bool\n```"' \
+    "$(request textDocument/hover v0810.valk 53 16)"
+
 # A message with broken headers is skipped; the messages after it are still answered
 for broken in 'X-Junk-Without-Colon\r\n\r\n' 'X-No-Length: 1\r\n\r\n{"x":1}' 'Content-Length: abc\r\n\r\n{"x":1}' '{ "body without headers": 1 }\r\n\r\n'; do
     count=$((count + 1))

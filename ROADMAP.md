@@ -7,6 +7,8 @@
 - Release 0.8.11
 + Fix (`fs`): `fs.is_dir` now masks `st_mode` with `S_IFMT` so Unix domain sockets (`S_IFSOCK`) are not misidentified as directories
 + Fix (`fs.Watcher`): `close()` on Linux now removes watches (`inotify_rm_watch`) so blocked `next()` calls wake immediately on `io_uring` instead of waiting for timeout
++ Fix (`fmt`): named tagged-union payload variants tighten to `variant(Type)` instead of preserving a space before `(`
++ Fix (`lsp`): hover, go-to-definition, and completion now work inside string interpolations (including format specifiers), inside uninstantiated `const`-generic and constrained generic structs/classes, on named tagged-union variants and destructured `match` bindings, on `#loop properties` metadata (`$tag`, `$has_tag`, `$type`, ...), and on `atomic_cas`/`atomic_load`/`atomic_store`; `documentSymbol` now includes named union variants
 
 + Release 0.8.10
 + Language: property metadata tags (`$tag(...)` and backtick shorthand) exposed via `#loop properties` / `#loop object`, with `json` support for `rename`, `skip`, and `omitempty`
