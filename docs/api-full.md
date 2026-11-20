@@ -538,8 +538,8 @@ Prints `msg` to stderr and ends the process with exit code 1.
 
 The compiler fills `location` with the panic's source position, relative to the root of
 the package it was compiled in, and the output reads `msg at path:line`. A program built
-with `--debug` also prints the stack trace. C exit handlers do not run. Marked `$exit`:
-the compiler knows a call never returns.
+with `--debug` or `--stack-traces` also prints the stack trace. C exit handlers do not run.
+Marked `$exit`: the compiler knows a call never returns.
 
 ### process_id
 

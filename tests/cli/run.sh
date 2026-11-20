@@ -1430,6 +1430,54 @@ Stack trace:
 fi
 
 echo ""
+echo "# Test --stack-traces: production traces and line tables without full --debug"
+rel_trace_out=$($TIMEOUT "$VALK" build "$DIR/debug-trace.valk" --no-warn --release --stack-traces -o "$workdir/rel-trace$EXE_SUFFIX" 2>&1 && $TIMEOUT "$workdir/rel-trace$EXE_SUFFIX" 2>&1)
+rel_trace_code=$?
+rel_trace_out=$(printf '%s' "$rel_trace_out" | tr -d '\r' | sed 's#[^ (]*/debug-trace\.valk#debug-trace.valk#g')
+if [ "$rel_trace_code" -ne 1 ] || [[ "$rel_trace_out" != *"$expected_trace"* ]]; then
+    echo "# A panic in a --release --stack-traces build must print the stack trace (exit code $rel_trace_code)"
+    echo "$rel_trace_out"
+    exit 1
+fi
+opt_trace_out=$($TIMEOUT "$VALK" build "$DIR/debug-trace.valk" --no-warn --opt --stack-traces -o "$workdir/opt-trace$EXE_SUFFIX" 2>&1 && $TIMEOUT "$workdir/opt-trace$EXE_SUFFIX" 2>&1)
+opt_trace_code=$?
+opt_trace_out=$(printf '%s' "$opt_trace_out" | tr -d '\r' | sed 's#[^ (]*/debug-trace\.valk#debug-trace.valk#g')
+if [ "$opt_trace_code" -ne 1 ] || [[ "$opt_trace_out" != *"$expected_trace"* ]]; then
+    echo "# A panic in an --opt --stack-traces build must print the stack trace (exit code $opt_trace_code)"
+    echo "$opt_trace_out"
+    exit 1
+fi
+st_ir=$("$VALK" build "$DIR/stack-traces-prod.valk" --no-warn --release --stack-traces --ir -o "$workdir/st-prod.ir" 2>&1 && cat "$workdir/st-prod.ir")
+for needle in "emissionKind: LineTablesOnly" 'name: "main.leaf_add"' 'name: "main.worker_boom"' "!DILocation("; do
+    if [[ "$st_ir" != *"$needle"* ]]; then
+        echo "# The --stack-traces IR is missing: $needle"
+        exit 1
+    fi
+done
+for forbidden in "emissionKind: FullDebug" "@llvm.dbg.declare" "!DILocalVariable(" 'valk.dbg.main__leaf_add'; do
+    if [[ "$st_ir" == *"$forbidden"* ]]; then
+        echo "# The --stack-traces IR must not contain: $forbidden"
+        exit 1
+    fi
+done
+prod_out=$($TIMEOUT "$VALK" build "$DIR/stack-traces-prod.valk" --no-warn --release --stack-traces -o "$workdir/st-prod$EXE_SUFFIX" 2>&1 && $TIMEOUT "$workdir/st-prod$EXE_SUFFIX" 2>&1)
+prod_code=$?
+prod_out=$(printf '%s' "$prod_out" | tr -d '\r' | sed 's#[^ (]*/stack-traces-prod\.valk#stack-traces-prod.valk#g')
+for needle in "DEBUG=false" "STACK_TRACES=true" "STACK_SIZE=1048576" "SUM=42" "coro trace at stack-traces-prod.valk:19" "at main.worker_boom (stack-traces-prod.valk:19)"; do
+    if [ "$prod_code" -ne 1 ] || [[ "$prod_out" != *"$needle"* ]]; then
+        echo "# The --release --stack-traces run is missing '$needle' (exit code $prod_code)"
+        echo "$prod_out"
+        exit 1
+    fi
+done
+st_regions=$("$VALK" build "$DIR/stack-traces-prod.valk" --no-warn --release --stack-traces --region-report -o "$workdir/st-prod-reg$EXE_SUFFIX" 2>&1)
+if [[ "$st_regions" != *"TempBox"* ]] || [[ "$st_regions" != *"region"* && "$st_regions" != *"frame"* ]]; then
+    echo "# --stack-traces must keep region escape analysis enabled"
+    echo "$st_regions"
+    exit 1
+fi
+
+echo ""
 echo "# Test library names with dots link by name"
 link_args() {
     "$VALK" build "$DIR/link-names.valk" --no-warn -vvv --target "$1" -o "$workdir/link-names" 2>&1 | grep "Full link command" | tr -d '\r'

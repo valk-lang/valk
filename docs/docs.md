@@ -149,6 +149,7 @@ valk run ./src -- alice bob                 # Compile and run; program arguments
 valk build ./src -o ./app --run --watch     # Rebuild and restart when a file changes
 valk build ./src -o ./app --target win-x64  # Cross compile: linux-x64, linux-arm64, macos-x64, macos-arm64, win-x64
 valk build ./src -o ./app --release --cpu native  # Use this machine's CPU features (AVX2, ...); or a name like x86-64-v3
+valk build ./src -o ./app --release --stack-traces # Optimized build with line tables and panic stack traces
 valk build ./src -o ./app --io epoll        # Linux: use epoll instead of io_uring, for systems that block io_uring
 valk build ./src --lint                     # Check without building
 valk build ./src --lint --deny-warnings     # Fail on any warning (alias: -Werror)
@@ -2706,6 +2707,16 @@ Visual Studio show the functions, the source lines, the arguments and the local 
 A debug build keeps its local variables in memory, where a debugger can read them. It is
 slower, its stack frames are larger (a coroutine gets 4 MiB of stack instead of 1 MiB), and an
 object can stay alive a little longer before it is collected.
+
+For production builds that still need symbolicated panic stack traces and source line tables
+without disabling optimizations or increasing coroutine stack sizes, pass `--stack-traces`:
+
+```sh
+valk build ./src --release --stack-traces -o app
+```
+
+`--stack-traces` keeps full optimizations and 1 MiB coroutine stacks, emits lightweight line
+tables for profilers and debuggers, and prints stack traces on panics and crashes.
 
 ## HTTP
 
