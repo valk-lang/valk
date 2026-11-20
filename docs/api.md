@@ -2821,6 +2821,8 @@ alias pid_t for i32
 ```js
 // The kind of file system entry reported by `stat`.
 + enum FileKind { file, directory, other }
+// The kind of filesystem change reported by `fs.Watcher`.
++ enum WatchEventKind { create, modify, remove, rename }
 // How `open` treats the contents of a file it opens for writing.
 + enum WriteMode { preserve, truncate, append }
 ```
@@ -2922,6 +2924,8 @@ alias pid_t for i32
 + fn try_lock(path: String, exclusive: bool (true)) ?FileLock !io:IoError
 // Writes `content` to the file at `path`, creating the file when it is missing.
 + fn write(path: String, content: local &[u8], append: bool (false)) void !io:IoError
+// Writes `content` to `path` atomically via a sibling temporary file and atomic rename.
++ fn write_atomic(path: String, content: local &[u8], sync: bool (true), permissions: u32 (0c644)) void !io:IoError
 // Writes everything `source` yields to the file at `path`, in chunks of `chunk_size` bytes, and returns the bytes written; the file is created when it is missing and replaced unless `append` is set.
 + fn write_from(path: String, source: Reader, append: bool (false), chunk_size: uint (65536)) uint !io:IoError
 ```
@@ -3061,6 +3065,32 @@ alias pid_t for i32
     + fn pop() Path
     // Returns the absolute, normalized form of this path; see `fs.resolve`.
     + fn resolve() Path
+}
+```
+
+```js
+// A filesystem change notification produced by `fs.Watcher.next`.
++ struct WatchEvent {
+    // Kind of change observed.
+    + kind: WatchEventKind
+    // Full path of the file or directory that changed.
+    + path: String
+}
+```
+
+```js
+// Watches files and directories for changes using OS notifications (`inotify` on Linux, `kqueue` on macOS, metadata polling on Windows).
++ class Watcher is Closer {
+    // Starts watching the file or directory at `path`.
+    + fn add(path: String) void !io:IoError
+    // Closes the watcher and releases all OS watch handles.
+    + fn close() void !io:IoError
+    // Creates a new filesystem watcher.
+    + static fn new() Watcher !io:IoError
+    // Waits for and returns the next filesystem event, or `null` if `timeout_ms` (> 0) runs out.
+    + fn next(timeout_ms: uint (0)) ?WatchEvent !io:IoError
+    // Stops watching `path`. Does nothing if `path` is not currently watched.
+    + fn remove(path: String) void !io:IoError
 }
 ```
 

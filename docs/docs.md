@@ -1761,9 +1761,11 @@ A ternary whose branch starts with `.name` needs a space after the `?`:
 API for [valk.fs](api.md#fs)
 
 Use `valk.fs` for file-system operations. `fs.read(path)` returns a whole
-file as a `String`, `fs.write(path, content, append)` takes any bytes, and
-`fs.read_into(path, writer)` / `fs.write_from(path, reader)` stream a file
-without holding it in memory:
+file as a `String`, `fs.write(path, content, append)` takes any bytes,
+`fs.write_atomic(path, content)` writes via a sibling temporary file and atomic
+rename, and `fs.read_into(path, writer)` / `fs.write_from(path, reader)` stream
+a file without holding it in memory. `fs.Watcher` watches files or directories
+for create, modify, rename, and remove events (`add`, `remove`, `next`, `close`):
 
 ```rust
 use valk.fs

@@ -1,0 +1,440 @@
+use ext
+use io
+use core
+use time
+
+/// The kind of filesystem change reported by `fs.Watcher`.
++ enum WatchEventKind {
+    create
+    modify
+    remove
+    rename
+}
+
+/// A filesystem change notification produced by `fs.Watcher.next`.
++ struct WatchEvent {
+    /// Full path of the file or directory that changed.
+    + path: String
+    /// Kind of change observed.
+    + kind: WatchEventKind
+}
+
+#if OS == "linux"
+value IN_MODIFY (0x00000002)
+value IN_ATTRIB (0x00000004)
+value IN_CLOSE_WRITE (0x00000008)
+value IN_MOVED_FROM (0x00000040)
+value IN_MOVED_TO (0x00000080)
+value IN_CREATE (0x00000100)
+value IN_DELETE (0x00000200)
+value IN_DELETE_SELF (0x00000400)
+value IN_MOVE_SELF (0x00000800)
+value IN_WATCH_MASK (IN_CREATE | IN_MODIFY | IN_CLOSE_WRITE | IN_ATTRIB | IN_DELETE | IN_DELETE_SELF | IN_MOVED_FROM | IN_MOVED_TO | IN_MOVE_SELF)
+
+extern fn inotify_init1(flags: i32) i32;
+extern fn inotify_add_watch(fd: i32, pathname: cstring, mask: u32) i32;
+extern fn inotify_rm_watch(fd: i32, wd: i32) i32;
+#elif OS == "macos"
+value KQ_EVFILT_VNODE (-4)
+value KQ_EV_ADD (0x0001)
+value KQ_EV_CLEAR (0x0020)
+value KQ_NOTE_DELETE (0x00000001)
+value KQ_NOTE_WRITE (0x00000002)
+value KQ_NOTE_EXTEND (0x00000004)
+value KQ_NOTE_ATTRIB (0x00000008)
+value KQ_NOTE_LINK (0x00000010)
+value KQ_NOTE_RENAME (0x00000020)
+value KQ_VNODE_NOTES (KQ_NOTE_DELETE | KQ_NOTE_WRITE | KQ_NOTE_EXTEND | KQ_NOTE_ATTRIB | KQ_NOTE_LINK | KQ_NOTE_RENAME)
+
+class MacWatchEntry {
+    path: String
+    fd: i32
+    is_dir: bool
+    children: HashMap[String, uint] (.{})
+}
+#else
+class PollWatchEntry {
+    path: String
+    is_dir: bool
+    exists: bool
+    mtime: uint (0)
+    size: uint (0)
+    children: HashMap[String, (uint, uint)] (.{})
+}
+#end
+
+/// Watches files and directories for changes using OS notifications (`inotify` on Linux,
+/// `kqueue` on macOS, metadata polling on Windows).
+///
+/// Waiting in `next` only suspends the current coroutine. Close the watcher with `close()`
+/// when done.
++ class Watcher is io.Closer {
+    - closed: bool (false)
+    - queue: Deque[WatchEvent] (.{})
+    #if OS == "linux"
+    - fd: i32 (-1)
+    - wd_to_path: HashMap[u32, String] (.{})
+    - path_to_wd: HashMap[String, uint] (.{})
+    #elif OS == "macos"
+    - kq: i32 (-1)
+    - fd_to_entry: HashMap[u32, MacWatchEntry] (.{})
+    - path_to_fd: HashMap[String, uint] (.{})
+    #else
+    - entries: HashMap[String, PollWatchEntry] (.{})
+    #end
+
+    /// Creates a new filesystem watcher.
+    + static fn new() Watcher !io.IoError {
+        #if OS == "linux"
+        let fd = inotify_init1(ext.O_NONBLOCK | ext.O_CLOEXEC)
+        if fd < 0 : throw .os
+        return Watcher { fd: fd }
+        #elif OS == "macos"
+        let kq = ext.kqueue()
+        if kq < 0 : throw .os
+        io.set_close_on_exec(kq) ! {
+            ext.close(kq)
+            throw .os
+        }
+        io.set_nonblocking(kq, true) ! {
+            ext.close(kq)
+            throw .os
+        }
+        return Watcher { kq: kq }
+        #else
+        return Watcher {}
+        #end
+    }
+
+    /// Starts watching the file or directory at `path`.
+    ///
+    /// Watching a path that is already watched is a no-op. Throws `.closed` if the watcher is
+    /// closed, or `.open`/`.access` if `path` cannot be watched.
+    + fn add(path: String) !io.IoError {
+        if this.closed : throw .closed
+        let resolved = resolve(path)
+        #if OS == "linux"
+        @unsafe
+        if this.path_to_wd.has(resolved) : return
+        let wd = inotify_add_watch(this.fd, resolved.data_cstring, IN_WATCH_MASK)
+        if wd < 0 {
+            if !exists(resolved) : throw .open
+            throw .access
+        }
+        this.wd_to_path.set(wd.to(u32), resolved)
+        this.path_to_wd.set(resolved, wd.to(uint))
+        #elif OS == "macos"
+        @unsafe
+        if this.path_to_fd.has(resolved) : return
+        let fd = ext.open(resolved.data_cstring, ext.O_RDONLY | ext.O_CLOEXEC, 0)
+        if fd < 0 : throw .open
+        let ev: ext.kEvent = @undefined
+        ev.ident = fd.to(uint)
+        ev.filter = KQ_EVFILT_VNODE
+        ev.flags = (KQ_EV_ADD | KQ_EV_CLEAR).to(u16)
+        ev.fflags = KQ_VNODE_NOTES
+        ev.data = 0
+        ev.udata = (0).@cast(ptr)
+        if ext.kevent(this.kq, @ref(ev), 1, null, 0, null) != 0 {
+            ext.close(fd)
+            throw .os
+        }
+        let dir = is_dir(resolved)
+        let entry = MacWatchEntry { path: resolved, fd: fd, is_dir: dir }
+        if dir : mac_snapshot_dir(resolved, entry.children)
+        this.fd_to_entry.set(fd.to(u32), entry)
+        this.path_to_fd.set(resolved, fd.to(uint))
+        #else
+        if this.entries.has(resolved) : return
+        let info = stat(resolved) ! throw .open
+        let dir = info.kind == FileKind.directory
+        let entry = PollWatchEntry {
+            path: resolved
+            is_dir: dir
+            exists: true
+            mtime: info.modified_time
+            size: info.size
+        }
+        if dir : poll_snapshot_dir(resolved, entry.children)
+        this.entries.set(resolved, entry)
+        #end
+    }
+
+    /// Stops watching `path`. Does nothing if `path` is not currently watched.
+    + fn remove(path: String) !io.IoError {
+        if this.closed : throw .closed
+        let resolved = resolve(path)
+        #if OS == "linux"
+        let wd = this.path_to_wd.get(resolved) ! return
+        this.path_to_wd.remove(resolved)
+        this.wd_to_path.remove(wd.to(u32))
+        inotify_rm_watch(this.fd, wd.to(i32))
+        #elif OS == "macos"
+        let fd = this.path_to_fd.get(resolved) ! return
+        this.path_to_fd.remove(resolved)
+        this.fd_to_entry.remove(fd.to(u32))
+        ext.close(fd.to(i32))
+        #else
+        this.entries.remove(resolved)
+        #end
+    }
+
+    /// Waits for and returns the next filesystem event, or `null` if `timeout_ms` (> 0) runs out.
+    ///
+    /// `timeout_ms` 0 waits until an event arrives or the watcher is closed. Throws `.closed`
+    /// once `close()` has been called.
+    + fn next(timeout_ms: uint (0)) ?WatchEvent !io.IoError {
+        let deadline = time.deadline_ms(timeout_ms)
+        while true {
+            let queued = this.queue.pop_front() !? null
+            if isset(queued) : return queued
+            if this.closed : throw .closed
+
+            let remaining: uint = 0
+            if deadline > 0 {
+                let now = time.mono_ms()
+                if now >= deadline : return null
+                remaining = deadline - now
+            }
+
+            #if OS == "linux"
+            this.read_inotify_events() !>
+            if !this.queue.is_empty() : continue
+            let ev = io.await_fd(this.fd, true, false, remaining)
+            if this.closed : throw .closed
+            if ev.is_timeout() : return null
+            if ev.is_closed() : throw .closed
+            #elif OS == "macos"
+            this.read_kqueue_events() !>
+            if !this.queue.is_empty() : continue
+            let ev = io.await_fd(this.kq, true, false, remaining)
+            if this.closed : throw .closed
+            if ev.is_timeout() : return null
+            if ev.is_closed() : throw .closed
+            #else
+            this.poll_entries()
+            if !this.queue.is_empty() : continue
+            let wait_ms: uint = 50
+            if remaining > 0 && remaining < wait_ms : wait_ms = remaining
+            time.sleep_ms(wait_ms)
+            #end
+        }
+    }
+
+    /// Closes the watcher and releases all OS watch handles.
+    + fn close() !io.IoError {
+        if this.closed : return
+        this.closed = true
+        #if OS == "linux"
+        if this.fd >= 0 {
+            let fd = this.fd
+            this.fd = -1
+            io.interrupt_fd(fd)
+            io.close(fd) !>
+        }
+        this.wd_to_path.clear()
+        this.path_to_wd.clear()
+        #elif OS == "macos"
+        each this.fd_to_entry as entry {
+            ext.close(entry.fd)
+        }
+        this.fd_to_entry.clear()
+        this.path_to_fd.clear()
+        if this.kq >= 0 {
+            let kq = this.kq
+            this.kq = -1
+            io.interrupt_fd(kq)
+            io.close(kq) !>
+        }
+        #else
+        this.entries.clear()
+        #end
+    }
+
+    fn gc_free() {
+        #if OS == "linux"
+        if this.fd >= 0 {
+            let fd = this.fd
+            this.fd = -1
+            ext.close(fd)
+        }
+        #elif OS == "macos"
+        if this.kq >= 0 {
+            let kq = this.kq
+            this.kq = -1
+            ext.close(kq)
+        }
+        #end
+    }
+
+    #if OS == "linux"
+    fn read_inotify_events() !io.IoError {
+        @unsafe
+        let buf: [u8 x 4096] = @undefined
+        while true {
+            let n = ext.read(this.fd, @ref(buf).@cast(ptr), 4096)
+            if n < 0 {
+                let err = ext.get_errno()
+                if err == ext.EAGAIN || err == ext.EINTR : return
+                if this.closed : throw .closed
+                throw .read
+            }
+            if n == 0 : return
+            let len = n.to(uint)
+            let off: uint = 0
+            while off + 16 <= len {
+                let base_ptr = @ref(buf).@cast(ptr).@offset(off)
+                let wd = @ptrv(base_ptr, i32, 0)
+                let mask = @ptrv(base_ptr, u32, 1)
+                let name_len = @ptrv(base_ptr, u32, 3).to(uint)
+                if off + 16 + name_len > len : break
+
+                let watched = wd >= 0 ? (this.wd_to_path.get(wd.to(u32)) !? "") : ""
+                if watched.bytes > 0 {
+                    let ev_path = watched
+                    if name_len > 0 {
+                        let name_ptr = base_ptr.@offset(16)
+                        let actual: uint = 0
+                        while actual < name_len && @ptrv(name_ptr, u8, actual) != 0 : actual++
+                        if actual > 0 {
+                            ev_path = add(watched, String.copy_from_ptr(name_ptr, actual))
+                        }
+                    }
+                    let kind = inotify_mask_kind(mask)
+                    if isset(kind) {
+                        this.queue.push_back(WatchEvent { path: ev_path, kind: kind })
+                    }
+                }
+                off += 16 + name_len
+            }
+        }
+    }
+    #elif OS == "macos"
+    fn read_kqueue_events() !io.IoError {
+        let events: [ext.kEvent x 16] = @undefined
+        let zero_ts = ext.libc_gen_timespec { tv_sec: 0, tv_nsec: 0 }
+        while true {
+            let n = ext.kevent(this.kq, null, 0, @ref(events[0]), 16, @ref(zero_ts))
+            if n < 0 {
+                let err = ext.get_errno()
+                if err == ext.EINTR : continue
+                if this.closed : throw .closed
+                throw .read
+            }
+            if n == 0 : return
+            let i: i32 = 0
+            while i < n {
+                let ev = events[i.to(uint)]
+                let entry = this.fd_to_entry.get(ev.ident.to(u32)) ! {
+                    i++
+                    continue
+                }
+                let fflags = ev.fflags
+                if entry.is_dir && (fflags & (KQ_NOTE_WRITE | KQ_NOTE_EXTEND | KQ_NOTE_LINK)) != 0 {
+                    mac_diff_dir(entry, this.queue)
+                } else if (fflags & KQ_NOTE_DELETE) != 0 {
+                    this.queue.push_back(WatchEvent { path: entry.path, kind: WatchEventKind.remove })
+                } else if (fflags & KQ_NOTE_RENAME) != 0 {
+                    this.queue.push_back(WatchEvent { path: entry.path, kind: WatchEventKind.rename })
+                } else if (fflags & (KQ_NOTE_WRITE | KQ_NOTE_EXTEND | KQ_NOTE_ATTRIB)) != 0 {
+                    this.queue.push_back(WatchEvent { path: entry.path, kind: WatchEventKind.modify })
+                }
+                i++
+            }
+        }
+    }
+    #else
+    fn poll_entries() {
+        each this.entries as entry {
+            if entry.is_dir {
+                let next_map = HashMap[String, (uint, uint)]{}
+                poll_snapshot_dir(entry.path, next_map)
+                each next_map as meta, child {
+                    let prev = entry.children.get(child) !? null
+                    if !isset(prev) {
+                        this.queue.push_back(WatchEvent { path: child, kind: WatchEventKind.create })
+                    } else if prev[0] != meta[0] || prev[1] != meta[1] {
+                        this.queue.push_back(WatchEvent { path: child, kind: WatchEventKind.modify })
+                    }
+                }
+                each entry.children as _, child {
+                    if !next_map.has(child) {
+                        this.queue.push_back(WatchEvent { path: child, kind: WatchEventKind.remove })
+                    }
+                }
+                entry.children = next_map
+            } else {
+                let info = stat(entry.path) ! {
+                    if entry.exists {
+                        entry.exists = false
+                        this.queue.push_back(WatchEvent { path: entry.path, kind: WatchEventKind.remove })
+                    }
+                    continue
+                }
+                if !entry.exists {
+                    entry.exists = true
+                    entry.mtime = info.modified_time
+                    entry.size = info.size
+                    this.queue.push_back(WatchEvent { path: entry.path, kind: WatchEventKind.create })
+                } else if info.modified_time != entry.mtime || info.size != entry.size {
+                    entry.mtime = info.modified_time
+                    entry.size = info.size
+                    this.queue.push_back(WatchEvent { path: entry.path, kind: WatchEventKind.modify })
+                }
+            }
+        }
+    }
+    #end
+}
+
+#if OS == "linux"
+fn inotify_mask_kind(mask: u32) ?WatchEventKind {
+    if (mask & (IN_DELETE | IN_DELETE_SELF)) != 0 : return WatchEventKind.remove
+    if (mask & (IN_MOVED_FROM | IN_MOVED_TO | IN_MOVE_SELF)) != 0 : return WatchEventKind.rename
+    if (mask & IN_CREATE) != 0 : return WatchEventKind.create
+    if (mask & (IN_MODIFY | IN_CLOSE_WRITE | IN_ATTRIB)) != 0 : return WatchEventKind.modify
+    return null
+}
+#elif OS == "macos"
+fn mac_snapshot_dir(dir: String, out: HashMap[String, uint]) {
+    let items = files_in(dir, false, true, true, false) ! return
+    each items as p {
+        let mtime = modified_time(p) !? 0
+        out.set(p, mtime)
+    }
+}
+
+fn mac_diff_dir(entry: MacWatchEntry, queue: Deque[WatchEvent]) {
+    let next_map = HashMap[String, uint]{}
+    mac_snapshot_dir(entry.path, next_map)
+    let emitted = false
+    each next_map as mtime, child {
+        let prev = entry.children.get(child) !? null
+        if !isset(prev) {
+            queue.push_back(WatchEvent { path: child, kind: WatchEventKind.create })
+            emitted = true
+        } else if prev != mtime {
+            queue.push_back(WatchEvent { path: child, kind: WatchEventKind.modify })
+            emitted = true
+        }
+    }
+    each entry.children as _, child {
+        if !next_map.has(child) {
+            queue.push_back(WatchEvent { path: child, kind: WatchEventKind.remove })
+            emitted = true
+        }
+    }
+    entry.children = next_map
+    if !emitted {
+        queue.push_back(WatchEvent { path: entry.path, kind: WatchEventKind.modify })
+    }
+}
+#else
+fn poll_snapshot_dir(dir: String, out: HashMap[String, (uint, uint)]) {
+    let items = files_in(dir, false, true, true, false) ! return
+    each items as p {
+        let info = stat(p) ! continue
+        out.set(p, (info.modified_time, info.size))
+    }
+}
+#end
