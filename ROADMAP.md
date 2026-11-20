@@ -4,6 +4,8 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
+- Release 0.8.11
+
 + Release 0.8.10
 + Language: property metadata tags (`$tag(...)` and backtick shorthand) exposed via `#loop properties` / `#loop object`, with `json` support for `rename`, `skip`, and `omitempty`
 + Language: generic type constraints (`[T is Interface]` and built-in bounds) checked at call sites, with `valk doc` and `valk lsp` hover/completion support
