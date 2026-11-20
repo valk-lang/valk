@@ -252,6 +252,14 @@ let msg2 = "Hello %name!" // Short way
 let msg3 = "Name length x 2: %{ name.length * 2 }!" // Any expression that can be converted to String
 let msg4 = "Hello \%name!" // Escape the %
 let msg5 = r"Hello %name!" // Raw string
+
+// Format specifiers: %{expr:[[fill]align][sign][#][0][width][.precision][type]}
+let padded = "%{42:05}"             // "00042"
+let hex = "%{255:#06x}"             // "0x00ff" (also: X, b, o, d)
+let fixed = "%{3.14159:.2f}"        // "3.14" (also: e, E)
+let aligned = "%{"hi":*>6}"         // "****hi" (align: < left, > right, ^ center)
+let truncated = "%{"abcdef":.3}"    // "abc"
+// Dynamic format specs at runtime: core.format_int, format_uint, format_float, format_string
 // Basics
 s.length // Length in bytes
 s.starts_with(x) bool
@@ -642,6 +650,15 @@ queue[0] = 9 !!               // assignment throws `missing` out of range
 let heap = Heap[int]{ 5, 1, 4 }
 let smallest = heap.pop() ! panic("empty")       // 1
 let by_length = Heap[String].new(fn(a: String, b: String) bool { return a.bytes < b.bytes })
+
+// Ordered collections (sorted iteration, min/max, floor/ceil, range queries)
+let sorted_map = BTreeMap[String, int]{ "c" => 3, "a" => 1, "b" => 2 }
+let min_k, min_v = sorted_map.min() ! panic("empty")    // "a", 1
+let floor_k, _ = sorted_map.floor("bb") ! panic("none") // "b"
+each sorted_map.range("a", "b") as val, key {}          // visits "a", then "b"
+
+let sorted_set = BTreeSet[int]{ 30, 10, 20 }
+each sorted_set.range(10, 25) as value {}               // visits 10, 20
 ```
 
 Full API: [core](api.md#core)

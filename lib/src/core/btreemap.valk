@@ -1,0 +1,793 @@
+// Minimum degree T = 16: non-root nodes hold 15..31 keys (up to 32 children).
+value BTREE_T (16)
+value BTREE_MIN_KEYS (15)
+value BTREE_MAX_KEYS (31)
+
+class BTreeNode[K, T] {
+    keys: Array[K] (Array[K].new())
+    values: Array[T] (Array[T].new())
+    children: Array[BTreeNode[K, T]] (Array[BTreeNode[K, T]].new())
+    size: uint (0)
+
+    fn is_leaf() bool $inline {
+        return this.children.length == 0
+    }
+
+    fn recount() {
+        let total = this.keys.length
+        each this.children into child {
+            total += child.size
+        }
+        this.size = total
+    }
+}
+
+/// A slice of entries from a `BTreeMap.range` query, in ascending key order.
+///
+/// Iterate with `each map.range(a, b) as value, key` or inspect `keys`, `values` and `length`.
++ class BTreeRange[K, T] $global {
+    - _keys: Array[K] (.{})
+    - _values: Array[T] (.{})
+
+    /// The number of entries in the range.
+    + get length: uint {
+        return this._keys.length
+    }
+
+    /// Returns true when the range is empty.
+    + fn is_empty() bool {
+        return this._keys.length == 0
+    }
+
+    /// Returns a copy of the keys in ascending order.
+    + fn keys() Array[K] {
+        return this._keys.copy()
+    }
+
+    /// Returns a copy of the values in ascending key order.
+    + fn values() Array[T] {
+        return this._values.copy()
+    }
+
+    fn _next(index: uint) (T, K) !IterError {
+        let k = this._keys.get(index) ! throw .end
+        let v = this._values.get(index) ! throw .end
+        return (v, k)
+    }
+}
+
+/// An ordered map backed by a B-tree: lookups, inserts, removals and order queries
+/// (`min`, `max`, `floor`, `ceil`, `at`) run in O(log n), and `each` visits entries in
+/// ascending key order.
+///
+/// Keys are ordered by `<` by default; pass a `before(a, b)` function that returns true
+/// when `a` sorts strictly before `b` to choose another order (or for keys without `<`).
+/// Build one with `BTreeMap[K, T]{ k => v }`, read with `map[k]`, write with `map[k] = v`,
+/// and iterate with `each map as value, key`.
++ class BTreeMap[K, T] $global {
+    - root: ?BTreeNode[K, T] (null)
+    - version: uint (0)
+    // Cached in-order path for O(1) amortized sequential `each` iteration
+    - cursor_nodes: Array[BTreeNode[K, T]] (.{})
+    - cursor_slots: Array[uint] (.{})
+    - cursor_index: uint (uint.$max)
+    - cursor_version: uint (0)
+    #if K.$can_order
+    - before: ?atomic fn(K, K)(bool) (null)
+    #else
+    - before: atomic fn(K, K)(bool)
+    #end
+
+    #if K.$can_order
+    /// Creates an empty map ordered by `before`, or by `<` when `before` is `null`.
+    ///
+    /// Marked `$default`: it also provides `BTreeMap[K, T].$default_value`.
+    + static fn new(before: ?atomic fn(K, K)(bool) (null)) SELF $default {
+        return SELF { before: before }
+    }
+    #else
+    /// Creates an empty map ordered by `before`.
+    ///
+    /// This form is used when `K` has no `<`; the `before` function is then required.
+    + static fn new(before: atomic fn(K, K)(bool)) SELF {
+        return SELF { before: before }
+    }
+    #end
+
+    // Returns true when `a` sorts strictly before `b`
+    - fn less(a: K, b: K) bool $inline {
+        let before = this.before
+        #if K.$can_order
+        if !isset(before) {
+            #if K.$is_raw_pointer
+            @unsafe
+            #end
+            return isset(a) && isset(b) && a < b
+        }
+        #end
+        return before(a, b)
+    }
+
+    - fn invalidate_cursor() {
+        this.version++
+        this.cursor_index = uint.$max
+        this.cursor_nodes.clear()
+        this.cursor_slots.clear()
+    }
+
+    /// The number of entries.
+    + get length: uint {
+        let r = this.root ?! return 0
+        return r.size
+    }
+
+    /// Returns true when the map holds no entries.
+    + fn is_empty() bool {
+        return this.length == 0
+    }
+
+    // First index `i` in `node.keys` with `!(node.keys[i] < key)`
+    - fn lower_bound_in(node: BTreeNode[K, T], key: K) uint {
+        let lo: uint = 0
+        let hi = node.keys.length
+        while lo < hi {
+            let mid = lo + ((hi - lo) >> 1)
+            let mk = node.keys.get(mid) ! break
+            if this.less(mk, key) : lo = mid + 1
+            else : hi = mid
+        }
+        return lo
+    }
+
+    /// Returns the value stored under `key`; backs `map[key]` (`$offset`).
+    ///
+    /// Throws `missing` when `key` is not in the map.
+    + fn get(key: K) T !LookupError $offset {
+        let cur = this.root
+        while isset(cur) {
+            let idx = this.lower_bound_in(cur, key)
+            if idx < cur.keys.length {
+                let k = cur.keys.get(idx) ! break
+                if !this.less(key, k) {
+                    return cur.values.get(idx) ! throw .missing
+                }
+            }
+            if cur.is_leaf() : break
+            cur = cur.children.get(idx) ! break
+        }
+        throw .missing
+    }
+
+    /// Returns true when `key` is in the map.
+    + fn has(key: K) bool {
+        let cur = this.root
+        while isset(cur) {
+            let idx = this.lower_bound_in(cur, key)
+            if idx < cur.keys.length {
+                let k = cur.keys.get(idx) ! break
+                if !this.less(key, k) : return true
+            }
+            if cur.is_leaf() : break
+            cur = cur.children.get(idx) ! break
+        }
+        return false
+    }
+
+    /// Stores `value` under `key`, replacing the value of an existing entry in place.
+    ///
+    /// Backs `map[key] = value` (`$offset_assign`) and the literal `BTreeMap[K, T]{ k => v }`
+    /// (`$set_key`).
+    + fn set(key: K, value: T) $offset_assign $set_key {
+        this.insert_entry(key, value, false) ! {}
+    }
+
+    /// Adds a new entry for `key`.
+    ///
+    /// Throws `exists`, leaving the map unchanged, when `key` is already present.
+    + fn set_unique(key: K, value: T) !LookupError {
+        this.insert_entry(key, value, true) !>
+    }
+
+    /// Replaces the value under `key` with what `change` returns and returns the new value.
+    ///
+    /// `change` receives the current value, or `null` when `key` is not yet in the map.
+    + fn update(key: K, change: fn(?T)(T)) T {
+        let cur: ?T = this.get(key) !? null
+        let next = change(cur)
+        this.set(key, next)
+        return next
+    }
+
+    - fn insert_entry(key: K, value: T, unique_only: bool) !LookupError {
+        let root = this.root
+        if !isset(root) {
+            let leaf = BTreeNode[K, T] { size: 1 }
+            leaf.keys.append(key)
+            leaf.values.append(value)
+            this.root = leaf
+            this.invalidate_cursor()
+            return
+        }
+        let inserted = this.insert_rec(root, key, value, unique_only) !>
+        if inserted {
+            if root.keys.length > BTREE_MAX_KEYS {
+                let new_root = BTreeNode[K, T] { size: root.size }
+                new_root.children.append(root)
+                this.split_child(new_root, 0)
+                this.root = new_root
+            }
+            this.invalidate_cursor()
+        }
+    }
+
+    - fn insert_rec(node: BTreeNode[K, T], key: K, value: T, unique_only: bool) bool !LookupError {
+        let idx = this.lower_bound_in(node, key)
+        if idx < node.keys.length {
+            let existing = node.keys.get(idx) ! panic("btree index out of bounds")
+            if !this.less(key, existing) {
+                if unique_only : throw .exists
+                node.values.set(idx, value) _
+                return false
+            }
+        }
+        if node.is_leaf() {
+            node.keys.insert(idx, key) _
+            node.values.insert(idx, value) _
+            node.size++
+            return true
+        }
+        let child = node.children.get(idx) ! panic("btree child missing")
+        let inserted = this.insert_rec(child, key, value, unique_only) !>
+        if inserted {
+            node.size++
+            if child.keys.length > BTREE_MAX_KEYS : this.split_child(node, idx)
+        }
+        return inserted
+    }
+
+    - fn split_child(parent: BTreeNode[K, T], idx: uint) {
+        let child = parent.children.get(idx) ! panic("btree split child missing")
+        let mid: uint = BTREE_T
+        let right = BTreeNode[K, T] {}
+
+        let i = mid + 1
+        while i < child.keys.length {
+            right.keys.append(child.keys.get(i) ! break)
+            right.values.append(child.values.get(i) ! break)
+            i++
+        }
+        if !child.is_leaf() {
+            let ci = mid + 1
+            while ci < child.children.length {
+                right.children.append(child.children.get(ci) ! break)
+                ci++
+            }
+            while child.children.length > mid + 1 : child.children.pop_last() _
+        }
+
+        let mid_key = child.keys.get(mid) ! panic("btree split median missing")
+        let mid_val = child.values.get(mid) ! panic("btree split median missing")
+        while child.keys.length > mid {
+            child.keys.pop_last() _
+            child.values.pop_last() _
+        }
+
+        child.recount()
+        right.recount()
+
+        parent.keys.insert(idx, mid_key) _
+        parent.values.insert(idx, mid_val) _
+        parent.children.insert(idx + 1, right) _
+        parent.recount()
+    }
+
+    /// Removes `key` and its value; does nothing when `key` is not in the map.
+    + fn remove(key: K) {
+        this.remove_entry(key)
+    }
+
+    // Removes `key` and returns true when an entry was removed
+    fn remove_entry(key: K) bool {
+        let root = this.root ?! return false
+        let removed = this.delete_rec(root, key)
+        if !removed : return false
+        if root.keys.length == 0 {
+            if root.is_leaf() : this.root = null
+            else : this.root = root.children.get(0) !? null
+        }
+        this.invalidate_cursor()
+        return true
+    }
+
+    - fn delete_rec(node: BTreeNode[K, T], key: K) bool {
+        let idx = this.lower_bound_in(node, key)
+        let found = false
+        if idx < node.keys.length {
+            let k = node.keys.get(idx) ! return false
+            found = !this.less(key, k)
+        }
+        if node.is_leaf() {
+            if !found : return false
+            node.keys.remove(idx)
+            node.values.remove(idx)
+            node.size--
+            return true
+        }
+        if found {
+            let left = node.children.get(idx) ! panic("btree child missing")
+            let pk, pv = this.pop_max_rec(left)
+            node.keys.set(idx, pk) _
+            node.values.set(idx, pv) _
+            node.size--
+            this.fix_underflow(node, idx)
+            return true
+        }
+        let child = node.children.get(idx) ! panic("btree child missing")
+        let removed = this.delete_rec(child, key)
+        if !removed : return false
+        node.size--
+        this.fix_underflow(node, idx)
+        return true
+    }
+
+    - fn pop_min_rec(node: BTreeNode[K, T]) (K, T) {
+        if node.is_leaf() {
+            let k = node.keys.pop_first() ! panic("btree pop_min empty leaf")
+            let v = node.values.pop_first() ! panic("btree pop_min empty leaf")
+            node.size--
+            return (k, v)
+        }
+        let child = node.children.get(0) ! panic("btree child missing")
+        let k, v = this.pop_min_rec(child)
+        node.size--
+        this.fix_underflow(node, 0)
+        return (k, v)
+    }
+
+    - fn pop_max_rec(node: BTreeNode[K, T]) (K, T) {
+        if node.is_leaf() {
+            let k = node.keys.pop_last() ! panic("btree pop_max empty leaf")
+            let v = node.values.pop_last() ! panic("btree pop_max empty leaf")
+            node.size--
+            return (k, v)
+        }
+        let last = node.children.length - 1
+        let child = node.children.get(last) ! panic("btree child missing")
+        let k, v = this.pop_max_rec(child)
+        node.size--
+        this.fix_underflow(node, last)
+        return (k, v)
+    }
+
+    - fn fix_underflow(parent: BTreeNode[K, T], idx: uint) {
+        let child = parent.children.get(idx) ! return
+        if child.keys.length >= BTREE_MIN_KEYS : return
+
+        // Borrow from left sibling
+        if idx > 0 {
+            let left = parent.children.get(idx - 1) ! panic("btree left sibling missing")
+            if left.keys.length > BTREE_MIN_KEYS {
+                let sep_k = parent.keys.get(idx - 1) ! panic("btree separator missing")
+                let sep_v = parent.values.get(idx - 1) ! panic("btree separator missing")
+                child.keys.prepend(sep_k)
+                child.values.prepend(sep_v)
+                let lk = left.keys.pop_last() ! panic("btree left key missing")
+                let lv = left.values.pop_last() ! panic("btree left val missing")
+                parent.keys.set(idx - 1, lk) _
+                parent.values.set(idx - 1, lv) _
+                if !left.is_leaf() {
+                    let lc = left.children.pop_last() ! panic("btree left child missing")
+                    child.children.prepend(lc)
+                }
+                left.recount()
+                child.recount()
+                return
+            }
+        }
+
+        // Borrow from right sibling
+        if idx + 1 < parent.children.length {
+            let right = parent.children.get(idx + 1) ! panic("btree right sibling missing")
+            if right.keys.length > BTREE_MIN_KEYS {
+                let sep_k = parent.keys.get(idx) ! panic("btree separator missing")
+                let sep_v = parent.values.get(idx) ! panic("btree separator missing")
+                child.keys.append(sep_k)
+                child.values.append(sep_v)
+                let rk = right.keys.pop_first() ! panic("btree right key missing")
+                let rv = right.values.pop_first() ! panic("btree right val missing")
+                parent.keys.set(idx, rk) _
+                parent.values.set(idx, rv) _
+                if !right.is_leaf() {
+                    let rc = right.children.pop_first() ! panic("btree right child missing")
+                    child.children.append(rc)
+                }
+                right.recount()
+                child.recount()
+                return
+            }
+        }
+
+        // Merge with an adjacent sibling
+        let merge_idx = idx > 0 ? idx - 1 : idx
+        let left = parent.children.get(merge_idx) ! panic("btree merge left missing")
+        let right = parent.children.get(merge_idx + 1) ! panic("btree merge right missing")
+        let sep_k = parent.keys.get(merge_idx) ! panic("btree merge sep missing")
+        let sep_v = parent.values.get(merge_idx) ! panic("btree merge sep missing")
+        left.keys.append(sep_k)
+        left.values.append(sep_v)
+        each right.keys into rk : left.keys.append(rk)
+        each right.values into rv : left.values.append(rv)
+        each right.children into rc : left.children.append(rc)
+        parent.keys.remove(merge_idx)
+        parent.values.remove(merge_idx)
+        parent.children.remove(merge_idx + 1)
+        left.recount()
+    }
+
+    /// Returns the smallest `(key, value)` entry in O(log n).
+    ///
+    /// Throws `empty` when the map is empty.
+    + fn min() (K, T) !LookupError {
+        let cur = this.root ?! throw .empty
+        while !cur.is_leaf() {
+            cur = cur.children.get(0) ! throw .empty
+        }
+        let k = cur.keys.get(0) ! throw .empty
+        let v = cur.values.get(0) ! throw .empty
+        return (k, v)
+    }
+
+    /// Returns the largest `(key, value)` entry in O(log n).
+    ///
+    /// Throws `empty` when the map is empty.
+    + fn max() (K, T) !LookupError {
+        let cur = this.root ?! throw .empty
+        while !cur.is_leaf() {
+            cur = cur.children.get(cur.children.length - 1) ! throw .empty
+        }
+        let last = cur.keys.length - 1
+        let k = cur.keys.get(last) ! throw .empty
+        let v = cur.values.get(last) ! throw .empty
+        return (k, v)
+    }
+
+    /// Removes and returns the smallest `(key, value)` entry in O(log n).
+    ///
+    /// Throws `empty` when the map is empty.
+    + fn pop_min() (K, T) !LookupError {
+        let root = this.root ?! throw .empty
+        let k, v = this.pop_min_rec(root)
+        if root.keys.length == 0 {
+            if root.is_leaf() : this.root = null
+            else : this.root = root.children.get(0) !? null
+        }
+        this.invalidate_cursor()
+        return (k, v)
+    }
+
+    /// Removes and returns the largest `(key, value)` entry in O(log n).
+    ///
+    /// Throws `empty` when the map is empty.
+    + fn pop_max() (K, T) !LookupError {
+        let root = this.root ?! throw .empty
+        let k, v = this.pop_max_rec(root)
+        if root.keys.length == 0 {
+            if root.is_leaf() : this.root = null
+            else : this.root = root.children.get(0) !? null
+        }
+        this.invalidate_cursor()
+        return (k, v)
+    }
+
+    /// Returns the greatest `(key, value)` entry with key `<= key` in O(log n).
+    ///
+    /// Throws `missing` when every key in the map is greater than `key` or the map is empty.
+    + fn floor(key: K) (K, T) !LookupError {
+        let cur = this.root
+        let has_best = false
+        let best_node: ?BTreeNode[K, T] = null
+        let best_idx: uint = 0
+        while isset(cur) {
+            let idx = this.lower_bound_in(cur, key)
+            if idx < cur.keys.length {
+                let k = cur.keys.get(idx) ! break
+                if !this.less(key, k) {
+                    let v = cur.values.get(idx) ! throw .missing
+                    return (k, v)
+                }
+            }
+            if idx > 0 {
+                best_node = cur
+                best_idx = idx - 1
+                has_best = true
+            }
+            if cur.is_leaf() : break
+            cur = cur.children.get(idx) ! break
+        }
+        if has_best && isset(best_node) {
+            let k = best_node.keys.get(best_idx) ! throw .missing
+            let v = best_node.values.get(best_idx) ! throw .missing
+            return (k, v)
+        }
+        throw .missing
+    }
+
+    /// Returns the smallest `(key, value)` entry with key `>= key` in O(log n).
+    ///
+    /// Throws `missing` when every key in the map is smaller than `key` or the map is empty.
+    + fn ceil(key: K) (K, T) !LookupError {
+        let cur = this.root
+        let has_best = false
+        let best_node: ?BTreeNode[K, T] = null
+        let best_idx: uint = 0
+        while isset(cur) {
+            let idx = this.lower_bound_in(cur, key)
+            if idx < cur.keys.length {
+                let k = cur.keys.get(idx) ! break
+                if !this.less(key, k) {
+                    let v = cur.values.get(idx) ! throw .missing
+                    return (k, v)
+                }
+                best_node = cur
+                best_idx = idx
+                has_best = true
+            }
+            if cur.is_leaf() : break
+            cur = cur.children.get(idx) ! break
+        }
+        if has_best && isset(best_node) {
+            let k = best_node.keys.get(best_idx) ! throw .missing
+            let v = best_node.values.get(best_idx) ! throw .missing
+            return (k, v)
+        }
+        throw .missing
+    }
+
+    /// Returns the `(key, value)` entry at 0-based sorted position `index` in O(log n).
+    ///
+    /// Throws `range` when `index >= length`.
+    + fn at(index: uint) (K, T) !LookupError {
+        let cur = this.root ?! throw .range
+        if index >= cur.size : throw .range
+        let rem = index
+        while true {
+            if cur.is_leaf() {
+                let k = cur.keys.get(rem) ! throw .range
+                let v = cur.values.get(rem) ! throw .range
+                return (k, v)
+            }
+            let i: uint = 0
+            let n = cur.keys.length
+            let moved = false
+            while i <= n {
+                let child = cur.children.get(i) ! throw .range
+                if rem < child.size {
+                    cur = child
+                    moved = true
+                    break
+                }
+                rem -= child.size
+                if i < n {
+                    if rem == 0 {
+                        let k = cur.keys.get(i) ! throw .range
+                        let v = cur.values.get(i) ! throw .range
+                        return (k, v)
+                    }
+                    rem--
+                }
+                i++
+            }
+            if !moved : throw .range
+        }
+        throw .range
+    }
+
+    /// Returns all entries with `from <= key <= to` in ascending key order, in O(log n + k).
+    ///
+    /// Returns an empty range when `to < from`.
+    + fn range(from: K, to: K) BTreeRange[K, T] {
+        let out = BTreeRange[K, T] {}
+        if this.less(to, from) : return out
+        let root = this.root ?! return out
+        this.collect_range(root, from, to, out)
+        return out
+    }
+
+    - fn collect_range(node: BTreeNode[K, T], from: K, to: K, out: BTreeRange[K, T]) {
+        let start = this.lower_bound_in(node, from)
+        let n = node.keys.length
+        let leaf = node.is_leaf()
+        let i = start
+        while i < n {
+            if !leaf {
+                let child = node.children.get(i) ! break
+                this.collect_range(child, from, to, out)
+            }
+            let k = node.keys.get(i) ! break
+            if this.less(to, k) : return
+            let v = node.values.get(i) ! break
+            out._keys.append(k)
+            out._values.append(v)
+            i++
+        }
+        if !leaf {
+            let child = node.children.get(i) ! return
+            this.collect_range(child, from, to, out)
+        }
+    }
+
+    /// Returns a new array of the keys in ascending order.
+    + fn keys() Array[K] {
+        let out = Array[K].new(this.length)
+        each this as _, k : out.append(k)
+        return out
+    }
+
+    /// Returns a new array of the values in ascending key order.
+    + fn values() Array[T] {
+        let out = Array[T].new(this.length)
+        each this as v : out.append(v)
+        return out
+    }
+
+    /// Removes the entries for which `func` returns true.
+    + fn remove_where(func: fn(T, K)(bool)) {
+        let drop = Array[K].new()
+        each this as v, k {
+            if func(v, k) : drop.append(k)
+        }
+        each drop into k : this.remove_entry(k)
+    }
+
+    /// Keeps only the entries for which `func` returns true.
+    + fn retain(func: fn(T, K)(bool)) {
+        let drop = Array[K].new()
+        each this as v, k {
+            if !func(v, k) : drop.append(k)
+        }
+        each drop into k : this.remove_entry(k)
+    }
+
+    /// Removes every entry.
+    + fn clear() {
+        this.root = null
+        this.invalidate_cursor()
+    }
+
+    /// Copies every entry of `map` into this map, replacing values of keys both maps have.
+    + fn merge_in_place(map: SELF) {
+        each map as v, k : this.set(k, v)
+    }
+
+    /// Returns a new map with the entries of this map and of `map`; `map` wins on shared keys.
+    ///
+    /// Marked `$add`: backs `a + b`. Neither operand changes.
+    + fn merge(map: SELF) SELF $add {
+        let result = this.copy()
+        result.merge_in_place(map)
+        return result
+    }
+
+    fn empty_same_order() SELF {
+        return SELF.new(this.before)
+    }
+
+    /// Returns a shallow copy: a new map holding the same keys and values.
+    + fn copy() SELF {
+        let result = SELF.new(this.before)
+        each this as v, k : result.set(k, v)
+        return result
+    }
+
+    /// Returns a deep copy: every key and value is cloned.
+    + fn clone() SELF {
+        let result = SELF.new(this.before)
+        each this as v, k : result.set(clone k, clone v)
+        return result
+    }
+
+    // Seeks the cursor stack to 0-based sorted position `target` in O(log n)
+    - fn cursor_seek(target: uint) bool {
+        let cur = this.root ?! return false
+        if target >= cur.size : return false
+        this.cursor_nodes.clear()
+        this.cursor_slots.clear()
+        let rem = target
+        while true {
+            if cur.is_leaf() {
+                this.cursor_nodes.append(cur)
+                this.cursor_slots.append(rem)
+                this.cursor_index = target
+                this.cursor_version = this.version
+                return true
+            }
+            let i: uint = 0
+            let n = cur.keys.length
+            let moved = false
+            while i <= n {
+                let child = cur.children.get(i) ! return false
+                if rem < child.size {
+                    this.cursor_nodes.append(cur)
+                    this.cursor_slots.append(i)
+                    cur = child
+                    moved = true
+                    break
+                }
+                rem -= child.size
+                if i < n {
+                    if rem == 0 {
+                        this.cursor_nodes.append(cur)
+                        this.cursor_slots.append(i)
+                        this.cursor_index = target
+                        this.cursor_version = this.version
+                        return true
+                    }
+                    rem--
+                }
+                i++
+            }
+            if !moved : return false
+        }
+        return false
+    }
+
+    // Advances the cursor stack by 1 in-order step in O(1) amortized
+    - fn cursor_advance() bool {
+        if this.cursor_nodes.length == 0 : return false
+        let top = this.cursor_nodes.length - 1
+        let node = this.cursor_nodes.get(top) ! return false
+        let slot = this.cursor_slots.get(top) ! return false
+
+        if !node.is_leaf() {
+            this.cursor_slots.set(top, slot + 1) _
+            let cur = node.children.get(slot + 1) ! return false
+            while !cur.is_leaf() {
+                this.cursor_nodes.append(cur)
+                this.cursor_slots.append(0)
+                cur = cur.children.get(0) ! return false
+            }
+            this.cursor_nodes.append(cur)
+            this.cursor_slots.append(0)
+            this.cursor_index++
+            return true
+        }
+
+        if slot + 1 < node.keys.length {
+            this.cursor_slots.set(top, slot + 1) _
+            this.cursor_index++
+            return true
+        }
+
+        // Leaf exhausted: climb to first ancestor with a remaining separator key
+        this.cursor_nodes.pop_last() _
+        this.cursor_slots.pop_last() _
+        while this.cursor_nodes.length > 0 {
+            let p_idx = this.cursor_nodes.length - 1
+            let p_node = this.cursor_nodes.get(p_idx) ! return false
+            let p_slot = this.cursor_slots.get(p_idx) ! return false
+            if p_slot < p_node.keys.length {
+                this.cursor_index++
+                return true
+            }
+            this.cursor_nodes.pop_last() _
+            this.cursor_slots.pop_last() _
+        }
+        this.cursor_index = uint.$max
+        return false
+    }
+
+    fn _next(index: uint) (T, K) !IterError {
+        if index >= this.length : throw .end
+        if this.cursor_version == this.version && this.cursor_index != uint.$max && index == this.cursor_index + 1 {
+            if !this.cursor_advance() : throw .end
+        } else if !(this.cursor_version == this.version && this.cursor_index == index) {
+            if !this.cursor_seek(index) : throw .end
+        }
+        let top = this.cursor_nodes.length - 1
+        let node = this.cursor_nodes.get(top) ! throw .end
+        let slot = this.cursor_slots.get(top) ! throw .end
+        let k = node.keys.get(slot) ! throw .end
+        let v = node.values.get(slot) ! throw .end
+        return (v, k)
+    }
+}

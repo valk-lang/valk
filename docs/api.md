@@ -172,6 +172,14 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 + fn exec(cmd: String, print_output: bool (false), capture_stderr: bool (true)) (i32, String)
 // Ends the process with exit code `code`.
 + fn exit(code: i32) void
+// Formats floating-point `value` using format specifier `spec` (e.g. `".2f"`, `"08.2f"`, `".3e"`).
++ fn format_float(value: f64, spec: String) String !SyntaxError
+// Formats signed integer `value` using format specifier `spec` (e.g. `"05"`, `"#06x"`, `"+>8"`).
++ fn format_int(value: int, spec: String) String !SyntaxError
+// Formats string `value` using format specifier `spec` (e.g. `">10"`, `"*^12"`, `".5"`).
++ fn format_string(value: String, spec: String) String !SyntaxError
+// Formats unsigned integer `value` using format specifier `spec` (e.g. `"05"`, `"#08x"`, `"b"`).
++ fn format_uint(value: uint, spec: String) String !SyntaxError
 // Returns the value of the environment variable `var`.
 + fn getenv(var: String) String !LookupError
 // Returns the host name of this machine.
@@ -442,6 +450,152 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn min() uint !LookupError
     // Returns the sum of the elements, or 0 when the array is empty.
     + fn sum() uint
+}
+```
+
+```js
+// An ordered map backed by a B-tree: lookups, inserts, removals and order queries (`min`, `max`, `floor`, `ceil`, `at`) run in O(log n), and `each` visits entries in ascending key order.
++ class BTreeMap[K, T] {
+    // Returns the `(key, value)` entry at 0-based sorted position `index` in O(log n).
+    + fn at(index: uint) (K, T) !LookupError
+    // Returns the smallest `(key, value)` entry with key `>= key` in O(log n).
+    + fn ceil(key: K) (K, T) !LookupError
+    // Removes every entry.
+    + fn clear() void
+    // Returns a deep copy: every key and value is cloned.
+    + fn clone() BTreeMap[K, T]
+    // Returns a shallow copy: a new map holding the same keys and values.
+    + fn copy() BTreeMap[K, T]
+    // Returns the greatest `(key, value)` entry with key `<= key` in O(log n).
+    + fn floor(key: K) (K, T) !LookupError
+    // Returns the value stored under `key`; backs `map[key]` (`$offset`).
+    + fn get(key: K) T !LookupError
+    // Returns true when `key` is in the map.
+    + fn has(key: K) bool
+    // Returns true when the map holds no entries.
+    + fn is_empty() bool
+    // Returns a new array of the keys in ascending order.
+    + fn keys() Array[K]
+    // The number of entries.
+    + get length: uint
+    // Returns the largest `(key, value)` entry in O(log n).
+    + fn max() (K, T) !LookupError
+    // Returns a new map with the entries of this map and of `map`; `map` wins on shared keys.
+    + fn merge(map: BTreeMap[K, T]) BTreeMap[K, T]
+    // Copies every entry of `map` into this map, replacing values of keys both maps have.
+    + fn merge_in_place(map: BTreeMap[K, T]) void
+    // Returns the smallest `(key, value)` entry in O(log n).
+    + fn min() (K, T) !LookupError
+    // Creates an empty map ordered by `before`, or by `<` when `before` is `null`.
+    + static fn new(before: ?atomic fn(K, K)(bool) (null)) BTreeMap[K, T]
+    // Removes and returns the largest `(key, value)` entry in O(log n).
+    + fn pop_max() (K, T) !LookupError
+    // Removes and returns the smallest `(key, value)` entry in O(log n).
+    + fn pop_min() (K, T) !LookupError
+    // Returns all entries with `from <= key <= to` in ascending key order, in O(log n + k).
+    + fn range(from: K, to: K) BTreeRange[K, T]
+    // Removes `key` and its value; does nothing when `key` is not in the map.
+    + fn remove(key: K) void
+    // Removes the entries for which `func` returns true.
+    + fn remove_where(func: fn(T, K)(bool)) void
+    // Keeps only the entries for which `func` returns true.
+    + fn retain(func: fn(T, K)(bool)) void
+    // Stores `value` under `key`, replacing the value of an existing entry in place.
+    + fn set(key: K, value: T) void
+    // Adds a new entry for `key`.
+    + fn set_unique(key: K, value: T) void !LookupError
+    // Replaces the value under `key` with what `change` returns and returns the new value.
+    + fn update(key: K, change: fn(?T)(T)) T
+    // Returns a new array of the values in ascending key order.
+    + fn values() Array[T]
+}
+```
+
+```js
+// A slice of entries from a `BTreeMap.range` query, in ascending key order.
++ class BTreeRange[K, T] {
+    // Returns true when the range is empty.
+    + fn is_empty() bool
+    // Returns a copy of the keys in ascending order.
+    + fn keys() Array[K]
+    // The number of entries in the range.
+    + get length: uint
+    // Returns a copy of the values in ascending key order.
+    + fn values() Array[T]
+}
+```
+
+```js
+// An ordered set of unique values backed by a `BTreeMap`.
++ class BTreeSet[T] {
+    // Adds `value`; adding a value that is already present changes nothing.
+    + fn add(value: T) void
+    // Adds every value of `values`.
+    + fn add_all(values: Array[T]) void
+    // Returns the value at 0-based sorted position `index` in O(log n); throws `range` if out of bounds.
+    + fn at(index: uint) T !LookupError
+    // Returns the smallest value `>= value` in O(log n); throws `missing` when none exists.
+    + fn ceil(value: T) T !LookupError
+    // Removes every value.
+    + fn clear() void
+    // Returns a deep copy in which every value is cloned as well.
+    + fn clone() BTreeSet[T]
+    // Returns a shallow copy: a new set holding the same values.
+    + fn copy() BTreeSet[T]
+    // Returns a new set with the values of this set that are not in `other`; backs `a - b` (`$sub`).
+    + fn difference(other: BTreeSet[T]) BTreeSet[T]
+    // Returns true when both sets hold the same values; backs `==` (`$eq`).
+    + fn equals(other: BTreeSet[T]) bool
+    // Returns the greatest value `<= value` in O(log n); throws `missing` when none exists.
+    + fn floor(value: T) T !LookupError
+    // Returns true when `value` is in the set.
+    + fn has(value: T) bool
+    // Adds `value` and returns true when it was not present yet.
+    + fn insert(value: T) bool
+    // Returns a new set with the values that are in both sets.
+    + fn intersection(other: BTreeSet[T]) BTreeSet[T]
+    // Returns true when the two sets share no value.
+    + fn is_disjoint(other: BTreeSet[T]) bool
+    // Returns true when the set holds no values.
+    + fn is_empty() bool
+    // Returns true when every value of this set is also in `other`.
+    + fn is_subset_of(other: BTreeSet[T]) bool
+    // Returns the values as a new array in ascending order.
+    + fn items() Array[T]
+    // The number of values.
+    + get length: uint
+    // Returns the largest value in O(log n); throws `empty` when the set is empty.
+    + fn max() T !LookupError
+    // Returns the smallest value in O(log n); throws `empty` when the set is empty.
+    + fn min() T !LookupError
+    // Creates an empty set ordered by `before`, or by `<` when `before` is `null`.
+    + static fn new(before: ?atomic fn(T, T)(bool) (null)) BTreeSet[T]
+    // Removes and returns the largest value in O(log n); throws `empty` when empty.
+    + fn pop_max() T !LookupError
+    // Removes and returns the smallest value in O(log n); throws `empty` when empty.
+    + fn pop_min() T !LookupError
+    // Returns all values with `from <= value <= to` in ascending order, in O(log n + k).
+    + fn range(from: T, to: T) BTreeSetRange[T]
+    // Removes `value` and returns true when it was present.
+    + fn remove(value: T) bool
+    // Removes the values for which `func` returns true.
+    + fn remove_where(func: fn(T)(bool)) void
+    // Keeps only the values for which `func` returns true; the opposite of `remove_where`.
+    + fn retain(func: fn(T)(bool)) void
+    // Returns a new set with the values in this set or in `other`; backs `a + b` (`$add`).
+    + fn union(other: BTreeSet[T]) BTreeSet[T]
+}
+```
+
+```js
+// A slice of values from a `BTreeSet.range` query, in ascending order.
++ class BTreeSetRange[T] {
+    // Returns true when the range is empty.
+    + fn is_empty() bool
+    // Returns a copy of the values in ascending order.
+    + fn items() Array[T]
+    // The number of values in the range.
+    + get length: uint
 }
 ```
 
