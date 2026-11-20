@@ -2542,6 +2542,13 @@ println(a) // 5
 println(v) // 7
 ```
 
+Use `atomic_load`, `atomic_store`, and `atomic_cas(target, expected, desired)` for atomic reads, writes, and compare-and-swap on integers, booleans, and raw pointers:
+
+```rust
+let state: uint = 0
+let swapped = atomic_cas(state, 0, 1) // true, state is now 1
+```
+
 ## Testing
 
 To test a project, pass `--test` with the build command. Test declarations are omitted from ordinary builds; in a test build, the generated entry point runs them instead of `main`. Use `assert` inside a test to record its results. Every executed `assert` counts towards the test summary, so keep them out of long loops: accumulate the result in a variable and assert once after the loop.
