@@ -5,6 +5,20 @@
 
 ```
 - Release 0.8.10
++ Language: property metadata tags (`$tag(...)` and backtick shorthand) exposed via `#loop properties` / `#loop object`, with `json` support for `rename`, `skip`, and `omitempty`
++ Language: generic type constraints (`[T is Interface]` and built-in bounds) checked at call sites, with `valk doc` and `valk lsp` hover/completion support
++ Language: named tagged-union variants (ADTs) and tuple/struct/variant destructuring in `match` arms
++ Language: interfaces on `struct` types (both zero-alloc static generic dispatch and boxed dynamic dispatch)
++ Language: user-facing compare-and-swap builtin `atomic_cas(target, expected, desired)`
++ Language: string and number interpolation format specifiers (`%{expr:[[fill]align][sign][#][0][width][.precision][type]}`), plus runtime `core.format_int`, `format_uint`, `format_float`, and `format_string`
++ GC: weak references (`Weak[T]` and `Weak[atomic T]`) with lock-free clearing across local and shared collections
++ Tooling: first-class `bench "name" { ... }` blocks (`valk bench`, `valk build --bench`, `core.Bencher`) and source-based line/function code coverage (`--coverage`, `--coverage-uncovered`, `--coverage-out` LCOV)
++ Tooling: `--stack-traces` for lightweight production line tables and symbolicated panic traces in `--opt`/`--release` builds without `--debug`, and `--deny-warnings` / `-Werror` for CI warning enforcement
++ Standard library (`core`): ordered `BTreeMap[K, T]` and `BTreeSet[T]` collections with O(log n) `min`/`max`/`pop_min`/`pop_max`/`floor`/`ceil`/`at`, `range(from, to)` queries, and sorted iteration
++ Standard library (`compress` & `http`): pure-Valk Zstandard (RFC 8878) codec (`compress.zstd`, `unzstd`, `zstd_into`, `unzstd_into`) and HTTP/1.1 + HTTP/2 `Content-Encoding: zstd` negotiation, `.zst` sidecars, and client decompression
++ Standard library (`io` & `fs`): `io.BufReader`, `BufWriter`, `LimitReader`, `MultiWriter`, `Discard`, `read_exact`, `write_all`, `copy_n`, `fs.write_atomic`, and cross-platform `fs.Watcher` (`inotify`, `kqueue`, polling)
++ Standard library (`sync` & `net`): `sync.Once`, `sync.Lazy[T]`, `sync.Barrier`, `sync.Cond`, `net.IpAddr`, `net.Cidr`, Unix domain sockets (`unix_server`/`unix_client`), and DNS record lookups (`TXT`, `MX`, `SRV`, `CNAME`)
++ Standard library (`crypto`): Argon2id KDF & PHC password hashing (`argon2id`, `argon2id_hash`, `argon2id_verify`, with pure-Valk RFC 9106 fallback on OpenSSL < 3.2), `X25519Key`, ECDH `PrivateKey.derive_secret`, `Sha3` (`sha3_256`/`sha3_512`), and `zero_bytes`
 
 + Release 0.8.9
 + Language: compile-time value generic parameters (`const NAME: Type` for `bool`, integers, and `String`) across functions, methods, classes, structs, traits, and `extend`
