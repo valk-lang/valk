@@ -1737,10 +1737,52 @@ bench_out=$($TIMEOUT "$VALK" bench "$DIR/bench-and-coverage.valk" --no-warn -- -
     echo "$bench_out"
     exit 1
 }
-for needle in "BENCH RESULTS" "> simple sum" "> hash payload" "500 iters" "MB/s" "Benchmarks: 2"; do
+for needle in "BENCH RESULTS" "> simple sum" "> hash payload" "500 iters" "0 B/op" "0 allocs/op" "MB/s" "Benchmarks: 2"; do
     if [[ "$bench_out" != *"$needle"* ]]; then
         echo "# valk bench output is missing: $needle"
         echo "$bench_out"
+        exit 1
+    fi
+done
+cat > "$workdir/bench-allocs.valk" <<'EOF'
+class Box {
+    a: int
+    b: int
+}
+
+global sink_box: ?Box (null)
+
+fn make_box(v: int) Box $noinline {
+    return Box { a: v, b: v + 1 }
+}
+
+bench "alloc one box" {
+    let x = make_box(1)
+    sink_box = x
+    b.keep(x)
+}
+
+bench "alloc paused setup" {
+    while b.loop() {
+        b.stop_timer()
+        let ignored = make_box(9)
+        sink_box = ignored
+        b.start_timer()
+        let x = make_box(2)
+        sink_box = x
+        b.keep(x)
+    }
+}
+EOF
+bench_alloc_out=$($TIMEOUT "$VALK" bench "$workdir/bench-allocs.valk" --no-warn -- --bench-iters 300 2>&1) || {
+    echo "# valk bench allocs test failed:"
+    echo "$bench_alloc_out"
+    exit 1
+}
+for needle in "> alloc one box" "> alloc paused setup" "24 B/op" "1 allocs/op" "Benchmarks: 2"; do
+    if [[ "$bench_alloc_out" != *"$needle"* ]]; then
+        echo "# valk bench allocs output is missing: $needle"
+        echo "$bench_alloc_out"
         exit 1
     fi
 done
