@@ -2039,6 +2039,16 @@ class User {
 let user = json.decode_to[User]("{\"name\":\"Alice\",\"age\":30}") ! panic("Invalid user")
 ```
 
+You can attach compile-time metadata tags to class or struct properties with `$tag(...)` or the shorthand `` `...` ``, and read them in `#loop properties` / `#loop object` via `prop.$has_tag("key")` and `prop.$tag("key", "fallback")`. `valk.json` supports `json` (rename or `"-"` to skip) and `omitempty`:
+
+```rust
+class User {
+    id: int `json: "user_id"`
+    secret: String ("") `json: "-"`
+    bio: ?String (null) $tag(omitempty)
+}
+```
+
 ## DateTime
 
 API for [valk.time](api.md#time)

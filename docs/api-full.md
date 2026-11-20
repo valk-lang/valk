@@ -14040,7 +14040,9 @@ Converts `data` to a JSON value.
 
 Strings, numbers and bools map to their JSON kinds, `null` to `null`, arrays to
 arrays, string-keyed maps to objects, and classes and structs to objects with one
-member per field. Types with a `to_json_value` method use it. Any other value becomes
+member per field. Field tags control serialization: `$tag(json: "name")` renames a
+field, `$tag(json: "-")` skips it, and `$tag(omitempty)` omits zero/empty values.
+Types with a `to_json_value` method use it. Any other value becomes
 `null`. An object that is reached again inside itself becomes the string
 `"(recursion)"`.
 
@@ -14538,7 +14540,9 @@ rejected). Types with a static `from_json_value` method use it; arrays and
 string-keyed maps convert item by item. For a class or struct the value must be an
 object: fields that are nullable or declare an explicit default may be absent or
 `null` and then get their default, every other field is required, and unknown
-members are ignored.
+members are ignored. Field tags control deserialization: `$tag(json: "name")`
+matches a renamed key, `$tag(json: "-")` skips a field (using its default value),
+and `$tag(omitempty)` allows missing/`null` values when the field has a default.
 
 ```js
 // A read-only value of a JSON document, made by `json.read`. Small and free to copy; it keeps the document and its input alive.
