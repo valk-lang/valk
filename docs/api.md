@@ -4569,6 +4569,8 @@ error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max
 ## Enums for 'net'
 
 ```js
+// DNS resource record types supported by `dns_lookup`.
++ enum DnsType : u16 { a (1), ns (2), cname (5), ptr (12), mx (15), txt (16), aaaa (28), srv (33) }
 // A TLS protocol version, for the minimum and maximum version settings.
 + enum TlsVersion : i32 { tls_1_2 (TLS1_2_VERSION), tls_1_3 (TLS1_3_VERSION) }
 ```
@@ -4576,6 +4578,16 @@ error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max
 ## Functions for 'net'
 
 ```js
+// Queries DNS records of `record_type` for `name`.
++ fn dns_lookup(name: String, record_type: DnsType, server: String (""), timeout_ms: uint (5000)) Array[DnsRecord] !NetError
+// Looks up `CNAME` targets for `name`.
++ fn lookup_cname(name: String, server: String (""), timeout_ms: uint (5000)) Array[String] !NetError
+// Looks up `MX` records for `name`, sorted by ascending `priority`.
++ fn lookup_mx(name: String, server: String (""), timeout_ms: uint (5000)) Array[DnsRecord] !NetError
+// Looks up `SRV` records for `name`, sorted by ascending `priority`.
++ fn lookup_srv(name: String, server: String (""), timeout_ms: uint (5000)) Array[DnsRecord] !NetError
+// Looks up `TXT` records for `name` and returns each record's text value.
++ fn lookup_txt(name: String, server: String (""), timeout_ms: uint (5000)) Array[String] !NetError
 // Receives once from the socket `fd` into `buf` and returns the number of bytes read.
 + fn recv(fd: i32, buf: local mut &[u8], timeout_ms: uint (5000)) uint !io:IoError
 // Connects to a TCP server; the same as `TcpConnection.new`.
@@ -4586,6 +4598,10 @@ error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max
 + fn udp_client(host: String, port: u16, timeout_ms: uint (5000), local_port: u16 (0), local_host: String ("")) UdpClient !NetError
 // Binds a UDP socket to your own address; the same as `UdpServer.new`.
 + fn udp_server(host: String, port: u16, timeout_ms: uint (5000), reuse_address: bool (false)) UdpServer !NetError
+// Connects to a Unix domain stream socket at `path`.
++ fn unix_client(path: String, timeout_ms: uint (5000)) TcpConnection !NetError
+// Opens a listening Unix domain stream socket at `path`; the same as `UnixServer.new`.
++ fn unix_server(path: String, remove_existing: bool (false)) atomic UnixServer !NetError
 // Sends once from `data` on the socket `fd` and returns the number of bytes sent.
 + fn write(fd: i32, data: local &[u8], timeout_ms: uint (5000)) uint !io:IoError
 ```
@@ -4614,6 +4630,81 @@ error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max
 ```
 
 ```js
+// An IPv4 or IPv6 CIDR network prefix, such as `10.0.0.0/8` or `2001:db8::/32`.
++ struct Cidr {
+    // The canonical network address with all host bits cleared.
+    + network: IpAddr
+    // Prefix length in bits (`0..32` for IPv4, `0..128` for IPv6).
+    + prefix: u8
+
+    // Returns whether `ip` belongs to this CIDR prefix.
+    + fn contains(ip: IpAddr) bool
+    // Creates a CIDR prefix from `addr` and `prefix`, masking off host bits.
+    + static fn new(addr: IpAddr, prefix: u8) Cidr !NetError
+    // Returns whether this prefix and `other` share at least one address.
+    + fn overlaps(other: Cidr) bool
+    // Parses a CIDR string such as `"192.168.1.0/24"` or `"2001:db8::/32"`.
+    + static fn parse(text: String) Cidr !NetError
+    // Formats the CIDR as `"<network>/<prefix>"`.
+    + fn to_string() String
+}
+```
+
+```js
+// A parsed DNS resource record returned by `dns_lookup`.
++ struct DnsRecord {
+    + name: String
+    + port: u16
+    + priority: u16
+    + ttl: u32
+    + type: DnsType
+    + value: String
+    + weight: u16
+}
+```
+
+```js
+// An IPv4 or IPv6 address without a port.
++ struct IpAddr {
+    // True for an IPv6 address, false for IPv4.
+    + ipv6: bool
+
+    // Copies the raw address bytes (4 for IPv4, 16 for IPv6) into `out` and returns the count.
+    + fn bytes_into(out: local mut &[u8]) uint
+    // Creates an IPv4 (4 bytes) or IPv6 (16 bytes) address from raw network-order bytes.
+    + static fn from_bytes(raw: local &[u8]) IpAddr !NetError
+    // Extracts the IP address from a `SocketAddress` (dropping its port and scope id).
+    + static fn from_socket_address(sa: SocketAddress) IpAddr
+    // Creates an IPv4 address from four octets `a.b.c.d`.
+    + static fn ipv4(a: u8, b: u8, c: u8, d: u8) IpAddr
+    // True if the address is globally routable (not unspecified, loopback, private, link-local, multicast, CGNAT `100.64.0.0/10`, documentation, or reserved).
+    + get is_global: bool
+    // True if this is an IPv4 address.
+    + get is_ipv4: bool
+    // True if this is an IPv6 address.
+    + get is_ipv6: bool
+    // True for link-local addresses (`169.254.0.0/16`, `fe80::/10`, or IPv4-mapped).
+    + get is_link_local: bool
+    // True for loopback addresses (`127.0.0.0/8`, `::1`, or `::ffff:127.0.0.0/104`).
+    + get is_loopback: bool
+    // True for multicast addresses (`224.0.0.0/4` or `ff00::/8`).
+    + get is_multicast: bool
+    // True for private networks: RFC 1918 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) and RFC 4193 IPv6 unique local addresses (`fc00::/7`). Also matches IPv4-mapped IPv6.
+    + get is_private: bool
+    // True for `0.0.0.0` or `::`.
+    + get is_unspecified: bool
+    // Parses a numeric IPv4 (`"127.0.0.1"`) or IPv6 (`"::1"`, `"[::1]"`, `"::ffff:10.0.0.1"`) address without performing any DNS lookup.
+    + static fn parse(text: String) IpAddr !NetError
+    // Returns this address as an IPv4 address if it is IPv4 or IPv4-mapped IPv6 (`::ffff:a.b.c.d`), or `null` otherwise.
+    + fn to_ipv4() ?IpAddr
+    // Combines this IP address with `port` into a `SocketAddress`.
+    + fn to_socket_address(port: u16 (0)) SocketAddress
+    // Formats the address as `"127.0.0.1"` or RFC 5952 IPv6 (`"::1"`).
+    + fn to_string() String
+}
+```
+
+```js
 + struct SocketAddress {
     // True for an IPv6 address, false for IPv4.
     + ipv6: bool
@@ -4626,6 +4717,8 @@ error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max
     + fn equals(other: SocketAddress) bool
     // Returns the address without the port, as `"127.0.0.1"` or `"::1"`.
     + fn ip() String
+    // Returns the IP address part without the port or scope id.
+    + fn ip_addr() IpAddr
     // Writes `ip()` into `buf` and returns the byte count.
     + fn ip_in(buf: local mut &[u8]) uint
     // Returns the IPv4 address `a.b.c.d` with `port`.
@@ -4886,6 +4979,23 @@ error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max
     + fn set_send_buffer(bytes: uint) void !NetError
     // Sets the hop limit (TTL) of datagrams sent to a single address.
     + fn set_ttl(hops: u8) void !NetError
+}
+```
+
+```js
+// A listening Unix domain stream socket (`AF_UNIX`), created by `UnixServer.new` or `net.unix_server`; `accept` returns connected `TcpConnection` streams.
++ class UnixServer is Closer {
+    // The OS socket descriptor.
+    ~ fd: i32
+    // The filesystem (or abstract) socket path this server listens on.
+    ~ path: String
+
+    // Waits for the next incoming Unix socket connection and returns it.
+    + fn accept(timeout_ms: uint (0)) TcpConnection !NetError
+    // Stops accepting connections, closes the socket, and removes the socket file.
+    + fn close() void !io:IoError
+    // Binds a Unix domain stream socket to `path` and starts listening.
+    + static fn new(path: String, remove_existing: bool (false)) atomic UnixServer !NetError
 }
 ```
 

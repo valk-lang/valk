@@ -15478,9 +15478,15 @@ Also carries every `io.IoError` code.
 ## Enums for 'net'
 
 ```js
+// DNS resource record types supported by `dns_lookup`.
++ enum DnsType : u16 { a (1), ns (2), cname (5), ptr (12), mx (15), txt (16), aaaa (28), srv (33) }
 // A TLS protocol version, for the minimum and maximum version settings.
 + enum TlsVersion : i32 { tls_1_2 (TLS1_2_VERSION), tls_1_3 (TLS1_3_VERSION) }
 ```
+
+### DnsType
+
+DNS resource record types supported by `dns_lookup`.
 
 ### TlsVersion
 
@@ -15489,6 +15495,16 @@ A TLS protocol version, for the minimum and maximum version settings.
 ## Functions for 'net'
 
 ```js
+// Queries DNS records of `record_type` for `name`.
++ fn dns_lookup(name: String, record_type: DnsType, server: String (""), timeout_ms: uint (5000)) Array[DnsRecord] !NetError
+// Looks up `CNAME` targets for `name`.
++ fn lookup_cname(name: String, server: String (""), timeout_ms: uint (5000)) Array[String] !NetError
+// Looks up `MX` records for `name`, sorted by ascending `priority`.
++ fn lookup_mx(name: String, server: String (""), timeout_ms: uint (5000)) Array[DnsRecord] !NetError
+// Looks up `SRV` records for `name`, sorted by ascending `priority`.
++ fn lookup_srv(name: String, server: String (""), timeout_ms: uint (5000)) Array[DnsRecord] !NetError
+// Looks up `TXT` records for `name` and returns each record's text value.
++ fn lookup_txt(name: String, server: String (""), timeout_ms: uint (5000)) Array[String] !NetError
 // Receives once from the socket `fd` into `buf` and returns the number of bytes read.
 + fn recv(fd: i32, buf: local mut &[u8], timeout_ms: uint (5000)) uint !io:IoError
 // Connects to a TCP server; the same as `TcpConnection.new`.
@@ -15499,9 +15515,39 @@ A TLS protocol version, for the minimum and maximum version settings.
 + fn udp_client(host: String, port: u16, timeout_ms: uint (5000), local_port: u16 (0), local_host: String ("")) UdpClient !NetError
 // Binds a UDP socket to your own address; the same as `UdpServer.new`.
 + fn udp_server(host: String, port: u16, timeout_ms: uint (5000), reuse_address: bool (false)) UdpServer !NetError
+// Connects to a Unix domain stream socket at `path`.
++ fn unix_client(path: String, timeout_ms: uint (5000)) TcpConnection !NetError
+// Opens a listening Unix domain stream socket at `path`; the same as `UnixServer.new`.
++ fn unix_server(path: String, remove_existing: bool (false)) atomic UnixServer !NetError
 // Sends once from `data` on the socket `fd` and returns the number of bytes sent.
 + fn write(fd: i32, data: local &[u8], timeout_ms: uint (5000)) uint !io:IoError
 ```
+
+### dns_lookup
+
+Queries DNS records of `record_type` for `name`.
+
+When `server` is empty, reads the system nameserver from `/etc/resolv.conf` on Unix (falling
+back to `1.1.1.1:53`). Pass `"host"` or `"host:port"` (or `"[::1]:5353"`) to query a
+specific resolver. Sends a UDP query and automatically retries over TCP if the server sets
+the truncation (`TC`) flag. Throws `invalid_host` when `name` is invalid or `NXDOMAIN`,
+`timeout` when the server does not respond in time, or `connect`/`read`/`write`.
+
+### lookup_cname
+
+Looks up `CNAME` targets for `name`.
+
+### lookup_mx
+
+Looks up `MX` records for `name`, sorted by ascending `priority`.
+
+### lookup_srv
+
+Looks up `SRV` records for `name`, sorted by ascending `priority`.
+
+### lookup_txt
+
+Looks up `TXT` records for `name` and returns each record's text value.
 
 ### recv
 
@@ -15525,6 +15571,19 @@ Opens a UDP socket that talks to one server; the same as `UdpClient.new`.
 ### udp_server
 
 Binds a UDP socket to your own address; the same as `UdpServer.new`.
+
+### unix_client
+
+Connects to a Unix domain stream socket at `path`.
+
+Returns a `TcpConnection` stream (`io.Reader`, `io.Writer`, `io.Closer`) using the same
+coroutine-aware I/O, timeouts, and cancellation support. Throws `invalid_host` when `path`
+is empty or exceeds the OS limit, `init` when the socket cannot be created (or on Windows),
+`timeout`, or `connect`.
+
+### unix_server
+
+Opens a listening Unix domain stream socket at `path`; the same as `UnixServer.new`.
 
 ### write
 
@@ -15602,6 +15661,216 @@ and `init` when the background task cannot start.
 Returns a pointer to the C `sockaddr` of the chosen entry; valid while this object lives.
 
 ```js
+// An IPv4 or IPv6 CIDR network prefix, such as `10.0.0.0/8` or `2001:db8::/32`.
++ struct Cidr {
+    // The canonical network address with all host bits cleared.
+    + network: IpAddr
+    // Prefix length in bits (`0..32` for IPv4, `0..128` for IPv6).
+    + prefix: u8
+
+    // Returns whether `ip` belongs to this CIDR prefix.
+    + fn contains(ip: IpAddr) bool
+    // Creates a CIDR prefix from `addr` and `prefix`, masking off host bits.
+    + static fn new(addr: IpAddr, prefix: u8) Cidr !NetError
+    // Returns whether this prefix and `other` share at least one address.
+    + fn overlaps(other: Cidr) bool
+    // Parses a CIDR string such as `"192.168.1.0/24"` or `"2001:db8::/32"`.
+    + static fn parse(text: String) Cidr !NetError
+    // Formats the CIDR as `"<network>/<prefix>"`.
+    + fn to_string() String
+}
+```
+
+### Cidr
+
+An IPv4 or IPv6 CIDR network prefix, such as `10.0.0.0/8` or `2001:db8::/32`.
+
+Host bits beyond `prefix` are cleared on construction so `network` is always canonical.
+
+#### network
+
+The canonical network address with all host bits cleared.
+
+#### prefix
+
+Prefix length in bits (`0..32` for IPv4, `0..128` for IPv6).
+
+#### contains
+
+Returns whether `ip` belongs to this CIDR prefix.
+
+IPv4 and IPv6 prefixes only match addresses of the same family (use `ip.to_ipv4()`
+first if you want to unwrap IPv4-mapped IPv6 addresses).
+
+#### new
+
+Creates a CIDR prefix from `addr` and `prefix`, masking off host bits.
+
+Throws `invalid_host` if `prefix` exceeds 32 (IPv4) or 128 (IPv6).
+
+#### overlaps
+
+Returns whether this prefix and `other` share at least one address.
+
+#### parse
+
+Parses a CIDR string such as `"192.168.1.0/24"` or `"2001:db8::/32"`.
+
+Throws `invalid_host` on malformed input or an out-of-range prefix length.
+
+#### to_string
+
+Formats the CIDR as `"<network>/<prefix>"`.
+
+```js
+// A parsed DNS resource record returned by `dns_lookup`.
++ struct DnsRecord {
+    + name: String
+    + port: u16
+    + priority: u16
+    + ttl: u32
+    + type: DnsType
+    + value: String
+    + weight: u16
+}
+```
+
+### DnsRecord
+
+A parsed DNS resource record returned by `dns_lookup`.
+
+`value` holds the formatted IP (`a`/`aaaa`), domain target (`cname`/`ns`/`ptr`/`mx`/`srv`),
+or concatenated text (`txt`). `priority`, `weight`, and `port` are populated for `mx` and
+`srv` records.
+
+```js
+// An IPv4 or IPv6 address without a port.
++ struct IpAddr {
+    // True for an IPv6 address, false for IPv4.
+    + ipv6: bool
+
+    // Copies the raw address bytes (4 for IPv4, 16 for IPv6) into `out` and returns the count.
+    + fn bytes_into(out: local mut &[u8]) uint
+    // Creates an IPv4 (4 bytes) or IPv6 (16 bytes) address from raw network-order bytes.
+    + static fn from_bytes(raw: local &[u8]) IpAddr !NetError
+    // Extracts the IP address from a `SocketAddress` (dropping its port and scope id).
+    + static fn from_socket_address(sa: SocketAddress) IpAddr
+    // Creates an IPv4 address from four octets `a.b.c.d`.
+    + static fn ipv4(a: u8, b: u8, c: u8, d: u8) IpAddr
+    // True if the address is globally routable (not unspecified, loopback, private, link-local, multicast, CGNAT `100.64.0.0/10`, documentation, or reserved).
+    + get is_global: bool
+    // True if this is an IPv4 address.
+    + get is_ipv4: bool
+    // True if this is an IPv6 address.
+    + get is_ipv6: bool
+    // True for link-local addresses (`169.254.0.0/16`, `fe80::/10`, or IPv4-mapped).
+    + get is_link_local: bool
+    // True for loopback addresses (`127.0.0.0/8`, `::1`, or `::ffff:127.0.0.0/104`).
+    + get is_loopback: bool
+    // True for multicast addresses (`224.0.0.0/4` or `ff00::/8`).
+    + get is_multicast: bool
+    // True for private networks: RFC 1918 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) and RFC 4193 IPv6 unique local addresses (`fc00::/7`). Also matches IPv4-mapped IPv6.
+    + get is_private: bool
+    // True for `0.0.0.0` or `::`.
+    + get is_unspecified: bool
+    // Parses a numeric IPv4 (`"127.0.0.1"`) or IPv6 (`"::1"`, `"[::1]"`, `"::ffff:10.0.0.1"`) address without performing any DNS lookup.
+    + static fn parse(text: String) IpAddr !NetError
+    // Returns this address as an IPv4 address if it is IPv4 or IPv4-mapped IPv6 (`::ffff:a.b.c.d`), or `null` otherwise.
+    + fn to_ipv4() ?IpAddr
+    // Combines this IP address with `port` into a `SocketAddress`.
+    + fn to_socket_address(port: u16 (0)) SocketAddress
+    // Formats the address as `"127.0.0.1"` or RFC 5952 IPv6 (`"::1"`).
+    + fn to_string() String
+}
+```
+
+### IpAddr
+
+An IPv4 or IPv6 address without a port.
+
+Parse numeric addresses without DNS lookups using `IpAddr.parse`. Supports equality,
+hashing (as a `HashMap`/`HashSet` key), CIDR matching via `Cidr`, and range
+classification (`is_loopback`, `is_private`, `is_link_local`, `is_global`, ...).
+
+#### ipv6
+
+True for an IPv6 address, false for IPv4.
+
+#### bytes_into
+
+Copies the raw address bytes (4 for IPv4, 16 for IPv6) into `out` and returns the count.
+
+Panics if `out` is too small.
+
+#### from_bytes
+
+Creates an IPv4 (4 bytes) or IPv6 (16 bytes) address from raw network-order bytes.
+
+Throws `invalid_host` for any other length.
+
+#### from_socket_address
+
+Extracts the IP address from a `SocketAddress` (dropping its port and scope id).
+
+#### ipv4
+
+Creates an IPv4 address from four octets `a.b.c.d`.
+
+#### is_global
+
+True if the address is globally routable (not unspecified, loopback, private,
+link-local, multicast, CGNAT `100.64.0.0/10`, documentation, or reserved).
+
+#### is_ipv4
+
+True if this is an IPv4 address.
+
+#### is_ipv6
+
+True if this is an IPv6 address.
+
+#### is_link_local
+
+True for link-local addresses (`169.254.0.0/16`, `fe80::/10`, or IPv4-mapped).
+
+#### is_loopback
+
+True for loopback addresses (`127.0.0.0/8`, `::1`, or `::ffff:127.0.0.0/104`).
+
+#### is_multicast
+
+True for multicast addresses (`224.0.0.0/4` or `ff00::/8`).
+
+#### is_private
+
+True for private networks: RFC 1918 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`)
+and RFC 4193 IPv6 unique local addresses (`fc00::/7`). Also matches IPv4-mapped IPv6.
+
+#### is_unspecified
+
+True for `0.0.0.0` or `::`.
+
+#### parse
+
+Parses a numeric IPv4 (`"127.0.0.1"`) or IPv6 (`"::1"`, `"[::1]"`, `"::ffff:10.0.0.1"`)
+address without performing any DNS lookup.
+
+Throws `invalid_host` if `text` is not a valid numeric IP address.
+
+#### to_ipv4
+
+Returns this address as an IPv4 address if it is IPv4 or IPv4-mapped IPv6
+(`::ffff:a.b.c.d`), or `null` otherwise.
+
+#### to_socket_address
+
+Combines this IP address with `port` into a `SocketAddress`.
+
+#### to_string
+
+Formats the address as `"127.0.0.1"` or RFC 5952 IPv6 (`"::1"`).
+
+```js
 + struct SocketAddress {
     // True for an IPv6 address, false for IPv4.
     + ipv6: bool
@@ -15614,6 +15883,8 @@ Returns a pointer to the C `sockaddr` of the chosen entry; valid while this obje
     + fn equals(other: SocketAddress) bool
     // Returns the address without the port, as `"127.0.0.1"` or `"::1"`.
     + fn ip() String
+    // Returns the IP address part without the port or scope id.
+    + fn ip_addr() IpAddr
     // Writes `ip()` into `buf` and returns the byte count.
     + fn ip_in(buf: local mut &[u8]) uint
     // Returns the IPv4 address `a.b.c.d` with `port`.
@@ -15651,6 +15922,10 @@ Returns the address without the port, as `"127.0.0.1"` or `"::1"`.
 
 IPv6 is written in the RFC 5952 short form (lowercase hex, the longest run of two or
 more zero groups as `::`), followed by `%scope_id` when the scope id is not 0.
+
+#### ip_addr
+
+Returns the IP address part without the port or scope id.
 
 #### ip_in
 
@@ -16634,6 +16909,58 @@ Throws `closed` after `close` and `os` when the system refuses.
 Sets the hop limit (TTL) of datagrams sent to a single address.
 
 Throws `closed` after `close` and `os` when the system refuses.
+
+```js
+// A listening Unix domain stream socket (`AF_UNIX`), created by `UnixServer.new` or `net.unix_server`; `accept` returns connected `TcpConnection` streams.
++ class UnixServer is Closer {
+    // The OS socket descriptor.
+    ~ fd: i32
+    // The filesystem (or abstract) socket path this server listens on.
+    ~ path: String
+
+    // Waits for the next incoming Unix socket connection and returns it.
+    + fn accept(timeout_ms: uint (0)) TcpConnection !NetError
+    // Stops accepting connections, closes the socket, and removes the socket file.
+    + fn close() void !io:IoError
+    // Binds a Unix domain stream socket to `path` and starts listening.
+    + static fn new(path: String, remove_existing: bool (false)) atomic UnixServer !NetError
+}
+```
+
+### UnixServer
+
+A listening Unix domain stream socket (`AF_UNIX`), created by `UnixServer.new` or
+`net.unix_server`; `accept` returns connected `TcpConnection` streams.
+
+On `close`, the socket file is removed from the filesystem (except Linux abstract sockets
+starting with a zero byte).
+
+#### fd
+
+The OS socket descriptor.
+
+#### path
+
+The filesystem (or abstract) socket path this server listens on.
+
+#### accept
+
+Waits for the next incoming Unix socket connection and returns it.
+
+`timeout_ms` 0 waits forever; throws `timeout`, `closed`, or `max_connections`.
+
+#### close
+
+Stops accepting connections, closes the socket, and removes the socket file.
+
+#### new
+
+Binds a Unix domain stream socket to `path` and starts listening.
+
+Pass `remove_existing: true` to unlink a stale socket file at `path` before binding.
+Throws `invalid_host` if `path` is empty or too long, `port_in_use` if `path` already
+exists, `access` on permission failure, `init` when the socket cannot be created (or on
+Windows), and `os` for other bind/listen errors.
 
 # random
 

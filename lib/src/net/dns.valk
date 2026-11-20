@@ -1,0 +1,358 @@
+// RFC 1035 DNS record resolver over UDP with automatic TCP fallback on truncation.
+
+use fs
+use io
+use random
+
+/// DNS resource record types supported by `dns_lookup`.
++ enum DnsType: u16 {
+    a (1)
+    ns (2)
+    cname (5)
+    ptr (12)
+    mx (15)
+    txt (16)
+    aaaa (28)
+    srv (33)
+}
+
+/// A parsed DNS resource record returned by `dns_lookup`.
+///
+/// `value` holds the formatted IP (`a`/`aaaa`), domain target (`cname`/`ns`/`ptr`/`mx`/`srv`),
+/// or concatenated text (`txt`). `priority`, `weight`, and `port` are populated for `mx` and
+/// `srv` records.
++ struct DnsRecord {
+    + name: String
+    + type: DnsType
+    + ttl: u32 (0)
+    + value: String
+    + priority: u16 (0)
+    + weight: u16 (0)
+    + port: u16 (0)
+}
+
+/// Queries DNS records of `record_type` for `name`.
+///
+/// When `server` is empty, reads the system nameserver from `/etc/resolv.conf` on Unix (falling
+/// back to `1.1.1.1:53`). Pass `"host"` or `"host:port"` (or `"[::1]:5353"`) to query a
+/// specific resolver. Sends a UDP query and automatically retries over TCP if the server sets
+/// the truncation (`TC`) flag. Throws `invalid_host` when `name` is invalid or `NXDOMAIN`,
+/// `timeout` when the server does not respond in time, or `connect`/`read`/`write`.
++ fn dns_lookup(name: String, record_type: DnsType, server: String (""), timeout_ms: uint (5000)) Array[DnsRecord] !NetError {
+    let host, port = resolve_dns_server(server) !>
+    let txid = (random.below(65536)).to(u16)
+    let query = build_dns_query(txid, name, record_type) !>
+
+    let resp = send_dns_udp(host, port, query, timeout_ms) !>
+    if resp.bytes < 12 : throw .invalid_host
+    let flags = read_u16_be(resp, 2)
+    // TC bit (0x0200): truncated UDP response, retry over TCP
+    if (flags & 0x0200) != 0 {
+        resp = send_dns_tcp(host, port, query, timeout_ms) !>
+    }
+    return parse_dns_response(txid, record_type, resp) !>
+}
+
+/// Looks up `TXT` records for `name` and returns each record's text value.
++ fn lookup_txt(name: String, server: String (""), timeout_ms: uint (5000)) Array[String] !NetError {
+    let records = dns_lookup(name, DnsType.txt, server, timeout_ms) !>
+    let out = Array[String].new(records.length)
+    each records as rec : out.append(rec.value)
+    return out
+}
+
+/// Looks up `MX` records for `name`, sorted by ascending `priority`.
++ fn lookup_mx(name: String, server: String (""), timeout_ms: uint (5000)) Array[DnsRecord] !NetError {
+    let records = dns_lookup(name, DnsType.mx, server, timeout_ms) !>
+    records.sort_by(fn(r: DnsRecord) u16 { return r.priority })
+    return records
+}
+
+/// Looks up `SRV` records for `name`, sorted by ascending `priority`.
++ fn lookup_srv(name: String, server: String (""), timeout_ms: uint (5000)) Array[DnsRecord] !NetError {
+    let records = dns_lookup(name, DnsType.srv, server, timeout_ms) !>
+    records.sort_by(fn(r: DnsRecord) u16 { return r.priority })
+    return records
+}
+
+/// Looks up `CNAME` targets for `name`.
++ fn lookup_cname(name: String, server: String (""), timeout_ms: uint (5000)) Array[String] !NetError {
+    let records = dns_lookup(name, DnsType.cname, server, timeout_ms) !>
+    let out = Array[String].new(records.length)
+    each records as rec : out.append(rec.value)
+    return out
+}
+
+fn resolve_dns_server(server: String) (String, u16) !NetError {
+    if server.bytes > 0 {
+        return parse_host_port(server, 53) !>
+    }
+    #if OS != "win"
+    let content = fs.read("/etc/resolv.conf") !? ""
+    if content.bytes > 0 {
+        each content.lines() as raw {
+            let line = raw.trim()
+            if line.starts_with("nameserver ") || line.starts_with("nameserver\t") {
+                let rest = line.range(10, line.bytes - 10).trim()
+                // Strip trailing comment or whitespace
+                let end: uint = 0
+                while end < rest.bytes && rest[end] != ' ' && rest[end] != '\t' && rest[end] != '#' : end++
+                let ip = rest.range(0, end)
+                if ip.bytes > 0 : return (ip, 53)
+            }
+        }
+    }
+    #end
+    return ("1.1.1.1", 53)
+}
+
+fn parse_host_port(text: String, default_port: u16) (String, u16) !NetError {
+    if text.starts_with("[") {
+        let close = text.index_of_byte(']') ! throw .invalid_host
+        let host = text.range(1, close - 1)
+        if host.bytes == 0 : throw .invalid_host
+        if close + 1 == text.bytes : return (host, default_port)
+        if text[close + 1] != ':' : throw .invalid_host
+        let port_str = text.range(close + 2, text.bytes - close - 2)
+        let p = port_str.to_uint() ! throw .invalid_host
+        if p == 0 || p > 65535 : throw .invalid_host
+        return (host, p.to(u16))
+    }
+    // Plain IPv6 literal without brackets has multiple colons
+    let first_colon = text.index_of_byte(':') !? uint.$max
+    if first_colon == uint.$max : return (text, default_port)
+    let last_colon = text.last_index_of(":") !? first_colon
+    if first_colon != last_colon : return (text, default_port)
+    let host = text.range(0, first_colon)
+    let port_str = text.range(first_colon + 1, text.bytes - first_colon - 1)
+    if host.bytes == 0 || port_str.bytes == 0 : throw .invalid_host
+    let p = port_str.to_uint() ! throw .invalid_host
+    if p == 0 || p > 65535 : throw .invalid_host
+    return (host, p.to(u16))
+}
+
+fn build_dns_query(txid: u16, name: String, qtype: DnsType) String !NetError {
+    let trimmed = name
+    if trimmed.ends_with(".") : trimmed = trimmed.range(0, trimmed.bytes - 1)
+    if trimmed.bytes == 0 || trimmed.bytes > 253 : throw .invalid_host
+
+    let buf = ByteBuffer.new(64)
+    // Header: ID, Flags (RD=1 -> 0x0100), QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
+    write_u16_be(buf, txid)
+    write_u16_be(buf, 0x0100)
+    write_u16_be(buf, 1)
+    write_u16_be(buf, 0)
+    write_u16_be(buf, 0)
+    write_u16_be(buf, 0)
+
+    // QNAME labels
+    let pos: uint = 0
+    while pos < trimmed.bytes {
+        let dot = trimmed.index_of_byte('.', pos) !? trimmed.bytes
+        let label_len = dot - pos
+        if label_len == 0 || label_len > 63 : throw .invalid_host
+        buf.write_byte(label_len.to(u8))
+        buf.write(trimmed.view(pos, label_len))
+        pos = dot + 1
+    }
+    buf.write_byte(0)
+    // QTYPE and QCLASS (IN = 1)
+    write_u16_be(buf, qtype.to(u16))
+    write_u16_be(buf, 1)
+    return buf.into_string()
+}
+
+fn send_dns_udp(host: String, port: u16, query: String, timeout_ms: uint) String !NetError {
+    let client = UdpClient.new(host, port, timeout_ms) !>
+    defer client.close() _
+    client.read_timeout_ms = timeout_ms
+    client.write_timeout_ms = timeout_ms
+    let sent = client.write(query) ! {
+        if error_is(E.code, timeout) : throw .timeout
+        throw .write
+    }
+    if sent != query.bytes : throw .write
+    let buf = [u8]{ 0 x 4096 }
+    let got = client.read(buf) ! {
+        if error_is(E.code, timeout) : throw .timeout
+        throw .read
+    }
+    return buf.view(0, got).to_string()
+}
+
+fn send_dns_tcp(host: String, port: u16, query: String, timeout_ms: uint) String !NetError {
+    let con = TcpConnection.new(host, port, timeout_ms) !>
+    defer con.close() _
+    con.read_timeout_ms = timeout_ms
+    con.write_timeout_ms = timeout_ms
+    let frame = ByteBuffer.new(query.bytes + 2)
+    write_u16_be(frame, query.bytes.to(u16))
+    frame.write(query)
+    io.write_all(con, frame) ! {
+        if error_is(E.code, timeout) : throw .timeout
+        throw .write
+    }
+    let len_buf: [u8 x 2] = { 0... }
+    io.read_exact(con, &len_buf) ! {
+        if error_is(E.code, timeout) : throw .timeout
+        throw .read
+    }
+    let msg_len = (len_buf[0].to(uint) << 8) | len_buf[1].to(uint)
+    if msg_len < 12 : throw .invalid_host
+    let body = [u8]{ 0 x msg_len }
+    io.read_exact(con, body) ! {
+        if error_is(E.code, timeout) : throw .timeout
+        throw .read
+    }
+    return body.to_string()
+}
+
+fn parse_dns_response(txid: u16, want_type: DnsType, msg: String) Array[DnsRecord] !NetError {
+    if msg.bytes < 12 : throw .invalid_host
+    let resp_id = read_u16_be(msg, 0)
+    if resp_id != txid : throw .invalid_host
+    let flags = read_u16_be(msg, 2)
+    let rcode = flags & 0x0f
+    // RCODE 3 = NXDOMAIN, 2 = SERVFAIL, 1 = FORMERR, 5 = REFUSED
+    if rcode != 0 : throw .invalid_host
+
+    let qdcount = read_u16_be(msg, 4).to(uint)
+    let ancount = read_u16_be(msg, 6).to(uint)
+
+    let pos: uint = 12
+    // Skip questions
+    let q: uint = 0
+    while q < qdcount {
+        let _, next = read_dns_name(msg, pos) !>
+        if next + 4 > msg.bytes : throw .invalid_host
+        pos = next + 4
+        q++
+    }
+
+    let out = Array[DnsRecord]{}
+    let a: uint = 0
+    while a < ancount {
+        let rname, after_name = read_dns_name(msg, pos) !>
+        if after_name + 10 > msg.bytes : throw .invalid_host
+        let rtype = read_u16_be(msg, after_name)
+        let ttl = read_u32_be(msg, after_name + 4)
+        let rdlen = read_u16_be(msg, after_name + 8).to(uint)
+        let rdata_pos = after_name + 10
+        if rdata_pos + rdlen > msg.bytes : throw .invalid_host
+        pos = rdata_pos + rdlen
+
+        if rtype == want_type.to(u16) {
+            let rec = parse_dns_rdata(msg, rname, want_type, ttl, rdata_pos, rdlen) !>
+            out.append(rec)
+        }
+        a++
+    }
+    return out
+}
+
+fn parse_dns_rdata(msg: String, rname: String, rtype: DnsType, ttl: u32, pos: uint, len: uint) DnsRecord !NetError {
+    if rtype == DnsType.a {
+        if len != 4 : throw .invalid_host
+        let ip = IpAddr.from_bytes(msg.view(pos, 4)) !>
+        return DnsRecord { name: rname, type: rtype, ttl: ttl, value: ip.to_string() }
+    }
+    if rtype == DnsType.aaaa {
+        if len != 16 : throw .invalid_host
+        let ip = IpAddr.from_bytes(msg.view(pos, 16)) !>
+        return DnsRecord { name: rname, type: rtype, ttl: ttl, value: ip.to_string() }
+    }
+    if rtype == DnsType.cname || rtype == DnsType.ns || rtype == DnsType.ptr {
+        let target, _ = read_dns_name(msg, pos) !>
+        return DnsRecord { name: rname, type: rtype, ttl: ttl, value: target }
+    }
+    if rtype == DnsType.mx {
+        if len < 3 : throw .invalid_host
+        let pref = read_u16_be(msg, pos)
+        let exchange, _ = read_dns_name(msg, pos + 2) !>
+        return DnsRecord { name: rname, type: rtype, ttl: ttl, value: exchange, priority: pref }
+    }
+    if rtype == DnsType.srv {
+        if len < 7 : throw .invalid_host
+        let priority = read_u16_be(msg, pos)
+        let weight = read_u16_be(msg, pos + 2)
+        let port = read_u16_be(msg, pos + 4)
+        let target, _ = read_dns_name(msg, pos + 6) !>
+        return DnsRecord {
+            name: rname
+            type: rtype
+            ttl: ttl
+            value: target
+            priority: priority
+            weight: weight
+            port: port
+        }
+    }
+    if rtype == DnsType.txt {
+        let out = ByteBuffer.new(len)
+        let cur = pos
+        let end = pos + len
+        while cur < end {
+            let chunk_len = msg[cur++].to(uint)
+            if cur + chunk_len > end : throw .invalid_host
+            out.write(msg.view(cur, chunk_len))
+            cur += chunk_len
+        }
+        return DnsRecord { name: rname, type: rtype, ttl: ttl, value: out.into_string() }
+    }
+    throw .invalid_host
+}
+
+// Decodes an RFC 1035 domain name with compression pointer support and cycle protection.
+fn read_dns_name(msg: String, start: uint) (String, uint) !NetError {
+    let out = ByteBuffer.new(64)
+    let pos = start
+    let next_pos: uint = 0
+    let jumped = false
+    let jumps: uint = 0
+
+    while true {
+        if pos >= msg.bytes : throw .invalid_host
+        let len = msg[pos].to(uint)
+        if len == 0 {
+            if !jumped : next_pos = pos + 1
+            break
+        }
+        if (len & 0xc0) == 0xc0 {
+            if pos + 1 >= msg.bytes : throw .invalid_host
+            if !jumped {
+                next_pos = pos + 2
+                jumped = true
+            }
+            let ptr_off = ((len & 0x3f) << 8) | msg[pos + 1].to(uint)
+            if ptr_off >= msg.bytes : throw .invalid_host
+            jumps++
+            if jumps > 64 : throw .invalid_host
+            pos = ptr_off
+            continue
+        }
+        if (len & 0xc0) != 0 : throw .invalid_host
+        pos++
+        if pos + len > msg.bytes : throw .invalid_host
+        if out.length > 0 : out.write_byte('.')
+        out.write(msg.view(pos, len))
+        pos += len
+        if out.length > 255 : throw .invalid_host
+    }
+    return (out.into_string(), next_pos)
+}
+
+fn write_u16_be(buf: ByteBuffer, value: u16) {
+    buf.write_byte((value >> 8).to(u8))
+    buf.write_byte((value & 0xff).to(u8))
+}
+
+fn read_u16_be(msg: String, offset: uint) u16 {
+    return (msg[offset].to(u16) << 8) | msg[offset + 1].to(u16)
+}
+
+fn read_u32_be(msg: String, offset: uint) u32 {
+    return (msg[offset].to(u32) << 24)
+        | (msg[offset + 1].to(u32) << 16)
+        | (msg[offset + 2].to(u32) << 8)
+        | msg[offset + 3].to(u32)
+}

@@ -2947,10 +2947,14 @@ connection closes and later calls throw `closed`.
 
 API for [valk.net](api.md#net)
 
-TCP servers and clients, and UDP sockets. Hosts can be names, IPv4
+TCP servers and clients, Unix domain sockets (`net.unix_server`, `net.unix_client`),
+and UDP sockets. Hosts can be names, IPv4
 addresses or IPv6 addresses (`"::1"`, or `"[::1]"` as written in a URL);
 a name that resolves to both uses IPv4. A server bound to `"::"` also
-accepts IPv4 clients where the system allows it.
+accepts IPv4 clients where the system allows it. `net.IpAddr` and `net.Cidr`
+parse, classify, and match IPv4/IPv6 addresses and prefixes without DNS lookups,
+and `net.dns_lookup` (`lookup_txt`, `lookup_mx`, `lookup_srv`, `lookup_cname`)
+queries DNS records directly.
 
 Example
 

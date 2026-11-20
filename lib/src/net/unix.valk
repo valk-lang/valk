@@ -1,0 +1,274 @@
+use io
+use core
+use ext
+use coro
+use fs
+use mem
+use time
+
+// Maximum socket path length (excluding NUL terminator) per OS `struct sockaddr_un`
+#if OS == "macos"
+value UNIX_MAX_PATH (103)
+value SOCKADDR_UN_BUF (106)
+#else
+value UNIX_MAX_PATH (107)
+value SOCKADDR_UN_BUF (110)
+#end
+
+/// Opens a listening Unix domain stream socket at `path`; the same as `UnixServer.new`.
++ fn unix_server(path: String, remove_existing: bool (false)) atomic UnixServer !NetError {
+    return UnixServer.new(path, remove_existing) !>
+}
+
+/// Connects to a Unix domain stream socket at `path`.
+///
+/// Returns a `TcpConnection` stream (`io.Reader`, `io.Writer`, `io.Closer`) using the same
+/// coroutine-aware I/O, timeouts, and cancellation support. Throws `invalid_host` when `path`
+/// is empty or exceeds the OS limit, `init` when the socket cannot be created (or on Windows),
+/// `timeout`, or `connect`.
++ fn unix_client(path: String, timeout_ms: uint (5000)) TcpConnection !NetError {
+    #if OS == "win"
+    throw .init
+    #else
+    @unsafe
+    let addr_buf: [u8 x SOCKADDR_UN_BUF] = { 0... }
+    let addr_len = write_sockaddr_un(@ref(addr_buf).@cast(ptr), path) !>
+    let fd = create_unix_socket() !>
+    connect_unix_fd(fd, @ref(addr_buf).@cast(*ext.libc_sockaddr), addr_len, timeout_ms) ! {
+        close_fd_cleanup(fd, __FILE__, __LINE__)
+        throw E
+    }
+    let con = TcpConnection.wrap(fd) !>
+    con.host = path
+    con.stream = true
+    return con
+    #end
+}
+
+/// A listening Unix domain stream socket (`AF_UNIX`), created by `UnixServer.new` or
+/// `net.unix_server`; `accept` returns connected `TcpConnection` streams.
+///
+/// On `close`, the socket file is removed from the filesystem (except Linux abstract sockets
+/// starting with a zero byte).
++ class UnixServer is io.Closer {
+    /// The filesystem (or abstract) socket path this server listens on.
+    ~ path: String
+    /// The OS socket descriptor.
+    ~ fd: Fd
+    - closed: u8 (0)
+    - accepting: uint (0)
+    - released: u8 (0)
+    - poll_owner: uint (0)
+
+    /// Binds a Unix domain stream socket to `path` and starts listening.
+    ///
+    /// Pass `remove_existing: true` to unlink a stale socket file at `path` before binding.
+    /// Throws `invalid_host` if `path` is empty or too long, `port_in_use` if `path` already
+    /// exists, `access` on permission failure, `init` when the socket cannot be created (or on
+    /// Windows), and `os` for other bind/listen errors.
+    + static fn new(path: String, remove_existing: bool (false)) atomic UnixServer !NetError {
+        #if OS == "win"
+        throw .init
+        #else
+        @unsafe
+        let addr_buf: [u8 x SOCKADDR_UN_BUF] = { 0... }
+        let addr_len = write_sockaddr_un(@ref(addr_buf).@cast(ptr), path) !>
+        if remove_existing && path.bytes > 0 && path[0] != 0 {
+            fs.delete_file(path) _
+        }
+        let fd = create_unix_socket() !>
+        if ext.bind(fd, @ref(addr_buf).@cast(*ext.libc_sockaddr), addr_len) != 0 {
+            let err = ext.get_errno()
+            close_fd_cleanup(fd, __FILE__, __LINE__)
+            unix_bind_failed(err)
+        }
+        if ext.listen(fd, 1024) != 0 {
+            let err = ext.get_errno()
+            close_fd_cleanup(fd, __FILE__, __LINE__)
+            if path.bytes > 0 && path[0] != 0 : fs.delete_file(path) _
+            unix_bind_failed(err)
+        }
+        return UnixServer {
+            path: path
+            fd: fd
+            #if OS == "linux"
+            poll_owner: coro.next_owner()
+            #end
+        }
+        #end
+    }
+
+    /// Waits for the next incoming Unix socket connection and returns it.
+    ///
+    /// `timeout_ms` 0 waits forever; throws `timeout`, `closed`, or `max_connections`.
+    + fn accept(timeout_ms: uint (0)) TcpConnection !NetError @threadsafe {
+        #if OS == "win"
+        throw .init
+        #else
+        atomic(this.accepting + 1)
+        if this.closed != 0 {
+            this.accept_done()
+            throw .closed
+        }
+        let fd = accept(this.fd, false, timeout_ms, this.poll_owner) ! {
+            let closed = this.closed != 0
+            this.accept_done()
+            if closed : throw .closed
+            throw E
+        }
+        this.accept_done()
+        let con = TcpConnection.wrap(fd) !>
+        con.stream = true
+        return con
+        #end
+    }
+
+    /// Stops accepting connections, closes the socket, and removes the socket file.
+    + fn close() !io.IoError @threadsafe {
+        #if OS != "win"
+        if atomic(this.closed | 1) != 0 : return
+        ext.shutdown(this.fd, ext.O_RDWR)
+        #if OS == "linux"
+        coro.fd_closing(this.fd)
+        #end
+        if this.path.bytes > 0 && this.path[0] != 0 {
+            fs.delete_file(this.path) _
+        }
+        if atomic_load(this.accepting) == 0 : this.release_fd() !>
+        #end
+    }
+
+    fn accept_done() @threadsafe {
+        let was = atomic(this.accepting - 1)
+        if was == 1 && this.closed != 0 {
+            this.release_fd() ! {}
+        }
+    }
+
+    fn release_fd() !io.IoError @threadsafe {
+        if atomic(this.released | 1) != 0 : return
+        close_fd(this.fd) ! throw .os
+    }
+
+    fn gc_free() {
+        #if OS != "win"
+        if this.released == 0 {
+            this.released = 1
+            close_fd_cleanup(this.fd, __FILE__, __LINE__)
+        }
+        #end
+    }
+}
+
+#if OS != "win"
+fn unix_bind_failed(err: i32) !NetError $throw {
+    if err == ext.EADDRINUSE : throw .port_in_use
+    if err == ext.EACCES || err == ext.EPERM : throw .access
+    throw .os
+}
+
+fn write_sockaddr_un(buf: ptr, path: String) u32 !NetError {
+    @unsafe
+    if path.bytes == 0 || path.bytes > UNIX_MAX_PATH : throw .invalid_host
+    let is_abstract = path[0] == 0
+    #if OS != "linux"
+    if is_abstract : throw .invalid_host
+    #end
+    if !is_abstract {
+        let i: uint = 0
+        while i < path.bytes {
+            if path[i] == 0 : throw .invalid_host
+            i++
+        }
+    }
+    mem.clear_bytes(buf, SOCKADDR_UN_BUF)
+    let total = 2 + path.bytes + (is_abstract ? 0 : 1)
+    #if OS == "macos"
+    @ptrv(buf, u8, 0) = total.to(u8)
+    @ptrv(buf, u8, 1) = ext.AF_UNIX.to(u8)
+    #else
+    @ptrv(buf, u16, 0) = ext.AF_UNIX.to(u16)
+    #end
+    mem.copy_bytes(path.data, buf.@offset(2), path.bytes)
+    return total.to(u32)
+}
+
+fn create_unix_socket() Fd !NetError {
+    let kind: i32 = ext.SOCK_STREAM
+    #if OS == "linux"
+    kind = kind | ext.SOCK_CLOEXEC | ext.SOCK_NONBLOCK
+    #end
+    let fd = ext.socket(ext.AF_UNIX, kind, 0)
+    if fd == io.INVALID_FD && io.collected_descriptors() : fd = ext.socket(ext.AF_UNIX, kind, 0)
+    if fd == io.INVALID_FD : throw .init
+    #if OS == "macos"
+    io.set_nonblocking(fd, true) ! {
+        close_fd(fd) ! core.cleanup_warning("Failed to close socket", __FILE__, __LINE__)
+        throw .os
+    }
+    io.set_close_on_exec(fd) ! {
+        close_fd(fd) ! core.cleanup_warning("Failed to close socket", __FILE__, __LINE__)
+        throw .os
+    }
+    @unsafe
+    let nosigv: i32 = 1
+    if ext.setsockopt(fd, ext.SOL_SOCKET, ext.SO_NOSIGPIPE, @ref(nosigv), size_of(i32)) != 0 {
+        close_fd(fd) ! core.cleanup_warning("Failed to close socket", __FILE__, __LINE__)
+        throw .init
+    }
+    #end
+    return fd
+}
+
+fn connect_unix_fd(fd: Fd, addr: *ext.libc_sockaddr, addr_len: u32, timeout_ms: uint) !NetError {
+    @unsafe
+    #if OS == "linux"
+    if io.use_epoll_backend() {
+        if ext.connect(fd, addr, addr_len) != 0 {
+            let error = ext.get_errno()
+            if error != ext.EINPROGRESS && error != ext.EINTR && error != ext.EAGAIN : throw .connect
+            let ev = io.await_fd(fd, false, true, timeout_ms)
+            if ev.is_timeout() : throw .timeout
+            if io.is_gone(ev) : throw .connect
+            let failed: i32 = 0
+            let size: u32 = size_of(i32)
+            if ext.getsockopt(fd, ext.SOL_SOCKET, ext.SO_ERROR, @ref(failed).@cast(ptr), @ref(size)) != 0 || failed != 0 : throw .connect
+        }
+        return
+    }
+    #if URING
+    let coro = coro.current_coro.@cast(coro.Coro)
+    let sqe = io.sqe(coro) !>
+    io.io_uring_prep_connect(sqe, fd, addr, addr_len)
+    io.link_timeout(coro, sqe, timeout_ms) ! throw .os
+    coro.yield()
+    let res = coro.completion_res
+    if res == 0 - ext.ETIMEDOUT : throw .timeout
+    if res < 0 : throw .connect
+    #end
+    #elif OS == "macos"
+    if ext.connect(fd, addr, addr_len) != 0 {
+        let error = ext.get_errno()
+        if error != ext.EISCONN {
+            if error != ext.EINPROGRESS && error != ext.EINTR : throw .connect
+            let deadline = time.deadline_ms(timeout_ms)
+            while true {
+                let left: uint = 0
+                if deadline != 0 {
+                    let now = time.mono_ms()
+                    if now >= deadline : throw .timeout
+                    left = deadline - now
+                }
+                let ev = io.await_fd(fd, false, true, left)
+                if ev.is_timeout() : throw .timeout
+                let failed: i32 = 0
+                let size: u32 = size_of(i32)
+                if ext.getsockopt(fd, ext.SOL_SOCKET, ext.SO_ERROR, @ref(failed).@cast(ptr), @ref(size)) != 0 : throw .connect
+                if failed == 0 : break
+                if failed != ext.EINPROGRESS : throw .connect
+            }
+        }
+    }
+    #end
+}
+#end
