@@ -6,7 +6,7 @@
 ```
 - Release 0.8.11
 + Fix (`fs`): `fs.is_dir` now masks `st_mode` with `S_IFMT` so Unix domain sockets (`S_IFSOCK`) are not misidentified as directories
-+ Fix (`io` / `fs.Watcher`): closing or interrupting non-socket descriptors (such as `inotify` fds) now cancels pending Linux `io_uring` `await_fd` polls immediately instead of waiting for timeout
++ Fix (`fs.Watcher`): `close()` on Linux now removes watches (`inotify_rm_watch`) so blocked `next()` calls wake immediately on `io_uring` instead of waiting for timeout
 
 + Release 0.8.10
 + Language: property metadata tags (`$tag(...)` and backtick shorthand) exposed via `#loop properties` / `#loop object`, with `json` support for `rename`, `skip`, and `omitempty`
