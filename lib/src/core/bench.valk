@@ -1,0 +1,318 @@
+use time
+use gc
+
+// Sink that prevents the optimizer from eliminating values passed to `b.keep(...)`.
+global bench_sink_word: uint (0)
+
+fn bench_black_box(p: ptr) $noinline {
+    bench_sink_word = p.@cast(uint)
+}
+
+/// Controls timing and iteration inside a `bench "..." { ... }` block.
+///
+/// The compiler binds `b: Bencher` automatically inside every `bench` block. Either write
+/// the benchmarked code directly for automatic iteration, or drive the loop explicitly with
+/// `while b.loop() { ... }` after any one-time setup.
++ class Bencher {
+    - target_ns: uint (250_000_000)
+    - fixed_iters: uint (0)
+    - start_ns: uint (0)
+    - accum_ns: uint (0)
+    - running: bool (false)
+    - did_loop: bool (false)
+    - batch: uint (0)
+    - batch_rem: uint (0)
+    /// Completed iterations measured so far.
+    ~ iters: uint (0)
+    /// Optional bytes processed per iteration, set via `set_bytes`.
+    ~ bytes_per_op: uint (0)
+
+    static fn create(target_ns: uint, fixed_iters: uint) Bencher {
+        return Bencher {
+            target_ns: target_ns
+            fixed_iters: fixed_iters
+        }
+    }
+
+    /// Drives the timed benchmark loop, returning `true` while more iterations are needed.
+    ///
+    /// Code before the first `b.loop()` call runs once as setup and is excluded from timing.
+    + fn loop() bool $inline {
+        if this.batch_rem > 0 {
+            this.batch_rem--
+            return true
+        }
+        return this.loop_slow()
+    }
+
+    fn loop_slow() bool $noinline {
+        if !this.did_loop {
+            this.did_loop = true
+            this.iters = 0
+            this.accum_ns = 0
+            this.batch = 1
+            this.batch_rem = 0
+            this.start_ns = time.mono_ns()
+            this.running = true
+            return true
+        }
+
+        this.iters += this.batch
+        let elapsed = this.elapsed_now_ns()
+
+        if this.fixed_iters > 0 {
+            if this.iters >= this.fixed_iters {
+                this.stop_timer()
+                return false
+            }
+            let rem = this.fixed_iters - this.iters
+            let next = this.batch * 2
+            if next > rem : next = rem
+            this.batch = next
+            this.batch_rem = next - 1
+            return true
+        }
+
+        if elapsed >= this.target_ns && this.iters >= 1 {
+            this.stop_timer()
+            return false
+        }
+
+        let next: uint = 1
+        if elapsed < 1_000_000 {
+            next = this.batch * 2
+        } else {
+            let remaining = this.target_ns - elapsed
+            let est = (remaining * this.iters) / elapsed / 2
+            next = est > 0 ? est : 1
+            let cap = this.iters * 4
+            if next > cap : next = cap
+        }
+        if next > 10_000_000 : next = 10_000_000
+        this.batch = next
+        this.batch_rem = next - 1
+        return true
+    }
+
+    /// Resets the elapsed timer and iteration count to zero.
+    + fn reset_timer() {
+        this.accum_ns = 0
+        this.iters = 0
+        this.batch = 0
+        this.batch_rem = 0
+        if this.running : this.start_ns = time.mono_ns()
+    }
+
+    /// Pauses the benchmark timer until `start_timer` is called.
+    + fn stop_timer() {
+        if !this.running : return
+        this.accum_ns += time.mono_ns() - this.start_ns
+        this.running = false
+    }
+
+    /// Resumes the benchmark timer after `stop_timer`.
+    + fn start_timer() {
+        if this.running : return
+        this.start_ns = time.mono_ns()
+        this.running = true
+    }
+
+    /// Records how many bytes each iteration processes, enabling throughput reporting (`MB/s`).
+    + fn set_bytes(bytes: uint) {
+        this.bytes_per_op = bytes
+    }
+
+    /// Prevents the optimizer from dead-code-eliminating `value`.
+    + fn keep[T](value: T) {
+        @unsafe
+        let slot = value
+        bench_black_box(@ref(slot))
+    }
+
+    fn elapsed_now_ns() uint {
+        if !this.running : return this.accum_ns
+        return this.accum_ns + (time.mono_ns() - this.start_ns)
+    }
+}
+
+class BenchRunner {
+    target_ns: uint (250_000_000)
+    fixed_iters: uint (0)
+    filter: ?String (null)
+    parsed: bool (false)
+    total: uint (0)
+    ran: uint (0)
+
+    fn init_args() {
+        if this.parsed : return
+        this.parsed = true
+        let args = cli_args
+        each args as arg, i {
+            if arg == "--filter" {
+                this.filter = args.get(i + 1) !? ""
+            } else if arg == "--bench-time" {
+                let raw = args.get(i + 1) !? ""
+                let ms = raw.to_uint() !? 0
+                if ms > 0 : this.target_ns = ms * 1_000_000
+            } else if arg == "--bench-iters" {
+                let raw = args.get(i + 1) !? ""
+                let n = raw.to_uint() !? 0
+                if n > 0 : this.fixed_iters = n
+            }
+        }
+    }
+
+    fn select(name: String) bool {
+        this.init_args()
+        this.total++
+        let filter = this.filter ?! return true
+        return name.lower().contains(filter.lower())
+    }
+
+    fn check_selection(selected: uint) {
+        let filter = this.filter ?! return
+        if selected > 0 : return
+        println("No benchmark name contains '" + filter + "' (--filter matches case-insensitively)")
+        exit(1)
+    }
+
+    fn run_one(name: String, func: fn(Bencher)()) {
+        this.ran++
+        gc.collect()
+
+        let b = Bencher.create(this.target_ns, this.fixed_iters)
+        let t0 = time.mono_ns()
+        func(b)
+        let first_ns = time.mono_ns() - t0
+
+        if b.did_loop {
+            this.print_row(name, b.iters, b.elapsed_now_ns(), b.bytes_per_op)
+            return
+        }
+
+        // Simple bench block without explicit `b.loop()`: probe served as warmup
+        let total_iters: uint = 0
+        let total_ns: uint = 0
+        let bytes = b.bytes_per_op
+
+        if this.fixed_iters > 0 {
+            let n = this.fixed_iters
+            let start = time.mono_ns()
+            let i: uint = 0
+            while i < n {
+                func(b)
+                i++
+            }
+            total_ns = time.mono_ns() - start
+            total_iters = n
+        } else {
+            let batch: uint = 1
+            if first_ns > 0 && first_ns < 500_000 {
+                batch = 500_000 / first_ns
+                if batch < 1 : batch = 1
+                if batch > 10_000 : batch = 10_000
+            }
+            while total_ns < this.target_ns || total_iters == 0 {
+                let start = time.mono_ns()
+                let i: uint = 0
+                while i < batch {
+                    func(b)
+                    i++
+                }
+                let dt = time.mono_ns() - start
+                total_ns += dt
+                total_iters += batch
+                if total_ns >= this.target_ns : break
+                if total_ns < 1_000_000 {
+                    batch *= 2
+                } else {
+                    let rem = this.target_ns - total_ns
+                    let est = (rem * total_iters) / total_ns / 2
+                    batch = est > 0 ? est : 1
+                    let cap = total_iters * 4
+                    if batch > cap : batch = cap
+                }
+                if batch > 10_000_000 : batch = 10_000_000
+            }
+        }
+        this.print_row(name, total_iters, total_ns, bytes)
+    }
+
+    fn print_header() {
+        println("--------- BENCH RESULTS ---------")
+    }
+
+    fn print_footer() {
+        println("---------------------------------")
+        let line = "Benchmarks: " + this.ran
+        let filter = this.filter
+        if isset(filter) : line += " of " + this.total + " (--filter '" + filter + "')"
+        println(line)
+    }
+
+    fn print_row(name: String, iters: uint, elapsed_ns: uint, bytes_per_op: uint) {
+        let row = "> " + name + " "
+        let width = row.utf8.length
+        if width > 44 {
+            row = row.utf8.range(0, 44)
+            width = 44
+        }
+        while width < 44 {
+            row += (width % 2 == 0) ? " " : "."
+            width++
+        }
+        let safe_iters = iters > 0 ? iters : 1
+        let ns_per_op = elapsed_ns.to(f64) / safe_iters.to(f64)
+        let ops_per_sec = elapsed_ns > 0 ? (safe_iters.to(f64) * 1_000_000_000.0 / elapsed_ns.to(f64)) : 0.0
+        row += " " + bench_pad_left(bench_fmt_uint(safe_iters) + " iters", 16)
+        row += " | " + bench_pad_left(bench_fmt_duration(ns_per_op), 13)
+        row += " | " + bench_pad_left(bench_fmt_rate(ops_per_sec) + " ops/s", 14)
+        if bytes_per_op > 0 && elapsed_ns > 0 {
+            let mb_per_sec = (safe_iters.to(f64) * bytes_per_op.to(f64)) / (elapsed_ns.to(f64) / 1_000_000_000.0) / (1024.0 * 1024.0)
+            row += " | " + bench_pad_left(mb_per_sec.to_string(1, false) + " MB/s", 12)
+        }
+        println(row)
+    }
+}
+
+fn bench_pad_left(text: String, width: uint) String {
+    if text.bytes >= width : return text
+    let out = ByteBuffer.new(width)
+    let pad = width - text.bytes
+    let i: uint = 0
+    while i < pad {
+        out.write_byte(' ')
+        i++
+    }
+    out.write(text)
+    return out.to_string()
+}
+
+fn bench_fmt_uint(v: uint) String {
+    let raw = v.to_string()
+    if raw.bytes <= 3 : return raw
+    let out = ByteBuffer.new(raw.bytes + raw.bytes / 3)
+    let first = raw.bytes % 3
+    if first == 0 : first = 3
+    let i: uint = 0
+    while i < raw.bytes {
+        if i > 0 && (i >= first && (i - first) % 3 == 0) : out.write_byte(',')
+        out.write_byte(raw[i])
+        i++
+    }
+    return out.to_string()
+}
+
+fn bench_fmt_duration(ns: f64) String {
+    if ns < 1_000.0 : return ns.to_string(1, false) + " ns/op"
+    if ns < 1_000_000.0 : return (ns / 1_000.0).to_string(2, false) + " us/op"
+    if ns < 1_000_000_000.0 : return (ns / 1_000_000.0).to_string(2, false) + " ms/op"
+    return (ns / 1_000_000_000.0).to_string(2, false) + " s/op"
+}
+
+fn bench_fmt_rate(ops: f64) String {
+    if ops >= 1_000_000_000.0 : return (ops / 1_000_000_000.0).to_string(2, false) + "G"
+    if ops >= 1_000_000.0 : return (ops / 1_000_000.0).to_string(2, false) + "M"
+    if ops >= 1_000.0 : return (ops / 1_000.0).to_string(1, false) + "K"
+    return ops.to_string(1, false)
+}

@@ -438,6 +438,29 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 ```
 
 ```js
+// Controls timing and iteration inside a `bench "..." { ... }` block.
++ class Bencher {
+    // Optional bytes processed per iteration, set via `set_bytes`.
+    ~ bytes_per_op: uint
+    // Completed iterations measured so far.
+    ~ iters: uint
+
+    // Prevents the optimizer from dead-code-eliminating `value`.
+    + fn keep[T](value: T) void
+    // Drives the timed benchmark loop, returning `true` while more iterations are needed.
+    + fn loop() bool
+    // Resets the elapsed timer and iteration count to zero.
+    + fn reset_timer() void
+    // Records how many bytes each iteration processes, enabling throughput reporting (`MB/s`).
+    + fn set_bytes(bytes: uint) void
+    // Resumes the benchmark timer after `stop_timer`.
+    + fn start_timer() void
+    // Pauses the benchmark timer until `start_timer` is called.
+    + fn stop_timer() void
+}
+```
+
+```js
 // A growable byte buffer for building binary or text data in memory.
 + class ByteBuffer is Writer {
     // Pointer to the first byte of the buffer's storage.

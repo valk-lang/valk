@@ -1,0 +1,238 @@
+// --coverage: source-based line and function coverage instrumentation.
+// Each instrumented unit keeps a counter array and a parallel metadata table
+// ({ file, func_name, line, is_entry }), registered into `core.cov_head` at startup.
+
+struct CovEntryIR {
+    file: String
+    func_name: String
+    line: uint
+    is_entry: bool
+}
+
+fn ir_cov_prepare(ir: IRFunc) {
+    let func = ir.func
+    let b = func.ns.build
+    if !b.options.coverage : return
+    if func.is_extern || func.is_test || func.is_bench || func.is_entrance : return
+    if func.name == "valk_run_all_tests" || func.name == "valk_run_all_benches" : return
+    if !func.is_literal && func.name.starts_with("<") : return
+    let main_pkg = b.main_pkg ?! return
+    if func.ns.pkg != main_pkg : return
+    let origin = message_resolve(func.exp.src, func.exp.i)
+    if !isset(origin.src.path) : return
+    let display = source_display(origin.src)
+    if display.path.length == 0 : return
+
+    ir.cov = true
+    ir.cov_src = origin.src
+    ir.cov_file = display.path
+    ir.cov_func_name = ir_cov_func_name(func)
+    ir.cov_line_map = HashMap[uint, uint]{}
+}
+
+// Merge generic specializations of the same source function onto one name.
+fn ir_cov_func_name(func: Func) String {
+    let owner = func.literal_owner
+    if isset(owner) : return "closure in " + ir_cov_func_name(owner)
+    let base = func.generic_from
+    let name = isset(base) ? base.name : func.name
+    let class = func.class
+    if isset(class) {
+        let base_class = class.generic_from ?? class
+        return base_class.pretty_name() + "." + name
+    }
+    return func.ns.name + "." + name
+}
+
+fn ir_cov_add_counter(ir: IRFunc, line: uint, is_entry: bool) uint {
+    let entries = ir.func.unit.cov_entries
+    let index = entries.length
+    entries.append(CovEntryIR {
+        file: ir.cov_file
+        func_name: ir.cov_func_name
+        line: line
+        is_entry: is_entry
+    })
+    return index
+}
+
+fn ir_cov_emit_inc(ir: IRFunc, index: uint) {
+    let ptr_reg = ir.var()
+    let unit_name = ir.func.unit.name
+    ir.line_start()
+    ir.write(ptr_reg)
+    ir.write(" = getelementptr i64, ptr @\"valk.cov.cnt.")
+    ir.write(unit_name)
+    ir.write("\", i64 ")
+    ir.write_uint(index)
+    ir.line_end()
+
+    let old_reg = ir.var()
+    ir.line_start()
+    ir.write(old_reg)
+    ir.write(" = atomicrmw add ptr ")
+    ir.write(ptr_reg)
+    ir.write(", i64 1 monotonic, align 8")
+    ir.line_end()
+}
+
+fn ir_cov_enter(ir: IRFunc) {
+    if !ir.cov : return
+    let src = ir.cov_src ?! return
+    let line = src.line_of(message_resolve(ir.func.exp.src, ir.func.exp.i).i)
+    let index = ir_cov_add_counter(ir, line, true)
+    ir_cov_emit_inc(ir, index)
+}
+
+fn ir_cov_stmt(ir: IRFunc, value: Value) {
+    if !ir.cov || ir.terminated : return
+    let t = value.type
+    if t == VAL.block || t == VAL.allocas || t == VAL.ir_comment
+        || t == VAL.run_defers || t == VAL.init_allocators {
+        return
+    }
+    let at = value.exp ?! return
+    let origin = message_resolve(at.src, at.i)
+    let own = ir.cov_src ?! return
+    if origin.src != own : return
+    let line = own.line_of(origin.i)
+    if line == 0 || line == ir.cov_last_line : return
+    ir.cov_last_line = line
+    let map = ir.cov_line_map ?! return
+    let index = map.get(line) !? <{
+        let created = ir_cov_add_counter(ir, line, false)
+        map.set(line, created)
+        return created
+    }
+    ir_cov_emit_inc(ir, index)
+}
+
+fn ir_cov_cstr_index(strings: Array[String], index_map: Map[uint], text: String) uint {
+    index_map.get(text) -> existing : return existing
+    let idx = strings.length
+    strings.append(text)
+    index_map.set(text, idx)
+    return idx
+}
+
+fn ir_cov_write_escaped(out: ByteBuffer, text: String) {
+    let i: uint = 0
+    while i < text.bytes {
+        let byte = @ptrv(text.data, u8, i++)
+        if byte >= 32 && byte <= 126 && byte != '"' && byte != '\\' {
+            out.write_byte(byte)
+            continue
+        }
+        out.write_byte('\\')
+        let hex = byte.to_hex()
+        if hex.bytes < 2 : out.write_byte('0')
+        out.append_text(hex)
+    }
+    out.append_text("\\00")
+}
+
+fn ir_cov_emit_unit_footer(out: ByteBuffer, build: Build, unit: Unit) !Error {
+    if !build.options.coverage : return
+    let idf = valk_idf(build, "core", "cov_head") !>
+    let cov_head = idf.global ?! build.bug("core.cov_head is missing")
+
+    if unit.cov_entries.length > 0 {
+        let strings = Array[String]{}
+        let index_map = Map[uint]{}
+        let file_ids = Array[uint]{}
+        let func_ids = Array[uint]{}
+        each unit.cov_entries as entry {
+            file_ids.append(ir_cov_cstr_index(strings, index_map, entry.file))
+            func_ids.append(ir_cov_cstr_index(strings, index_map, entry.func_name))
+        }
+
+        let uname = unit.name
+        each strings as text, i {
+            out.append_text("@\"valk.cov.s.")
+            out.append_text(uname)
+            out.append_text(".")
+            out.write_uint_ascii(i)
+            out.append_text("\" = private unnamed_addr constant [")
+            out.write_uint_ascii(text.bytes + 1)
+            out.append_text(" x i8] c\"")
+            ir_cov_write_escaped(out, text)
+            out.append_text("\", align 1\n")
+        }
+
+        let n = unit.cov_entries.length
+        out.append_text("@\"valk.cov.cnt.")
+        out.append_text(uname)
+        out.append_text("\" = internal global [")
+        out.write_uint_ascii(n)
+        out.append_text(" x i64] zeroinitializer, align 8\n")
+
+        out.append_text("@\"valk.cov.meta.")
+        out.append_text(uname)
+        out.append_text("\" = private unnamed_addr constant [")
+        out.write_uint_ascii(n)
+        out.append_text(" x { ptr, ptr, i32, i32 }] [\n")
+        each unit.cov_entries as entry, i {
+            out.append_text("  { ptr, ptr, i32, i32 } { ptr @\"valk.cov.s.")
+            out.append_text(uname)
+            out.append_text(".")
+            out.write_uint_ascii(file_ids[i])
+            out.append_text("\", ptr @\"valk.cov.s.")
+            out.append_text(uname)
+            out.append_text(".")
+            out.write_uint_ascii(func_ids[i])
+            out.append_text("\", i32 ")
+            out.write_uint_ascii(entry.line)
+            out.append_text(", i32 ")
+            out.write_uint_ascii(entry.is_entry ? 1 : 0)
+            out.append_text(i + 1 < n ? " },\n" : " }\n")
+        }
+        out.append_text("], align 8\n")
+
+        let node_link = build.options.single_unit ? "internal" : "dso_local"
+        out.append_text("@\"valk.cov.node.")
+        out.append_text(uname)
+        out.append_text("\" = ")
+        out.append_text(node_link)
+        out.append_text(" global { ptr, ptr, ptr, i64 } { ptr null, ptr @\"valk.cov.meta.")
+        out.append_text(uname)
+        out.append_text("\", ptr @\"valk.cov.cnt.")
+        out.append_text(uname)
+        out.append_text("\", i64 ")
+        out.write_uint_ascii(n)
+        out.append_text(" }, align 8\n")
+    }
+
+    // Emit the central `valk_cov_init_all` function in the unit that defines `core.cov_head`
+    if cov_head.unit == unit {
+        let head_name = global_ir_name(cov_head)
+        let cov_units = Array[Unit]{}
+        each build.lists.units as u {
+            if u.is_used && u.cov_entries.length > 0 {
+                cov_units.append(u)
+                if u != unit {
+                    out.append_text("@\"valk.cov.node.")
+                    out.append_text(u.name)
+                    out.append_text("\" = external global { ptr, ptr, ptr, i64 }\n")
+                }
+            }
+        }
+        out.append_text("define dso_local void @valk_cov_init_all() nounwind {\nentry:\n")
+        each cov_units as u, i {
+            let prev = "\%prev." + i
+            out.append_text("  ")
+            out.append_text(prev)
+            out.append_text(" = load ptr, ptr @\"")
+            out.append_text(head_name)
+            out.append_text("\", align 8\n  store ptr ")
+            out.append_text(prev)
+            out.append_text(", ptr @\"valk.cov.node.")
+            out.append_text(u.name)
+            out.append_text("\", align 8\n  store ptr @\"valk.cov.node.")
+            out.append_text(u.name)
+            out.append_text("\", ptr @\"")
+            out.append_text(head_name)
+            out.append_text("\", align 8\n")
+        }
+        out.append_text("  ret void\n}\n")
+    }
+}

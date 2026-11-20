@@ -1,0 +1,255 @@
+use fs
+
+// Linked list head of compiler-emitted coverage unit descriptors (populated by valk_cov_init_all).
+@shared cov_head: ?ptr (null)
+@shared cov_reported: bool (false)
+
+#if COVERAGE
+extern fn valk_cov_init_all() void;
+#end
+
+struct CovUnit {
+    next: ?ptr
+    meta: ptr
+    counts: ptr
+    count: uint
+}
+
+struct CovEntry {
+    file: ptr
+    func_name: ptr
+    line: u32
+    is_entry: u32
+}
+
+class CovFuncStat {
+    name: String
+    line: uint
+    hits: uint (0)
+}
+
+struct CovLineHit {
+    line: uint
+    hits: uint
+}
+
+class CovFileStat {
+    path: String
+    raw_lines: Array[CovLineHit] (.{})
+    funcs: HashMap[String, CovFuncStat] (.{})
+    has_stmt_lines: bool (false)
+}
+
+fn cov_cstr(p: ptr) String {
+    return p.@cast(cstring).to_string()
+}
+
+fn cov_pad_right(text: String, width: uint) String {
+    if text.bytes >= width : return text
+    let out = ByteBuffer.new(width)
+    out.write(text)
+    let i = text.bytes
+    while i < width {
+        out.write_byte(' ')
+        i++
+    }
+    return out.to_string()
+}
+
+fn cov_pad_left(text: String, width: uint) String {
+    if text.bytes >= width : return text
+    let out = ByteBuffer.new(width)
+    let pad = width - text.bytes
+    let i: uint = 0
+    while i < pad {
+        out.write_byte(' ')
+        i++
+    }
+    out.write(text)
+    return out.to_string()
+}
+
+fn cov_pct(hit: uint, total: uint) String {
+    if total == 0 : return "100.0%"
+    let pct = (hit.to(f64) * 100.0) / total.to(f64)
+    return pct.to_string(1, false) + "%"
+}
+
+fn cov_format_uncovered(merged: Array[CovLineHit]) String {
+    let parts = Array[String]{}
+    let i: uint = 0
+    while i < merged.length {
+        let entry = merged[i]
+        if entry.hits > 0 {
+            i++
+            continue
+        }
+        let start = entry.line
+        let end = entry.line
+        i++
+        while i < merged.length {
+            let nxt = merged[i]
+            if nxt.line == end + 1 && nxt.hits == 0 {
+                end = nxt.line
+                i++
+            } else {
+                break
+            }
+        }
+        if start == end : parts.append(start.to_string())
+        else : parts.append(start.to_string() + "-" + end.to_string())
+    }
+    return parts.join(", ")
+}
+
+fn cov_merge_lines(raw: Array[CovLineHit]) Array[CovLineHit] {
+    if raw.length == 0 : return Array[CovLineHit]{}
+    raw.sort(fn(a: CovLineHit, b: CovLineHit) bool { return a.line > b.line })
+    let merged = Array[CovLineHit].new(raw.length)
+    each raw as item {
+        if merged.length > 0 && merged[merged.length - 1].line == item.line {
+            let idx = merged.length - 1
+            merged[idx] = CovLineHit { line: item.line, hits: merged[idx].hits + item.hits }
+        } else {
+            merged.append(item)
+        }
+    }
+    return merged
+}
+
+// Writes the coverage summary to stdout and, when configured, an LCOV report file.
+fn cov_report() {
+    @unsafe
+    if cov_reported : return
+    cov_reported = true
+    #if COVERAGE
+    valk_cov_init_all()
+    #end
+    let node = cov_head
+    if !isset(node) : return
+
+    let files = HashMap[String, CovFileStat]{}
+    let file_order = Array[String]{}
+
+    // Pass 1: collect all statement and function entry hits per file
+    let cur = node
+    while isset(cur) {
+        let unit = @ptrv(cur, CovUnit)
+        let i: uint = 0
+        while i < unit.count {
+            let entry = @ptrv(unit.meta, CovEntry, i)
+            let hits = @ptrv(unit.counts, uint, i)
+            let path = cov_cstr(entry.file)
+            let fname = cov_cstr(entry.func_name)
+            let line = entry.line.to(uint)
+            let stat = files.get(path) !? <{
+                let created = CovFileStat { path: path }
+                files.set(path, created)
+                file_order.append(path)
+                return created
+            }
+            if entry.is_entry != 0 {
+                let key = fname + "@" + line
+                let fstat = stat.funcs.get(key) !? <{
+                    let created = CovFuncStat { name: fname, line: line }
+                    stat.funcs.set(key, created)
+                    return created
+                }
+                fstat.hits += hits
+            } else {
+                stat.has_stmt_lines = true
+                stat.raw_lines.append(CovLineHit { line: line, hits: hits })
+            }
+            i++
+        }
+        cur = unit.next
+    }
+
+    // Ensure empty functions (with no statement lines) still contribute their entry line
+    each file_order as path {
+        let stat = files.get(path) ! continue
+        if !stat.has_stmt_lines {
+            each stat.funcs as fstat {
+                stat.raw_lines.append(CovLineHit { line: fstat.line, hits: fstat.hits })
+            }
+        }
+    }
+
+    file_order.sort()
+
+    // Check CLI / env options for LCOV output and uncovered-line listing
+    let lcov_path = getenv("VALK_COVERAGE_FILE") !? ""
+    let show_uncovered = (getenv("VALK_COVERAGE_SHOW") !? "") == "1"
+    let args = cli_args
+    each args as arg, idx {
+        if arg == "--coverage-out" : lcov_path = args.get(idx + 1) !? ""
+        else if arg == "--coverage-uncovered" : show_uncovered = true
+    }
+
+    let lcov = lcov_path.length > 0 ? ByteBuffer.new(4096) : null
+    let total_lines: uint = 0
+    let hit_lines: uint = 0
+    let total_funcs: uint = 0
+    let hit_funcs: uint = 0
+
+    println("--------- COVERAGE ---------")
+    println(cov_pad_right("File", 36) + cov_pad_left("Lines", 12) + cov_pad_left("Funcs", 12) + cov_pad_left("Line %", 10))
+
+    each file_order as path {
+        let stat = files.get(path) ! continue
+        let merged = cov_merge_lines(stat.raw_lines)
+
+        let f_lines = merged.length
+        let f_hit_lines: uint = 0
+        each merged as item {
+            if item.hits > 0 : f_hit_lines++
+        }
+
+        let f_funcs = stat.funcs.length
+        let f_hit_funcs: uint = 0
+        each stat.funcs as fstat {
+            if fstat.hits > 0 : f_hit_funcs++
+        }
+
+        total_lines += f_lines
+        hit_lines += f_hit_lines
+        total_funcs += f_funcs
+        hit_funcs += f_hit_funcs
+
+        let label = path.bytes > 35 ? "..." + path.range(path.bytes - 32, 32) : path
+        let line_col = f_hit_lines.to_string() + "/" + f_lines
+        let func_col = f_hit_funcs.to_string() + "/" + f_funcs
+        println(cov_pad_right(label, 36) + cov_pad_left(line_col, 12) + cov_pad_left(func_col, 12) + cov_pad_left(cov_pct(f_hit_lines, f_lines), 10))
+
+        if show_uncovered && f_hit_lines < f_lines {
+            let miss = cov_format_uncovered(merged)
+            if miss.length > 0 : println("  uncovered: " + miss)
+        }
+
+        if isset(lcov) {
+            lcov.write("SF:" + path + "\n")
+            each stat.funcs as fstat {
+                lcov.write("FN:" + fstat.line + "," + fstat.name + "\n")
+            }
+            each stat.funcs as fstat {
+                lcov.write("FNDA:" + fstat.hits + "," + fstat.name + "\n")
+            }
+            lcov.write("FNF:" + f_funcs + "\n")
+            lcov.write("FNH:" + f_hit_funcs + "\n")
+            each merged as item {
+                lcov.write("DA:" + item.line + "," + item.hits + "\n")
+            }
+            lcov.write("LF:" + f_lines + "\n")
+            lcov.write("LH:" + f_hit_lines + "\n")
+            lcov.write("end_of_record\n")
+        }
+    }
+
+    println("----------------------------")
+    println(cov_pad_right("Total", 36) + cov_pad_left(hit_lines.to_string() + "/" + total_lines, 12) + cov_pad_left(hit_funcs.to_string() + "/" + total_funcs, 12) + cov_pad_left(cov_pct(hit_lines, total_lines), 10))
+    println("----------------------------")
+
+    if isset(lcov) && lcov_path.length > 0 {
+        fs.write(lcov_path, lcov.to_string()) ! println("Warning: failed to write coverage file: " + lcov_path)
+    }
+}

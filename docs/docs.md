@@ -71,6 +71,8 @@
 * [Compile macros](#compile-macros)
 * [Atomics](#atomics)
 * [Testing](#testing)
+* [Benchmarking](#benchmarking)
+* [Code coverage](#code-coverage)
 * [Debugging](#debugging)
 * [HTTP Client](#http-client)
 * [HTTP Server](#http-server)
@@ -146,6 +148,8 @@ fn main(args: Array[String]) {
 valk build ./src -o ./app                   # Compile a directory or .valk files
 valk build ./src -o ./app --run             # Compile, then run
 valk run ./src -- alice bob                 # Compile and run; program arguments go after --
+valk bench ./src                            # Build with --opt and run bench blocks
+valk build ./src --test --coverage --run    # Run tests and print line/function coverage
 valk build ./src -o ./app --run --watch     # Rebuild and restart when a file changes
 valk build ./src -o ./app --target win-x64  # Cross compile: linux-x64, linux-arm64, macos-x64, macos-arm64, win-x64
 valk build ./src -o ./app --release --cpu native  # Use this machine's CPU features (AVX2, ...); or a name like x86-64-v3
@@ -2681,6 +2685,36 @@ A failed comparison shows both sides, and the summary lists the failed tests:
 #1 [right] "Ada"
 #1 [file] tests/users.valk:12
 ```
+
+## Benchmarking
+
+Write benchmarks with `bench "name" { ... }` blocks alongside `test` blocks. Every `bench` block has an implicit `b: core.Bencher` parameter:
+
+```rust
+bench "simple sum" {
+    b.keep(sum_up(100))
+}
+
+bench "hash payload" {
+    let data = "hello world"
+    b.set_bytes(data.bytes)
+    while b.loop() {
+        b.keep(data.hash())
+    }
+}
+```
+
+Use `valk bench ./src` (which builds with `--bench --opt --run`) or `valk build ./src --bench --opt --run`. Pass `--filter "name"` to select benchmarks, and runtime flags after `--` such as `--bench-time 500` (ms per benchmark) or `--bench-iters 10000` (fixed iteration count).
+
+## Code coverage
+
+Pass `--coverage` when building tests or executables to instrument user-package source lines and functions and print a coverage summary on exit:
+
+```sh
+valk build ./src ./tests --test --coverage --run
+```
+
+Pass `--coverage-uncovered` (or `VALK_COVERAGE_SHOW=1`) to list uncovered line ranges per file, and `--coverage-out coverage.lcov` (or `VALK_COVERAGE_FILE=coverage.lcov`) to write an LCOV report for tools such as `genhtml` or editor plugins.
 
 ## Debugging
 

@@ -1692,5 +1692,81 @@ dw_out=$("$VALK" build "$dw_dir/warn/main.valk" --lint --no-warn --deny-warnings
     exit 1
 }
 
+echo ""
+echo "# Test bench and --coverage"
+"$VALK" fmt --check "$DIR/bench-and-coverage.valk" >/dev/null 2>&1 || {
+    echo "# bench-and-coverage.valk must be formatted cleanly"
+    exit 1
+}
+bench_out=$($TIMEOUT "$VALK" bench "$DIR/bench-and-coverage.valk" --no-warn -- --bench-iters 500 2>&1) || {
+    echo "# valk bench failed:"
+    echo "$bench_out"
+    exit 1
+}
+for needle in "BENCH RESULTS" "> simple sum" "> hash payload" "500 iters" "MB/s" "Benchmarks: 2"; do
+    if [[ "$bench_out" != *"$needle"* ]]; then
+        echo "# valk bench output is missing: $needle"
+        echo "$bench_out"
+        exit 1
+    fi
+done
+bench_filt=$($TIMEOUT "$VALK" bench "$DIR/bench-and-coverage.valk" --filter "payload" --no-warn -- --bench-iters 200 2>&1) || {
+    echo "# valk bench --filter failed:"
+    echo "$bench_filt"
+    exit 1
+}
+if [[ "$bench_filt" != *"> hash payload"* ]] || [[ "$bench_filt" == *"> simple sum"* ]] || [[ "$bench_filt" != *"Benchmarks: 1"* ]]; then
+    echo "# valk bench --filter did not select only matching benchmark:"
+    echo "$bench_filt"
+    exit 1
+fi
+combo_out=$("$VALK" build "$DIR/bench-and-coverage.valk" --test --bench 2>&1) && {
+    echo "# Combining --test and --bench must fail"
+    exit 1
+}
+if [[ "$combo_out" != *"Cannot combine --test and --bench"* ]]; then
+    echo "# Unexpected error for --test --bench:"
+    echo "$combo_out"
+    exit 1
+fi
+
+cov_lcov="$workdir/bench-and-coverage.lcov"
+cov_out=$($TIMEOUT "$VALK" build "$DIR/bench-and-coverage.valk" --test --coverage --run --no-warn -- --coverage-out "$cov_lcov" --coverage-uncovered 2>&1) || {
+    echo "# --test --coverage --run failed:"
+    echo "$cov_out"
+    exit 1
+}
+for needle in "COVERAGE" "11/14" "3/4" "78.6%" "uncovered: 3, 12-13"; do
+    if [[ "$cov_out" != *"$needle"* ]]; then
+        echo "# --test --coverage output is missing: $needle"
+        echo "$cov_out"
+        exit 1
+    fi
+done
+if [ ! -f "$cov_lcov" ]; then
+    echo "# Expected LCOV file to be written: $cov_lcov"
+    exit 1
+fi
+lcov_text=$(cat "$cov_lcov")
+for needle in "SF:" "FN:1,main.classify" "FNDA:2,main.classify" "FN:11,main.unused_helper" "FNDA:0,main.unused_helper" "FN:16,main.identity" "FNDA:2,main.identity" "DA:3,0" "DA:24,5" "LF:14" "LH:11" "end_of_record"; do
+    if [[ "$lcov_text" != *"$needle"* ]]; then
+        echo "# LCOV output is missing: $needle"
+        echo "$lcov_text"
+        exit 1
+    fi
+done
+cov_rel=$($TIMEOUT "$VALK" build "$DIR/bench-and-coverage.valk" --release --test --coverage --run --no-warn -- --coverage-uncovered 2>&1) || {
+    echo "# --release --test --coverage --run failed:"
+    echo "$cov_rel"
+    exit 1
+}
+for needle in "COVERAGE" "11/14" "3/4" "78.6%" "uncovered: 3, 12-13"; do
+    if [[ "$cov_rel" != *"$needle"* ]]; then
+        echo "# --release --test --coverage output is missing: $needle"
+        echo "$cov_rel"
+        exit 1
+    fi
+done
+
 echo "# CLI tests passed"
-echo "# Test count: 87"
+echo "# Test count: 93"

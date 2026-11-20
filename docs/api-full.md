@@ -1443,6 +1443,71 @@ Returns the sum of the elements, or 0 when the array is empty.
 Available on arrays of non-nullable integers and floats.
 
 ```js
+// Controls timing and iteration inside a `bench "..." { ... }` block.
++ class Bencher {
+    // Optional bytes processed per iteration, set via `set_bytes`.
+    ~ bytes_per_op: uint
+    // Completed iterations measured so far.
+    ~ iters: uint
+
+    // Prevents the optimizer from dead-code-eliminating `value`.
+    + fn keep[T](value: T) void
+    // Drives the timed benchmark loop, returning `true` while more iterations are needed.
+    + fn loop() bool
+    // Resets the elapsed timer and iteration count to zero.
+    + fn reset_timer() void
+    // Records how many bytes each iteration processes, enabling throughput reporting (`MB/s`).
+    + fn set_bytes(bytes: uint) void
+    // Resumes the benchmark timer after `stop_timer`.
+    + fn start_timer() void
+    // Pauses the benchmark timer until `start_timer` is called.
+    + fn stop_timer() void
+}
+```
+
+### Bencher
+
+Controls timing and iteration inside a `bench "..." { ... }` block.
+
+The compiler binds `b: Bencher` automatically inside every `bench` block. Either write
+the benchmarked code directly for automatic iteration, or drive the loop explicitly with
+`while b.loop() { ... }` after any one-time setup.
+
+#### bytes_per_op
+
+Optional bytes processed per iteration, set via `set_bytes`.
+
+#### iters
+
+Completed iterations measured so far.
+
+#### keep
+
+Prevents the optimizer from dead-code-eliminating `value`.
+
+#### loop
+
+Drives the timed benchmark loop, returning `true` while more iterations are needed.
+
+Code before the first `b.loop()` call runs once as setup and is excluded from timing.
+
+#### reset_timer
+
+Resets the elapsed timer and iteration count to zero.
+
+#### set_bytes
+
+Records how many bytes each iteration processes, enabling throughput reporting (`MB/s`).
+
+#### start_timer
+
+Resumes the benchmark timer after `stop_timer`.
+
+#### stop_timer
+
+Pauses the benchmark timer until `start_timer` is called.
+
+```js
 // A growable byte buffer for building binary or text data in memory.
 + class ByteBuffer is Writer {
     // Pointer to the first byte of the buffer's storage.
