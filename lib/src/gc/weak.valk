@@ -1,0 +1,182 @@
+use mem
+
+// Ownership bits on WeakCell.state: one for the Weak[T] object and one for the GC weak list.
+// Each side clears its hold with an atomic OR; whichever sets the second bit frees the cell.
+value WEAK_OWNER_GONE (1)
+value WEAK_UNLISTED (2)
+
+struct WeakCell {
+    target: uint
+    state: uint
+}
+
+fn weak_cell_new(raw: uint) *WeakCell {
+    @unsafe
+    let data = gcdata(raw.@cast(ptr))
+    #if GC_DEBUG
+    if isset(region_of(raw.@cast(ptr))) : panic("Weak[T] target is in a region")
+    if @ptrv(raw.@cast(ptr) - 8, uint) == REGION_HEADER_STACK : panic("Weak[T] target is in a frame")
+    #end
+    let cell = mem.new[WeakCell](.{
+        target: raw
+        state: data.offset == 0 ? WEAK_UNLISTED : 0
+    })
+    if data.offset > 0 {
+        if data.is_shared() {
+            gc.shared_weak_cells.add_ptr(cell.@cast(ptr))
+        } else {
+            gc.weak_cells.add_ptr(cell.@cast(ptr))
+        }
+    }
+    return cell
+}
+
+fn weak_cell_unlist(cell: *WeakCell) $inline {
+    @unsafe
+    let prev = atomic(cell.state | WEAK_UNLISTED)
+    if (prev & WEAK_OWNER_GONE) != 0 : mem.free(cell)
+}
+
+fn weak_cell_release_owner(cell: *WeakCell) $inline {
+    @unsafe
+    atomic_store(cell.target, 0)
+    let prev = atomic(cell.state | WEAK_OWNER_GONE)
+    if (prev & WEAK_UNLISTED) != 0 : mem.free(cell)
+}
+
+// Sweeps a shared weak list under STW after shared marking and before sweeping or unlocking.
+fn sweep_shared_weak_list(list: *Bump) {
+    @unsafe
+    if list.index == 0 : return
+    let base = list.data
+    let end = base + list.index
+    let read = base
+    let write = base
+    while read < end {
+        let cell = @ptrv(read, *WeakCell)
+        read = read.$offset(size_of(ptr))
+        let raw = atomic_load(cell.target)
+        if raw == 0 || (atomic_load(cell.state) & WEAK_OWNER_GONE) != 0 {
+            atomic_store(cell.target, 0)
+            weak_cell_unlist(cell)
+            continue
+        }
+        let data = gcdata(raw.@cast(ptr))
+        if !data.is_marked() {
+            atomic_store(cell.target, 0)
+            weak_cell_unlist(cell)
+            continue
+        }
+        @ptrv(write, *WeakCell) = cell
+        write = write.$offset(size_of(ptr))
+    }
+    list.index = write - base
+}
+
+fn sweep_all_shared_weak_cells(gcs: Array[*Gc]) {
+    each gcs as gcx : sweep_shared_weak_list(gcx.shared_weak_cells)
+    sweep_shared_weak_list(shared_dump_weak_cells)
+}
+
+/// A non-owning weak reference to a garbage-collected object `T`.
+///
+/// Holding a `Weak[T]` does not keep its target alive. Once the target is collected
+/// (or `clear()` is called), `get()` returns `null` and `is_alive` is `false`.
+///
+/// `T` must be a non-nullable class or array type. Use `Weak[atomic T]` for weak
+/// references shared across threads.
+///
+/// ```valk
+/// class CacheEntry {
+///     name: String
+/// }
+///
+/// let item: ?CacheEntry = CacheEntry { name: "a" }
+/// let weak = Weak[CacheEntry].new(item)
+/// let hit = weak.get()
+/// ```
++ class Weak[T] $global {
+    - cell: ?*WeakCell (null)
+
+    /// Creates a weak reference to `target`.
+    + static fn new(target: T) SELF {
+        @unsafe
+        let raw = target.@cast(ptr).@cast(uint)
+        return SELF { cell: weak_cell_new(raw) }
+    }
+
+    /// Creates an empty weak reference whose `get()` returns `null`.
+    ///
+    /// Marked `$default`: it also provides the type's default value.
+    + static fn empty() SELF $default {
+        return SELF { cell: null }
+    }
+
+    fn raw_target() uint $inline {
+        @unsafe
+        let cell = this.cell ?! return 0
+        return atomic_load(cell.target)
+    }
+
+    #if T.$is_shared
+    /// Returns the target object if it is still alive, or `null` if it was collected or cleared.
+    + fn get() ?T @threadsafe {
+        @unsafe
+        let raw = this.raw_target()
+        if raw == 0 : return null
+        return raw.@cast(ptr).@cast(T)
+    }
+
+    /// Whether the target object has not yet been collected or cleared.
+    + get is_alive: bool @threadsafe {
+        return this.raw_target() != 0
+    }
+
+    /// Clears this weak reference so subsequent `get()` calls return `null`.
+    + fn clear() @threadsafe {
+        @unsafe
+        let cell = this.cell ?! return
+        atomic_store(cell.target, 0)
+    }
+
+    /// Returns a new independent weak reference to the same target, or an empty one if cleared.
+    + fn clone() SELF $clone @threadsafe {
+        let target = this.get()
+        if isset(target) : return SELF.new(target)
+        return SELF.empty()
+    }
+    #else
+    /// Returns the target object if it is still alive, or `null` if it was collected or cleared.
+    + fn get() ?T {
+        @unsafe
+        let raw = this.raw_target()
+        if raw == 0 : return null
+        return raw.@cast(ptr).@cast(T)
+    }
+
+    /// Whether the target object has not yet been collected or cleared.
+    + get is_alive: bool {
+        return this.raw_target() != 0
+    }
+
+    /// Clears this weak reference so subsequent `get()` calls return `null`.
+    + fn clear() {
+        @unsafe
+        let cell = this.cell ?! return
+        atomic_store(cell.target, 0)
+    }
+
+    /// Returns a new independent weak reference to the same target, or an empty one if cleared.
+    + fn clone() SELF $clone {
+        let target = this.get()
+        if isset(target) : return SELF.new(target)
+        return SELF.empty()
+    }
+    #end
+
+    fn gc_free() @threadsafe {
+        @unsafe
+        let cell = this.cell ?! return
+        weak_cell_release_owner(cell)
+    }
+}

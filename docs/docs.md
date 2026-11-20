@@ -39,6 +39,7 @@
 * [Modes](#modes)
 * [Traits](#traits)
 * [Finalizers](#finalizers)
+* [Weak references](#weak-references)
 * [Globals](#globals)
 * [Aliases](#aliases)
 * [Documentation comments](#documentation-comments)
@@ -1561,6 +1562,26 @@ Finalization order is unspecified. A finalizer must not access other
 GC-managed objects or acquire locks, and shared finalizers may run on any
 collecting thread. Use an explicit operation such as `close()` for deterministic
 or ordered cleanup.
+
+
+## Weak references
+
+A `Weak[T]` holds a non-owning reference to a garbage-collected object (`class` or `Array[T]`), useful for caches, interning tables, and observer lists. Holding a weak reference does not keep its target alive:
+
+```rust
+class Item {
+    name: String
+}
+
+let item: ?Item = Item { name: "a" }
+let weak = Weak[Item].new(item)
+
+let hit = weak.get() // ?Item (returns the item while alive, or null once collected)
+let ok = weak.is_alive
+weak.clear()         // manually detach without affecting the target
+```
+
+Use `Weak[Item].empty()` (or `Weak[Item]{}`) for an empty weak reference. For weak references shared across threads, wrap an `atomic` target: `Weak[atomic Item]`.
 
 
 ## Globals

@@ -3143,6 +3143,26 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 + fn unlock() void
 ```
 
+## Classes for 'gc'
+
+```js
+// A non-owning weak reference to a garbage-collected object `T`.
++ class Weak[T] {
+    // Clears this weak reference so subsequent `get()` calls return `null`.
+    + fn clear() void
+    // Returns a new independent weak reference to the same target, or an empty one if cleared.
+    + fn clone() Weak[T]
+    // Creates an empty weak reference whose `get()` returns `null`.
+    + static fn empty() Weak[T]
+    // Returns the target object if it is still alive, or `null` if it was collected or cleared.
+    + fn get() ?T
+    // Whether the target object has not yet been collected or cleared.
+    + get is_alive: bool
+    // Creates a weak reference to `target`.
+    + static fn new(target: T) Weak[T]
+}
+```
+
 ## Globals for 'gc'
 
 ```js

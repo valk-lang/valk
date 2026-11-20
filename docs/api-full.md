@@ -10650,6 +10650,72 @@ Releases the calling thread's GC lock so other threads can collect for it while 
 Call it before a blocking operation and `lock` right after. The current stack pointer and
 registers are saved for those collections; do not touch GC memory in between.
 
+## Classes for 'gc'
+
+```js
+// A non-owning weak reference to a garbage-collected object `T`.
++ class Weak[T] {
+    // Clears this weak reference so subsequent `get()` calls return `null`.
+    + fn clear() void
+    // Returns a new independent weak reference to the same target, or an empty one if cleared.
+    + fn clone() Weak[T]
+    // Creates an empty weak reference whose `get()` returns `null`.
+    + static fn empty() Weak[T]
+    // Returns the target object if it is still alive, or `null` if it was collected or cleared.
+    + fn get() ?T
+    // Whether the target object has not yet been collected or cleared.
+    + get is_alive: bool
+    // Creates a weak reference to `target`.
+    + static fn new(target: T) Weak[T]
+}
+```
+
+### Weak
+
+A non-owning weak reference to a garbage-collected object `T`.
+
+Holding a `Weak[T]` does not keep its target alive. Once the target is collected
+(or `clear()` is called), `get()` returns `null` and `is_alive` is `false`.
+
+`T` must be a non-nullable class or array type. Use `Weak[atomic T]` for weak
+references shared across threads.
+
+```valk
+class CacheEntry {
+    name: String
+}
+
+let item: ?CacheEntry = CacheEntry { name: "a" }
+let weak = Weak[CacheEntry].new(item)
+let hit = weak.get()
+```
+
+#### clear
+
+Clears this weak reference so subsequent `get()` calls return `null`.
+
+#### clone
+
+Returns a new independent weak reference to the same target, or an empty one if cleared.
+
+#### empty
+
+Creates an empty weak reference whose `get()` returns `null`.
+
+Marked `$default`: it also provides the type's default value.
+
+#### get
+
+Returns the target object if it is still alive, or `null` if it was collected or cleared.
+
+#### is_alive
+
+Whether the target object has not yet been collected or cleared.
+
+#### new
+
+Creates a weak reference to `target`.
+
 ## Globals for 'gc'
 
 ```js
