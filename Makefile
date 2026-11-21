@@ -2,7 +2,7 @@
 .DEFAULT_GOAL := valk
 .DELETE_ON_ERROR:
 
-VERSION := 0.9.0
+VERSION := 0.9.1
 
 SRC := $(wildcard src/*.valk src/*/*.valk)
 LIB_SRC := $(wildcard lib/src/*.valk lib/src/*/*.valk lib/src/*/*/*.valk lib/src/*/*/*/*.valk)
@@ -176,12 +176,12 @@ test-doc: $(TEST_COMPILER)
 test-examples: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) bash ./tests/examples/run.sh
 
-# The public stdlib API must stay a superset of the last stable release (0.8.0: baseline taken from ./lib on 2026-10-23)
+# The public stdlib API must stay a superset of the last stable release (0.9.0)
 test-api-compat: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) bash ./tests/api-compat/run.sh
 
 # Records the installed release STABLE as the API baseline; run after a stable release
-STABLE ?= 0.8.0
+STABLE ?= 0.9.0
 api-baseline: valk
 	mkdir -p ./debug
 	./valk doc $(HOME)/.vman/versions/$(STABLE)/lib --stdlib $(HOME)/.vman/versions/$(STABLE)/lib -o ./debug/api-stable.json --no-private --target linux-x64

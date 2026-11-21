@@ -475,12 +475,10 @@ for target in linux-x64 linux-arm64 macos-x64 macos-arm64 win-x64; do
     fi
 done
 
-echo "> The standard library lints without warnings"
+echo "> The compiler and standard library lint without warnings"
 repo_root="$(cd "$DIR/../.." && pwd)"
-# Note: src/ keeps 4 legacy `error` declarations in 0.9.0 so 0.8.10 can bootstrap it;
-# re-add `default lld` here once 0.9.1 switches src/ to union errors against 0.9.0.
 for target in linux-x64 linux-arm64 macos-x64 macos-arm64 win-x64; do
-    for mode in stdlib; do
+    for mode in default lld stdlib; do
         case "$mode" in
             default) clean_lint=$("$VALK" build "$repo_root" --lint --target "$target" 2>&1) ;;
             lld) clean_lint=$("$VALK" build "$repo_root" --lint --def "LLD=1" --target "$target" 2>&1) ;;
