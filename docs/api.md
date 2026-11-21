@@ -35,8 +35,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 ## Enums for 'compress'
 
 ```js
-// A compressed data format; all three carry the same DEFLATE data.
-+ enum Format { deflate, zlib, gzip }
+// A compressed data format.
++ enum Format { deflate, zlib, gzip, zstd }
 ```
 
 ## Functions for 'compress'
@@ -611,13 +611,13 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn keep[T](value: T) void
     // Drives the timed benchmark loop, returning `true` while more iterations are needed.
     + fn loop() bool
-    // Resets the elapsed timer and iteration count to zero.
+    // Resets the elapsed timer, allocation counters, and iteration count to zero.
     + fn reset_timer() void
     // Records how many bytes each iteration processes, enabling throughput reporting (`MB/s`).
     + fn set_bytes(bytes: uint) void
-    // Resumes the benchmark timer after `stop_timer`.
+    // Resumes the benchmark timer and allocation tracking after `stop_timer`.
     + fn start_timer() void
-    // Pauses the benchmark timer until `start_timer` is called.
+    // Pauses the benchmark timer and allocation tracking until `start_timer` is called.
     + fn stop_timer() void
 }
 ```
@@ -3296,6 +3296,8 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 ```js
 // Allocates `size` bytes of GC memory whose contents are not scanned for references.
 + fn alloc(size: uint) GcPtr
+// Returns cumulative `(bytes, count)` of GC heap allocations on the calling thread.
++ fn alloc_stats() (uint, uint)
 // Allocates `size` bytes of GC memory whose references are traced through `layout`.
 + fn alloc_typed(size: uint, layout: ?ptr) GcPtr
 // Allocates `size` zeroed bytes of GC memory whose references are traced through `layout`.
