@@ -5,6 +5,7 @@
 
 ```
 - Release 0.9.1
++ Fix (compiler): prevent transient union-error TLS transport slots from leaking into `#loop globals` / global GC root validation when a `global` initializer calls a function with a multi-payload union error (such as `json.ParseError`)
 
 + Release 0.9.0
 + Breaking (language): replaced `error` declarations, `extends`, `payload`, and `error_is(...)` with named tagged `union` errors (`fn f() T !MyUnion`) using the out-of-band error ABI and `$auto` variant wrapping (`!>` / `throw` auto-wrap via direct or transitive `$auto` variants)
