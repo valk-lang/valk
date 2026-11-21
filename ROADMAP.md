@@ -4,7 +4,7 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.9.1
++ Release 0.9.1
 + Fix (compiler): prevent transient union-error TLS transport slots from leaking into `#loop globals` / global GC root validation when a `global` initializer calls a function with a multi-payload union error (such as `json.ParseError`)
 
 + Release 0.9.0
