@@ -21,10 +21,10 @@ value H2_FAIL_INVALID_RESPONSE (5)
 value H2_FAIL_TOO_LARGE (6)
 
 fn h2_throw_fail(kind: u8) !HttpError {
-    if kind == H2_FAIL_CLOSED : throw .closed
-    if kind == H2_FAIL_READ : throw .read
-    if kind == H2_FAIL_WRITE : throw .write
-    if kind == H2_FAIL_TIMEOUT : throw .timeout
+    if kind == H2_FAIL_CLOSED : throw .io(.closed)
+    if kind == H2_FAIL_READ : throw .io(.read)
+    if kind == H2_FAIL_WRITE : throw .io(.write)
+    if kind == H2_FAIL_TIMEOUT : throw .io(.timeout)
     if kind == H2_FAIL_TOO_LARGE : throw .response_too_large
     throw .invalid_response
 }
@@ -142,20 +142,20 @@ class H2ClientConnection {
     fn write_bytes(data: local &[u8], timeout_ms: uint) !HttpError {
         this.lock_write()
         defer this.unlock_write()
-        if this.closed : throw .closed
+        if this.closed : throw .io(.closed)
         this.con.set_timeouts(H2_CLIENT_READ_SLICE_MS, timeout_ms)
         let view = data
         while view.length > 0 {
             // Frames cut off halfway leave nothing else to say on this connection
             let n = this.con.write(view) ! {
                 this.close_internal(false)
-                if error_is(E.code, timeout) : throw .timeout
-                if error_is(E.code, closed) || error_is(E.code, cancelled) : throw .closed
-                throw .write
+                if E == .timeout : throw .io(.timeout)
+                if E == .closed || E == .cancelled : throw .io(.closed)
+                throw .io(.write)
             }
             if n == 0 || n > view.length {
                 this.close_internal(false)
-                throw .write
+                throw .io(.write)
             }
             view = view.view(n, view.length - n)
         }
@@ -216,7 +216,7 @@ class H2ClientConnection {
             let buf = this.recv_buf.view_spare(16_393)
             let n = this.con.read(buf) ! {
                 if this.closed : break
-                if error_is(E.code, timeout) {
+                if E == .timeout {
                     if this.streams.length == 0 && this.idle_timeout_ms > 0 {
                         if time.mono_ms() - this.last_activity_ms >= this.idle_timeout_ms {
                             this.close()
@@ -225,7 +225,7 @@ class H2ClientConnection {
                     }
                     continue
                 }
-                if error_is(E.code, closed) || error_is(E.code, cancelled) {
+                if E == .closed || E == .cancelled {
                     this.fail_all(H2_FAIL_CLOSED, true)
                     break
                 }
@@ -248,7 +248,7 @@ class H2ClientConnection {
         let reader = ByteReader.new(this.recv_buf)
         while !this.closed {
             let frame = h2_read_frame(reader, 16_384) ! {
-                if error_is(E.code, incomplete) : break
+                if E == .incomplete : break
                 if reader.pos > 0 : this.recv_buf.clear_until(reader.pos)
                 throw .invalid_response
             }
@@ -572,7 +572,7 @@ class H2ClientConnection {
 
         let stream_id = this.next_stream_id
         this.next_stream_id += 2
-        let waker = sync.Waker.new() ! throw .write
+        let waker = sync.Waker.new() ! throw .io(.write)
         let st = H2ClientStream {
             id: stream_id,
             waker: waker,
@@ -600,7 +600,8 @@ class H2ClientConnection {
         }
         this.write_bytes(head_out.view(), write_timeout) ! {
             this.streams.remove(stream_id)
-            if idempotent && (error_is(E.code, closed) || error_is(E.code, write)) : return null
+            let io_err = E.io_error()
+            if idempotent && (io_err == .closed || io_err == .write) : return null
             throw E
         }
 
@@ -610,14 +611,15 @@ class H2ClientConnection {
                 this.streams.remove(stream_id)
                 this.send_rst_stream(stream_id, 8)
                 if st.unprocessed : return null
-                if idempotent && (error_is(E.code, closed) || error_is(E.code, write)) : return null
+                let io_err = E.io_error()
+                if idempotent && (io_err == .closed || io_err == .write) : return null
                 throw E
             }
         }
 
         // Wait for stream completion (or timeout / failure)
         while !st.done {
-            if this.closed : throw .closed
+            if this.closed : throw .io(.closed)
             let wait_ms = ClientRequest.remaining_timeout(deadline_ms, read_timeout_ms) ! {
                 this.streams.remove(stream_id)
                 this.send_rst_stream(stream_id, 8)
@@ -626,7 +628,7 @@ class H2ClientConnection {
             if !st.waker.wait(wait_ms) && !st.done {
                 this.streams.remove(stream_id)
                 this.send_rst_stream(stream_id, 8)
-                throw .timeout
+                throw .io(.timeout)
             }
         }
 
@@ -652,17 +654,17 @@ class H2ClientConnection {
         while pos < total {
             while !this.closed && !st.done && (this.send_window <= 0 || st.send_window <= 0) {
                 let wait_ms = ClientRequest.remaining_timeout(deadline_ms, write_timeout_ms) !>
-                let waiter = sync.Waker.new() ! throw .write
+                let waiter = sync.Waker.new() ! throw .io(.write)
                 if this.send_window <= 0 {
                     this.window_waiters.append(waiter)
                 } else {
                     st.send_window_waiters.append(waiter)
                 }
                 if !waiter.wait(wait_ms) {
-                    if this.send_window <= 0 || st.send_window <= 0 : throw .timeout
+                    if this.send_window <= 0 || st.send_window <= 0 : throw .io(.timeout)
                 }
             }
-            if this.closed : throw .closed
+            if this.closed : throw .io(.closed)
             if st.done : h2_throw_fail(st.fail_kind != H2_FAIL_NONE ? st.fail_kind : H2_FAIL_CLOSED) !>
 
             let avail_conn = this.send_window.to(uint)
@@ -681,7 +683,7 @@ class H2ClientConnection {
                 flags: end_stream ? 1 : 0,
                 stream: st.id,
                 payload: body.range(pos, chunk),
-            }.encode_into(frame_buf, max_frame) ! throw .write
+            }.encode_into(frame_buf, max_frame) ! throw .io(.write)
 
             this.send_window -= chunk.to(int)
             st.send_window -= chunk.to(int)
@@ -795,12 +797,12 @@ fn h2_decompress_response(resp: ClientResponse, max_body_size: uint) !HttpError 
     if resp.body.bytes > 0 {
         if is_zstd {
             resp.body = compress.unzstd(resp.body, max_body_size) ! {
-                if error_is(E.code, too_large) : throw .response_too_large
+                if E == .too_large : throw .response_too_large
                 throw .invalid_response
             }
         } else {
             resp.body = compress.gunzip(resp.body, max_body_size) ! {
-                if error_is(E.code, too_large) : throw .response_too_large
+                if E == .too_large : throw .response_too_large
                 throw .invalid_response
             }
         }
@@ -921,13 +923,13 @@ fn send_h2_fresh(method: String, raw_url: String, u: url.Url, port: u16, is_http
         if isset(res) : return res
         h2_remove_pooled(client, key, h2c)
         h2c.close()
-        throw .closed
+        throw .io(.closed)
     }
     let res = h2c.execute(method, u, options, deadline_ms) ! {
         h2c.close()
         throw E
     }
     h2c.close()
-    return res ?! throw .closed
+    return res ?! throw .io(.closed)
 }
 

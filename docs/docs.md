@@ -1004,17 +1004,15 @@ defer {
 
 ### Errors
 
-Functions can return errors using `throw`. But first you need to define an error type or you can use one of the built-in ones.
+Functions can return errors using `throw`. Error types are named `union` types — either one of the built-in ones or your own.
 
-An error type must provide at least one error code or extend at least one existing error type. Payload fields can carry additional error data. Each field may declare an explicit default with the same `(value)` syntax used for class properties and function arguments.
+Each variant can carry payload values, and variants wrapping another error union can be marked `$auto` so `!>` and `throw` wrap them automatically:
 
 ```rust
-error {Error type name} ({codes}) [extends ({error types})] [payload { {field-name}: {type} [(default)] }]
-// Example
-error MyError (invalid_input, missing_key) extends (LookupError) payload {
-    message: String
-    key: Key
-    detail: String ("")
++ union MyError {
+    invalid_input(String)
+    missing_key(String, Key)
+    lookup(LookupError) $auto
 }
 ```
 
@@ -1022,35 +1020,26 @@ Usage:
 
 ```rust
 fn find_value(key: Key) Value !MyError {
-    //...
-    // Required payload fields must be set; fields with an explicit default may be omitted.
-    throw .missing_key { message: "Key not found", key: key }
-    //...
+    // ...
+    throw .missing_key("Key not found", key)
+    // ...
+}
+
+fn load_value(map: Map[Value], key: String) Value !MyError {
+    // `!>` automatically wraps `LookupError` into `MyError.lookup(e)` via `$auto`
+    return map.get(key) !>
 }
 ```
-
-When rethrowing inside an error handler, omitted fields that already exist on a
-compatible caught `E` are passed through.
-
-Pure pass (`!>` / the default pass) keeps the original error code and payload. If
-the caller error type adds **required** payload fields (no explicit default) that
-the callee does not have, the pass is a compile error — set them with a rethrow:
-
-```rust
-inner() ! throw E { detail: "missing on the inner error" }
-```
-
-Fields with an explicit payload default may still be omitted on both throw and pass.
 
 Built-in error types:
 
 ```rust
-AnError (error) // Generic error
-SystemError (failed, unsupported) // For when the operating system cannot answer a query, such as the number of CPU cores
-IterError (end) // You can end an 'each' loop with any error or you can use this one
-InitError (init) // Common error
-LookupError (missing, exists, range, empty) // For when a function needs to find or store something
-SyntaxError (syntax) // Common error
+union GenericError { error } // Generic error
+union SystemError { failed, unsupported } // OS query failures
+union IterError { end } // End an 'each' loop
+union InitError { init } // Initialization failure
+union LookupError { missing, exists, range, empty } // Lookups and collections
+union SyntaxError { syntax } // Parsing failures
 ```
 
 ### Error handling
@@ -1069,7 +1058,7 @@ let v = my_func() ! { print("error"); return }
 let v = my_func() !? <{ log("failed"); throw .failed }
 // ! You can also use a single line
 let v = my_func() ! return
-// !> pass the error to the parent caller
+// !> pass the error to the parent caller (auto-wrapping via `$auto` when needed)
 let v = my_func() !>
 // _ Ignore the error, but the return type/value is always `void`
 my_func() _
@@ -1098,33 +1087,26 @@ A handler written as a block takes the first block, and the body follows as a se
 `while value() ! { ... } { ... }`. In a `while` condition the handler may `break` or `continue`
 the loop.
 
-You can access all error information with the `E` identifier. `E.code` contains the error code that was thrown. `error_is(E.code, name)` compares against one or more bare code names and is the same as `E.code == E.name`:
+Inside an error handler, `E` is the thrown union value. Compare variants directly with `==` or destructure them with `match`:
 
 ```rust
 "x".to_int() ! {
-    if error_is(E.code, syntax) : println("not a number")
+    if E == .syntax : println("not a number")
 }
 ```
 
 ```rust
 fn main() {
     my_func() ! {
-        // Checking the error code using `if`
-        if E.code == E.fail : println("Error code `fail` was thrown")
-        // Using 'match'
-        match E.code {
-            E.fail => println("Error code `fail` was thrown")
-            E.nope => println("Error code `nope` was thrown")
-            default => println("Another error was thrown") // Only required if not all codes were checked (compiler will tell)
+        if E == .fail : println("`fail` was thrown")
+        match E {
+            .fail => println("`fail` was thrown")
+            .invalid_input(msg) => println("Invalid input: " + msg)
+            default => println("Another error was thrown")
         }
-        // Payload data
-        println(E.message)
     }
 }
 ```
-
-An error code turns into its name as text, like an enum: `E.code.name()`,
-`"failed: " + E.code` and `%{E.code}` all give `fail`.
 
 ### Throw functions
 
@@ -1133,23 +1115,17 @@ Throw functions centralize repeated error construction. They are ordinary error-
 Example
 
 ```rust
-error ParseError (invalid) payload {
-    message: String
-    line: uint
-    col: uint
+union ParseError {
+    invalid(String, uint, uint)
 }
 
 fn parse_error(parser: MyParser, message: String) !ParseError $throw {
-    throw .invalid {
-        message: message
-        line: parser.location.line
-        col: parser.location.col
-    }
+    throw .invalid(message, parser.location.line, parser.location.col)
 }
 
 fn parse() !ParseError {
     // ...
-    if something: parse_error(p, "This should not happen")
+    if something : parse_error(p, "This should not happen")
     // ...
 }
 ```
@@ -2422,7 +2398,7 @@ thread. A blocked `send` or `recv` given the token ends with `cancelled`:
 let stop: sync.CancelToken = sync.CancelToken.new() ! panic("init")
 stop.cancel_after(500)
 let value = queue.recv(0, stop) ! {
-    if error_is(E.code, cancelled) : println("gave up")
+    if E == .cancelled : println("gave up")
     return
 }
 ```
@@ -2437,7 +2413,7 @@ let con = listener.accept(3000) ! return
 con.set_cancel(stop)
 let buffer = [u8]{ 0 x 1024 }
 let bytes = con.read(buffer) ! {
-    if error_is(E.code, cancelled) : println("cancelled")
+    if E == .cancelled : println("cancelled")
     con.close() ! {}
     return
 }
@@ -3107,7 +3083,7 @@ fn server() {
         // Handle connection (normally you do this on a separate coroutine so you can keep accepting new connections)
         while true {
             let bytes = con.read(buffer) ! {
-                if error_is(E.code, closed) : break // Connection closed
+                if E == .closed : break // Connection closed
                 println("# Server failed to read from connection")
                 break
             }

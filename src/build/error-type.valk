@@ -25,14 +25,151 @@ class ErrorType {
     payload_defaults: Map[Exp] (.{})
     // Thread-local transport storage used by the error ABI.
     payload_globals: Map[Global] (.{})
+    // When backed by a named tagged union (`fn f() T !MyUnion`)
+    union_type: ?Type (null)
+    union_has_payload: bool (false)
+    union_global: ?Global (null)
     // parse_error_type bookkeeping (handles circular extends)
     parsing: bool (false)
     parsed: bool (false)
 
     fn is_compat(with: ErrorType) bool {
         if this == with : return true
+        if isset(this.union_type) || isset(with.union_type) : return false
         return this.extends.contains(with)
     }
+}
+
+class UnionWrapStep {
+    union_type: Type
+    variant: UnionVariant
+}
+
+// Adapts a named tagged union into an ErrorType so it flows through function,
+// closure, fnptr, and coroutine signatures with the out-of-band error ABI.
+fn error_type_for_union(union_t: Type) ErrorType !Error {
+    let c = union_t.get_class_or_null() ?! union_t.build.bug("Named union error is missing its Class")
+    let cached = c.error_adapter
+    if isset(cached) : return cached
+
+    let variants = c.union_variants ?! c.exp.bug("Named union is missing its variants")
+    let codes = Array[String]{}
+    let has_payload = false
+    each variants as v {
+        codes.append(v.name)
+        if v.payload_types.length > 0 : has_payload = true
+    }
+
+    let uglobal: ?Global = null
+    if has_payload {
+        let g = Global {
+            unit: c.unit
+            ns: c.ns
+            name: "__error_union_" + c.unit.name + "_" + c.name + "_" + c.exp.i
+            act: ACT.private
+            kind: GLOBAL_KIND.global
+            scope: c.scope
+            exp: c.exp
+            shared: false
+            allow_unsafe: true
+            type: union_t
+        }
+        // Only in unit.globals (not build.lists.globals): the slot is strictly transient
+        // between `store; ret` and the caller's immediate `load` into a GC-rooted stack slot.
+        c.unit.globals.append(g)
+        uglobal = g
+    }
+
+    let adapter = ErrorType {
+        unit: c.unit
+        ns: c.ns
+        name: c.pretty_name()
+        act: c.act
+        exp: c.exp
+        scope: c.scope
+        codes: codes
+        own_code_count: codes.length
+        union_type: union_t
+        union_has_payload: has_payload
+        union_global: uglobal
+        parsed: true
+    }
+    c.error_adapter = adapter
+    return adapter
+}
+
+fn resolve_error_type_from_id(err_exp: Exp, scope: Scope) ErrorType !Error {
+    let idf = resolve_idf_from_id(err_exp, scope) !>
+    if idf.type == IDF.error_type {
+        let etype = idf.error_type
+        if !isset(etype) : err_exp.bug("Error-type idf is missing error_type")
+        return etype
+    }
+    if idf.type == IDF.class {
+        let c = idf.class ?! err_exp.bug("Class idf is missing class")
+        if c.kind == CLASS_KIND.union && c.is_named_union {
+            if c.is_generic_base : err_exp.error("Generic union '" + c.pretty_name() + "' cannot be used as an error type without type arguments")
+            let ut = c.get_type() !>
+            return error_type_for_union(ut) !>
+        }
+    }
+    if idf.type == IDF.type {
+        let t = idf.of_type
+        if isset(t) {
+            let c = t.get_class_or_null()
+            if isset(c) && c.kind == CLASS_KIND.union && c.is_named_union {
+                return error_type_for_union(t) !>
+            }
+        }
+    }
+    err_exp.error("Identifier must be an error type or named union")
+}
+
+// Finds a unique `$auto` wrapping chain from `from` into `to` (outermost step first).
+// Direct `$auto` variants take precedence over transitive chains.
+fn union_error_wrap_chain(from: Type, to: Type, depth: uint (0)) (?Array[UnionWrapStep], bool) {
+    if depth > 8 : return (null, false)
+    let to_class = to.get_class_or_null() ?! return (null, false)
+    if !to_class.is_named_union : return (null, false)
+    let variants = to_class.union_variants ?! return (null, false)
+    let from_key = type_identity_key(from)
+
+    // 1. Direct `$auto` match
+    each variants as v {
+        if !v.is_auto : continue
+        if type_identity_key(v.payload_type) == from_key {
+            return (Array[UnionWrapStep]{ UnionWrapStep { union_type: to, variant: v } }, false)
+        }
+    }
+
+    // 2. Transitive `$auto` match through intermediate named unions
+    let found: ?Array[UnionWrapStep] = null
+    each variants as v {
+        if !v.is_auto : continue
+        let inner_class = v.payload_type.get_class_or_null()
+        if !isset(inner_class) || !inner_class.is_named_union : continue
+        let sub, ambig = union_error_wrap_chain(from, v.payload_type, depth + 1)
+        if ambig : return (null, true)
+        if isset(sub) {
+            if isset(found) : return (null, true)
+            let full = Array[UnionWrapStep]{ UnionWrapStep { union_type: to, variant: v } }
+            each sub as step : full.append(step)
+            found = full
+        }
+    }
+    return (found, false)
+}
+
+fn wrap_union_with_chain(inner: Value, chain: Array[UnionWrapStep], ctx: Context, at: Exp) Value !Error {
+    let current = inner
+    let i = chain.length
+    while i-- > 0 {
+        let step = chain.get(i) ! at.bug("Missing union wrap step")
+        current = vgen_union_wrap(current, step.union_type, step.variant.tag, ctx)
+            ?! at.bug("Failed to wrap union error via $auto")
+        current.exp = at
+    }
+    return current
 }
 
 // Resolve extends + payload. Safe to call multiple times; recurses into parents first.
@@ -42,6 +179,7 @@ fn parse_error_type(e: ErrorType) !Error {
         e.exp.error("Circular extend for error type: " + e.name)
     }
     e.parsing = true
+    // Legacy `error` stays quiet until 0.9.0 bootstraps `src/`'s own 4 error declarations.
 
     let extends_body = e.extends_exp
     if isset(extends_body) {

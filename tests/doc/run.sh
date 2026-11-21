@@ -103,7 +103,8 @@ for expect in \
     '"description": "Sizes a box can take."' \
     '"description": "An unmarked error type is still reachable from other packages."' \
     '"extends": [' \
-    '"LookupError"' \
+    '"BaseError"' \
+    '"lookup(LookupError) $auto"' \
     '"default-value": "3"' \
     '"type": "u8"' \
     '"value": "10"' \
@@ -138,7 +139,8 @@ if [[ "$public" != *'"BoxError"'* ]] || [[ "$public" != *'"PlainError"'* ]] || [
 fi
 
 markdown=$(<"$workdir/api.md")
-if [[ "$markdown" != *'+ error BoxError (missing, full) extends (LookupError) payload { box_name: String, retries: uint (3) }'* ]] \
+if [[ "$markdown" != *'+ error BoxError (missing, full) extends (BaseError) payload { box_name: String, retries: uint (3) }'* ]] \
+    || [[ "$markdown" != *'lookup(LookupError) $auto'* ]] \
     || [[ "$markdown" != *'error PlainError (plain)'* ]] \
     || [[ "$markdown" != *'+ enum BoxSize : u8 { small, large (10) }'* ]] \
     || [[ "$markdown" != *'// Failures of the box store.'* ]] \

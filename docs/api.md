@@ -25,13 +25,6 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 + value COMPRESS_DEFAULT_LEVEL (6)
 ```
 
-## Errors for 'compress'
-
-```js
-// Thrown when decompressing DEFLATE, zlib, gzip or zstd data fails.
-error CompressError (invalid_input, checksum, truncated, too_large) extends (io:IoError)
-```
-
 ## Enums for 'compress'
 
 ```js
@@ -91,6 +84,17 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 ## Classes for 'compress'
 
 ```js
+// Thrown when decompressing DEFLATE, zlib, gzip or zstd data fails.
++ union CompressError {
+    invalid_input
+    checksum
+    truncated
+    too_large
+    io(IoError) $auto
+}
+```
+
+```js
 // An `io.Writer` that compresses what is written to it and passes the result to `out`.
 + class Compressor is Writer, Closer {
     // Compresses the remaining input and writes the final block and trailer to `out`.
@@ -125,23 +129,6 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 + value FLOAT_TEXT_SIZE (64)
 // Methods shared by every integer type. The buffer size `to_base_in` requires: a sign plus 64 binary digits.
 + value INT_TEXT_SIZE (65)
-```
-
-## Errors for 'core'
-
-```js
-// A general-purpose error with the single code `error`.
-+ error AnError (error)
-// A resource could not be created or set up (`init`).
-+ error InitError (init)
-// Ends an iteration: an iterator's `_next` method throws `end` when no items are left.
-+ error IterError (end)
-// A lookup failed: `missing` (no such key or item), `exists` (already present), `range` (index out of range) or `empty` (the container is empty).
-+ error LookupError (missing, exists, range, empty)
-// Text could not be parsed (`syntax`), as thrown by the number parsers such as `to_int`.
-+ error SyntaxError (syntax)
-// An operating-system call failed (`failed`) or is not available on this platform (`unsupported`).
-+ error SystemError (failed, unsupported)
 ```
 
 ## Enums for 'core'
@@ -897,6 +884,13 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 ```
 
 ```js
+// A general-purpose error with the single variant `error`.
++ union GenericError {
+    error
+}
+```
+
+```js
 // A hash table from keys of type `K` to values of type `T`.
 + class HashMap[K, T] {
     // Removes every entry.
@@ -1044,6 +1038,20 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 ```
 
 ```js
+// A resource could not be created or set up (`init`).
++ union InitError {
+    init
+}
+```
+
+```js
+// Ends an iteration: an iterator's `_next` method throws `end` when no items are left.
++ union IterError {
+    end
+}
+```
+
+```js
 // A typed reference to an item of an `Arena[T]`: one 32-bit number, and `?Link[T]` takes no more room, so items can refer to each other at a fraction of the cost of objects.
 + struct Link[T] {
     // Returns the same link: it holds nothing that can be shared.
@@ -1060,6 +1068,16 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 + class Lock[T] {
     // Creates a lock holding `value`.
     + static fn new(value: T) Lock[T] !InitError
+}
+```
+
+```js
+// A lookup failed: `missing` (no such key or item), `exists` (already present), `range` (index out of range) or `empty` (the container is empty).
++ union LookupError {
+    missing
+    exists
+    range
+    empty
 }
 ```
 
@@ -1345,6 +1363,21 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + static fn new() SyncMutex
     // Releases the mutex; panics when the OS rejects the unlock.
     + fn unlock() void
+}
+```
+
+```js
+// Text could not be parsed (`syntax`), as thrown by the number parsers such as `to_int`.
++ union SyntaxError {
+    syntax
+}
+```
+
+```js
+// An operating-system call failed (`failed`) or is not available on this platform (`unsupported`).
++ union SystemError {
+    failed
+    unsupported
 }
 ```
 
@@ -2246,17 +2279,6 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 type c_long (int)
 ```
 
-## Errors for 'crypto'
-
-```js
-// Thrown by `encrypt`, `decrypt`, `seal` and `unseal`.
-error CipherError (invalid_input, auth, failed)
-// Thrown by the decoders, password hashes and key derivation functions of `crypto`.
-error CryptoError (invalid_input, write)
-// Thrown by `PrivateKey`, `PublicKey` and the ECDSA signature conversions.
-error KeyError (invalid_input, key, failed)
-```
-
 ## Enums for 'crypto'
 
 ```js
@@ -2426,6 +2448,23 @@ error KeyError (invalid_input, key, failed)
 ```
 
 ```js
+// Thrown by `encrypt`, `decrypt`, `seal` and `unseal`.
++ union CipherError {
+    invalid_input
+    auth
+    failed
+}
+```
+
+```js
+// Thrown by the decoders, password hashes and key derivation functions of `crypto`.
++ union CryptoError {
+    invalid_input
+    write
+}
+```
+
+```js
 // A streaming hash function: feed input with `update`, then read the digest with `finish`.
 + interface Hasher {
     // Returns the size in bytes of the blocks the hash function processes (64 or 128).
@@ -2462,6 +2501,15 @@ error KeyError (invalid_input, key, failed)
     + fn update(data: local &[u8]) void
     // Returns whether `mac` is the raw MAC of `data` under `key`, compared in constant time.
     + static fn verify(algorithm: HashAlgorithm, key: local &[u8], data: local &[u8], mac: local &[u8]) bool
+}
+```
+
+```js
+// Thrown by `PrivateKey`, `PublicKey` and the ECDSA signature conversions.
++ union KeyError {
+    invalid_input
+    key
+    failed
 }
 ```
 
@@ -3406,21 +3454,6 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 
 # http
 
-## Errors for 'http'
-
-```js
-// An HTTP/2 framing, HPACK or flow-control violation, found by the HTTP/2 server.
-error H2Error (incomplete, protocol, frame_size, flow_control, compression, limit)
-// Thrown by the HTTP client and by starting an HTTP server.
-error HttpError (invalid_url, invalid_response, in_progress, too_many_redirects, invalid_request, response_too_large, status) extends (net:NetError, HttpParseError) payload { http_status: uint (0) }
-// Thrown by `parse_http` when HTTP/1.x bytes are not a valid request or response.
-error HttpParseError (invalid, http413, http431, incomplete, missing_host_header, not_implemented) extends (io:IoError)
-// A router error.
-error RouteError (invalid)
-// Thrown by `WebSocket` methods.
-error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_request) extends (net:NetError)
-```
-
 ## Enums for 'http'
 
 ```js
@@ -3641,6 +3674,18 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
 ```
 
 ```js
+// An HTTP/2 framing, HPACK or flow-control violation, found by the HTTP/2 server.
++ union H2Error {
+    incomplete
+    protocol
+    frame_size
+    flow_control
+    compression
+    limit
+}
+```
+
+```js
 // An ordered list of HTTP header fields with case-insensitive names.
 + class Headers {
     // Adds a field at the end, keeping existing fields with the same name.
@@ -3665,6 +3710,40 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + fn remove(name: String) void
     // Replaces every field named `name` with one field holding `value`.
     + fn set(name: String, value: String) void
+}
+```
+
+```js
+// Thrown by the HTTP client and by starting an HTTP server.
++ union HttpError {
+    invalid_url
+    invalid_response
+    in_progress
+    too_many_redirects
+    invalid_request
+    response_too_large
+    status(uint)
+    net(NetError) $auto
+    parse(HttpParseError) $auto
+    io(IoError) $auto
+
+    // Returns the HTTP status code for `.status(code)`, or `0` for other variants.
+    + get http_status: uint
+    // Returns the underlying `io.IoError` if this error came from I/O, or `null`.
+    + fn io_error() ?(IoError)
+}
+```
+
+```js
+// Thrown by `parse_http` when HTTP/1.x bytes are not a valid request or response.
++ union HttpParseError {
+    invalid
+    http413
+    http431
+    incomplete
+    missing_host_header
+    not_implemented
+    io(IoError) $auto
 }
 ```
 
@@ -3893,6 +3972,13 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
 ```
 
 ```js
+// A router error.
++ union RouteError {
+    invalid
+}
+```
+
+```js
 // Maps a method and a URL path to a handler of type `T`.
 + class Router[T] {
     // Registers `handler` for `method` and the path pattern `url`.
@@ -4027,6 +4113,21 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
 ```
 
 ```js
+// Thrown by `WebSocket` methods.
++ union WebSocketError {
+    protocol
+    too_large
+    handshake
+    invalid_url
+    invalid_request
+    net(NetError) $auto
+
+    // Returns the underlying `io.IoError` if this error came from socket I/O, or `null`.
+    + fn io_error() ?(IoError)
+}
+```
+
+```js
 // A text or binary message prepared once and sent to many WebSockets with `WebSocket.write_frame`.
 + class WebSocketFrame {
     // Prepares a binary message.
@@ -4057,13 +4158,6 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
 alias Fd for i32
 // The descriptor value of no descriptor: -1.
 + value INVALID_FD (-1)
-```
-
-## Errors for 'io'
-
-```js
-// Thrown by file, stream, process and socket I/O.
-error IoError (open, access, read, write, exists, os, closed, timeout, range, cancelled)
 ```
 
 ## Enums for 'io'
@@ -4207,6 +4301,22 @@ error IoError (open, access, read, write, exists, os, closed, timeout, range, ca
 ```
 
 ```js
+// Thrown by file, stream, process and socket I/O.
++ union IoError {
+    open
+    access
+    read
+    write
+    exists
+    os
+    closed
+    timeout
+    range
+    cancelled
+}
+```
+
+```js
 // Reads at most `remaining` bytes from an underlying `io.Reader`.
 + class LimitReader is Reader {
     // Number of bytes left to read before reporting end of input.
@@ -4292,15 +4402,6 @@ error IoError (open, access, read, write, exists, os, closed, timeout, range, ca
 
 # json
 
-## Errors for 'json'
-
-```js
-// Thrown by typed decoding when the input does not fit the target type.
-+ error DecodeError (wrong_type, missing) extends (ParseError)
-// Thrown when JSON input cannot be parsed.
-+ error ParseError (invalid, too_deep, too_large) payload { at_index: uint, message: String, character: u8 (0) }
-```
-
 ## Enums for 'json'
 
 ```js
@@ -4342,6 +4443,32 @@ error IoError (open, access, read, write, exists, os, closed, timeout, range, ca
 ```
 
 ## Classes for 'json'
+
+```js
+// Thrown by typed decoding when the input does not fit the target type.
++ union DecodeError {
+    wrong_type(String, uint, u8)
+    missing(String, uint)
+    parse(ParseError) $auto
+
+    + get at_index: uint
+    + get character: u8
+    + get message: String
+}
+```
+
+```js
+// Thrown when JSON input cannot be parsed.
++ union ParseError {
+    invalid(String, uint, u8)
+    too_deep(String, uint)
+    too_large(String, uint)
+
+    + get at_index: uint
+    + get character: u8
+    + get message: String
+}
+```
 
 ```js
 // A JSON value: `null`, a string, an integer, a float, a bool, an array or an object.
@@ -4796,13 +4923,6 @@ error IoError (open, access, read, write, exists, os, closed, timeout, range, ca
 type c_long (int)
 ```
 
-## Errors for 'net'
-
-```js
-// Thrown by address resolution, sockets, connections and TLS.
-error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max_connections) extends (io:IoError)
-```
-
 ## Enums for 'net'
 
 ```js
@@ -4938,6 +5058,20 @@ error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max
     + fn to_socket_address(port: u16 (0)) SocketAddress
     // Formats the address as `"127.0.0.1"` or RFC 5952 IPv6 (`"::1"`).
     + fn to_string() String
+}
+```
+
+```js
+// Thrown by address resolution, sockets, connections and TLS.
++ union NetError {
+    init
+    connect
+    disconnected
+    invalid_host
+    ssl
+    port_in_use
+    max_connections
+    io(IoError) $auto
 }
 ```
 
@@ -5283,13 +5417,6 @@ error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max
 
 # regex
 
-## Errors for 'regex'
-
-```js
-// Thrown when a regular expression pattern cannot be compiled.
-error RegexError (syntax, unsupported, too_large) payload { message: String, position: uint (0) }
-```
-
 ## Functions for 'regex'
 
 ```js
@@ -5361,14 +5488,19 @@ error RegexError (syntax, unsupported, too_large) payload { message: String, pos
 }
 ```
 
-# signal
-
-## Errors for 'signal'
-
 ```js
-// Thrown by the `signal` functions.
-error SignalError (unsupported, init)
+// Thrown when a regular expression pattern cannot be compiled.
++ union RegexError {
+    syntax(String, uint)
+    unsupported(String, uint)
+    too_large(String, uint)
+
+    + get message: String
+    + get position: uint
+}
 ```
+
+# signal
 
 ## Enums for 'signal'
 
@@ -5398,14 +5530,17 @@ error SignalError (unsupported, init)
 + fn wait(sig: Signal, timeout_ms: uint (0)) bool !SignalError
 ```
 
-# sync
-
-## Errors for 'sync'
+## Classes for 'signal'
 
 ```js
-// Errors of channels, wakers and cancellation tokens.
-+ error SyncError (closed, timeout, cancelled, empty, full, init)
+// Thrown by the `signal` functions.
++ union SignalError {
+    unsupported
+    init
+}
 ```
+
+# sync
 
 ## Functions for 'sync'
 
@@ -5595,6 +5730,18 @@ error SignalError (unsupported, init)
 ```
 
 ```js
+// Errors of channels, wakers and cancellation tokens.
++ union SyncError {
+    closed
+    timeout
+    cancelled
+    empty
+    full
+    init
+}
+```
+
+```js
 // A clock that sends the tick number (1, 2, ...) to `channel` every interval, from `ticker`.
 + class Ticker {
     // Receives the tick numbers; closed by `stop`.
@@ -5642,15 +5789,6 @@ type Escape (fn(local &[u8], Writer)(uint !IoError))
 type Filter (fn(Value, Array[Value])(Value))
 ```
 
-## Errors for 'template'
-
-```js
-// The base error of `template`; functions throw it as `ParseError`.
-error Error (template_not_found) payload { template_name: String, message: String }
-// Thrown by `render` and `render_content` when a template cannot be rendered.
-error ParseError (parse, missing, write) extends (Error) payload { index: uint (0), line: uint (0) }
-```
-
 ## Functions for 'template'
 
 ```js
@@ -5696,6 +5834,21 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
     + fn set_filter(name: String, filter: fn(Value, Array[Value])(Value)) void
     // Registers every entry of `content` as a template, keyed by name.
     + fn set_many(content: Map[String]) void
+}
+```
+
+```js
+// Thrown by `render` and `render_content` when a template cannot be rendered.
++ union ParseError {
+    template_not_found(String, String)
+    parse(String, String, uint, uint)
+    missing(String, String, uint)
+    write(String, String)
+
+    + get index: uint
+    + get line: uint
+    + get message: String
+    + get template_name: String
 }
 ```
 
@@ -5783,13 +5936,6 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
 + value ISO8601_TEXT_SIZE (27)
 // The buffer size `DateTime.to_iso8601_in` requires for a value in a time zone: `YYYY-MM-DDTHH:MM:SS.uuuuuu+hh:mm:ss`.
 + value ISO8601_ZONED_TEXT_SIZE (35)
-```
-
-## Errors for 'time'
-
-```js
-// A time zone could not be loaded: `missing` when no zone has that name, `invalid` when its data or rule text is malformed.
-+ error ZoneError (missing, invalid)
 ```
 
 ## Functions for 'time'
@@ -6048,6 +6194,14 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
     + fn is_dst_at(unix_seconds: int) bool
     // Returns the offset from UTC in seconds at the instant `unix_seconds`, positive east of Greenwich: 3600 for CET, -18000 for EST.
     + fn offset_at(unix_seconds: int) int
+}
+```
+
+```js
+// A time zone could not be loaded: `missing` when no zone has that name, `invalid` when its data or rule text is malformed.
++ union ZoneError {
+    missing
+    invalid
 }
 ```
 
