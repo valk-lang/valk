@@ -97,30 +97,26 @@ if ! grep -Fq '+ struct DocReader is Readable {' "$workdir/api.md"; then
     exit 1
 fi
 
-echo "> Document error types and enums"
+echo "> Document error unions and enums"
 for expect in \
     '"description": "Failures of the box store."' \
     '"description": "Sizes a box can take."' \
-    '"description": "An unmarked error type is still reachable from other packages."' \
-    '"extends": [' \
-    '"BaseError"' \
     '"lookup(LookupError) $auto"' \
-    '"default-value": "3"' \
+    '"missing(String)"' \
+    '"full(String, uint)"' \
     '"type": "u8"' \
     '"value": "10"' \
     '"HiddenError"' \
     '"InternalSize"'; do
     if ! grep -Fq "$expect" "$workdir/api.json"; then
-        echo "# Error type or enum documentation is missing from the API JSON: $expect"
+        echo "# Error union or enum documentation is missing from the API JSON: $expect"
         cat "$workdir/api.json"
         exit 1
     fi
 done
 doc_codes=$(tr -d ' \n' < "$workdir/api.json")
-if [[ "$doc_codes" != *'"codes":["missing","full"]'* ]] \
-    || [[ "$doc_codes" != *'"box_name":{"type":"String"}'* ]] \
-    || [[ "$doc_codes" != *'"items":[{"name":"small"},{"name":"large","value":"10"}]'* ]]; then
-    echo "# Error codes, payload fields or enum items are not listed in order"
+if [[ "$doc_codes" != *'"items":[{"name":"small"},{"name":"large","value":"10"}]'* ]]; then
+    echo "# Enum items are not listed in order"
     echo "$doc_codes"
     exit 1
 fi
@@ -131,21 +127,20 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 public=$(<"$workdir/public.json")
-if [[ "$public" != *'"BoxError"'* ]] || [[ "$public" != *'"PlainError"'* ]] || [[ "$public" != *'"BoxSize"'* ]] \
+if [[ "$public" != *'"BoxError"'* ]] || [[ "$public" != *'"StoreError"'* ]] || [[ "$public" != *'"BoxSize"'* ]] \
     || [[ "$public" == *'"HiddenError"'* ]] || [[ "$public" == *'"InternalSize"'* ]]; then
-    echo "# --no-private must keep reachable error types and public enums only"
+    echo "# --no-private must keep public error unions and enums only"
     echo "$public"
     exit 1
 fi
 
 markdown=$(<"$workdir/api.md")
-if [[ "$markdown" != *'+ error BoxError (missing, full) extends (BaseError) payload { box_name: String, retries: uint (3) }'* ]] \
+if [[ "$markdown" != *'+ union BoxError {'* ]] \
     || [[ "$markdown" != *'lookup(LookupError) $auto'* ]] \
-    || [[ "$markdown" != *'error PlainError (plain)'* ]] \
     || [[ "$markdown" != *'+ enum BoxSize : u8 { small, large (10) }'* ]] \
     || [[ "$markdown" != *'// Failures of the box store.'* ]] \
     || [[ "$markdown" != *'// Sizes a box can take.'* ]]; then
-    echo "# Markdown is missing the error type or enum declarations"
+    echo "# Markdown is missing the error union or enum declarations"
     echo "$markdown"
     exit 1
 fi

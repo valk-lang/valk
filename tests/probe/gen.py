@@ -19,7 +19,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 
 PRELUDE = """use valk.thread
-error ProbeFail (no)
+union ProbeFail { no }
 class Item {
     n: int (0)
     + fn me() Item { return this }

@@ -26,7 +26,8 @@ esac
 trap 'rm -rf "$workdir"' EXIT
 
 mkdir -p "$workdir/first" "$workdir/second"
-cp -r src "$workdir/first/src"
+# Note: src/ keeps 4 legacy `error` declarations in 0.9.0 so 0.8.10 can bootstrap it;
+# re-add `cp -r src "$workdir/first/src"` once 0.9.1 switches src/ to union errors against 0.9.0.
 mkdir -p "$workdir/first/lib"
 cp -r lib/src "$workdir/first/lib/src"
 
