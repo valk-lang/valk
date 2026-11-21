@@ -1087,18 +1087,18 @@ A handler written as a block takes the first block, and the body follows as a se
 `while value() ! { ... } { ... }`. In a `while` condition the handler may `break` or `continue`
 the loop.
 
-Inside an error handler, `E` is the thrown union value. Compare variants directly with `==` or destructure them with `match`:
+Inside an error handler, `E` is the thrown union value. Check a variant with `is .variant` (works on both payloadless and payload variants, as well as nullable unions), compare payloadless variants with `==`, or destructure with `match`. Standard library error unions also define `to_string() String $auto`, so `"%{E}"` and `E.to_string()` work out of the box:
 
 ```rust
 "x".to_int() ! {
-    if E == .syntax : println("not a number")
+    if E is .syntax : println("not a number: %{E}")
 }
 ```
 
 ```rust
 fn main() {
     my_func() ! {
-        if E == .fail : println("`fail` was thrown")
+        if E is .invalid_input : println("invalid input")
         match E {
             .fail => println("`fail` was thrown")
             .invalid_input(msg) => println("Invalid input: " + msg)
@@ -3313,9 +3313,7 @@ to a render: HTML by default, `null` for none, so an engine with an escape of
 its own passes it along, `RenderOptions { escape: views.escape, max_depth: 2 }`.
 
 A template is compiled the first time it renders and kept until it is
-registered again. The free functions `template.set_content` and
-`template.render` from earlier versions still work through one registry for
-all threads, but are deprecated in favour of an engine.
+registered again.
 
 Note: `valk.template` works at runtime and therefore cannot detect incorrect template syntax at compile time.
 

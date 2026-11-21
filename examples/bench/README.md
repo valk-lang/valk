@@ -31,7 +31,7 @@ larger file-oriented serialization workload. Both Go implementations use
 `encoding/json/v2` with its default options.
 
 The `shared-*` benchmarks measure data shared between four threads, each in the
-way the language is normally written: `shared T`, `Lock[T]` and `sync.Channel`
+way the language is normally written: `atomic T`, `Lock[T]` and `sync.Channel`
 in Valk, plain pointers, `sync.Mutex` and channels in Go, `Arc`, `Mutex` and
 `std::sync::mpsc` in Rust (maps from `hashbrown`). Every program prints the same
 checksum.

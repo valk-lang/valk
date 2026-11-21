@@ -250,6 +250,8 @@ returns the bytes written.
     truncated
     too_large
     io(IoError) $auto
+
+    + fn to_string() String
 }
 ```
 
@@ -2052,8 +2054,6 @@ Pauses the benchmark timer and allocation tracking until `start_timer` is called
     + fn skip(amount: uint) void
     // Returns whether the contents at byte `offset` begin with `str`.
     + fn starts_with(str: String, offset: uint (0)) bool
-    // A copy of the bytes the buffer can hold, written or not.
-    + get storage: String $deprecated
     // Exchanges the contents and storage with `other`, without copying.
     + fn swap(other: ByteBuffer) void
     // Returns a copy of the contents as a new `String`.
@@ -2269,12 +2269,6 @@ filling the region returned by `view_spare`. Panics when the buffer is consumed.
 Returns whether the contents at byte `offset` begin with `str`.
 
 Returns false when `offset` is past the length.
-
-#### storage
-
-A copy of the bytes the buffer can hold, written or not.
-
-Deprecated: use `to_string()` for the written bytes.
 
 #### swap
 
@@ -2980,6 +2974,8 @@ Returns a new array of the values, in entry order.
 // A general-purpose error with the single variant `error`.
 + union GenericError {
     error
+
+    + fn to_string() String
 }
 ```
 
@@ -3449,6 +3445,8 @@ Returns the items as a new array in heap order, which is not sorted.
 // A resource could not be created or set up (`init`).
 + union InitError {
     init
+
+    + fn to_string() String
 }
 ```
 
@@ -3460,6 +3458,8 @@ A resource could not be created or set up (`init`).
 // Ends an iteration: an iterator's `_next` method throws `end` when no items are left.
 + union IterError {
     end
+
+    + fn to_string() String
 }
 ```
 
@@ -3548,6 +3548,8 @@ Throws `init` when the underlying `Mutex` cannot be created.
     exists
     range
     empty
+
+    + fn to_string() String
 }
 ```
 
@@ -4605,6 +4607,8 @@ Releases the mutex; panics when the OS rejects the unlock.
 // Text could not be parsed (`syntax`), as thrown by the number parsers such as `to_int`.
 + union SyntaxError {
     syntax
+
+    + fn to_string() String
 }
 ```
 
@@ -4617,6 +4621,8 @@ Text could not be parsed (`syntax`), as thrown by the number parsers such as `to
 + union SystemError {
     failed
     unsupported
+
+    + fn to_string() String
 }
 ```
 
@@ -4738,16 +4744,12 @@ Returns a new `String` holding a copy of the bytes before the zero terminator.
     + fn to_shortest_string() String
     // Writes the value like `to_shortest_string` into `buf` and returns the byte count.
     + fn to_shortest_string_in(buf: local mut &[u8], force_exponent: bool (false)) uint
-    // Writes the value like `to_shortest_string` to `buf` and returns the byte count.
-    + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint $deprecated
     // Writes the value like `to_shortest_string` to `out` and returns the bytes written.
     + fn to_shortest_string_into(out: Writer, force_exponent: bool (false)) uint !io:IoError
     // Returns the value as text; with `decimals`, with exactly that many digits after the dot.
     + fn to_string(decimals: ?uint (null), trim_zeros: bool (false)) String
     // Writes the value like `to_string` into `buf` and returns the byte count.
     + fn to_string_in(buf: local mut &[u8], decimals: ?uint (null), trim_zeros: bool (false)) uint
-    // Writes the value like `to_string` to `buf` and returns the byte count.
-    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint $deprecated
     // Writes the value like `to_string` to `out` and returns the bytes written.
     + fn to_string_into(out: Writer, decimals: ?uint (null), trim_zeros: bool (false)) uint !io:IoError
 }
@@ -4835,14 +4837,6 @@ Writes the value like `to_shortest_string` into `buf` and returns the byte count
 `buf` must hold at least `FLOAT_TEXT_SIZE` (64) bytes; a shorter buffer panics. With
 `force_exponent` the exponent form is always used. No terminating zero is written.
 
-#### to_shortest_string_in_ptr
-
-Writes the value like `to_shortest_string` to `buf` and returns the byte count.
-
-`buf` needs room for 32 bytes, unchecked. Deprecated: use `to_shortest_string_in`, which
-takes a bounds-checked slice, or `to_shortest_string_into`. No terminating zero is
-written. With `force_exponent` the exponent form is always used.
-
 #### to_shortest_string_into
 
 Writes the value like `to_shortest_string` to `out` and returns the bytes written.
@@ -4871,13 +4865,6 @@ Writes the value like `to_string` into `buf` and returns the byte count.
 `buf` must hold at least `FLOAT_TEXT_SIZE` (64) bytes; a shorter buffer panics. Nothing
 is allocated, so a stack array works: `let text: [u8 x 64] = @undefined` and
 `value.to_string_in(&text, 3)`. No terminating zero is written.
-
-#### to_string_in_ptr
-
-Writes the value like `to_string` to `buf` and returns the byte count.
-
-`buf` needs room for 64 bytes, unchecked. Deprecated: use `to_string_in`, which takes a
-bounds-checked slice, or `to_string_into`. No terminating zero is written.
 
 #### to_string_into
 
@@ -4914,16 +4901,12 @@ The text is built on the stack, so nothing is allocated. Throws when `out` fails
     + fn to_shortest_string() String
     // Writes the value like `to_shortest_string` into `buf` and returns the byte count.
     + fn to_shortest_string_in(buf: local mut &[u8], force_exponent: bool (false)) uint
-    // Writes the value like `to_shortest_string` to `buf` and returns the byte count.
-    + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint $deprecated
     // Writes the value like `to_shortest_string` to `out` and returns the bytes written.
     + fn to_shortest_string_into(out: Writer, force_exponent: bool (false)) uint !io:IoError
     // Returns the value as text; with `decimals`, with exactly that many digits after the dot.
     + fn to_string(decimals: ?uint (null), trim_zeros: bool (false)) String
     // Writes the value like `to_string` into `buf` and returns the byte count.
     + fn to_string_in(buf: local mut &[u8], decimals: ?uint (null), trim_zeros: bool (false)) uint
-    // Writes the value like `to_string` to `buf` and returns the byte count.
-    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint $deprecated
     // Writes the value like `to_string` to `out` and returns the bytes written.
     + fn to_string_into(out: Writer, decimals: ?uint (null), trim_zeros: bool (false)) uint !io:IoError
 }
@@ -5011,14 +4994,6 @@ Writes the value like `to_shortest_string` into `buf` and returns the byte count
 `buf` must hold at least `FLOAT_TEXT_SIZE` (64) bytes; a shorter buffer panics. With
 `force_exponent` the exponent form is always used. No terminating zero is written.
 
-#### to_shortest_string_in_ptr
-
-Writes the value like `to_shortest_string` to `buf` and returns the byte count.
-
-`buf` needs room for 32 bytes, unchecked. Deprecated: use `to_shortest_string_in`, which
-takes a bounds-checked slice, or `to_shortest_string_into`. No terminating zero is
-written. With `force_exponent` the exponent form is always used.
-
 #### to_shortest_string_into
 
 Writes the value like `to_shortest_string` to `out` and returns the bytes written.
@@ -5047,13 +5022,6 @@ Writes the value like `to_string` into `buf` and returns the byte count.
 `buf` must hold at least `FLOAT_TEXT_SIZE` (64) bytes; a shorter buffer panics. Nothing
 is allocated, so a stack array works: `let text: [u8 x 64] = @undefined` and
 `value.to_string_in(&text, 3)`. No terminating zero is written.
-
-#### to_string_in_ptr
-
-Writes the value like `to_string` to `buf` and returns the byte count.
-
-`buf` needs room for 64 bytes, unchecked. Deprecated: use `to_string_in`, which takes a
-bounds-checked slice, or `to_string_into`. No terminating zero is written.
 
 #### to_string_into
 
@@ -5090,16 +5058,12 @@ The text is built on the stack, so nothing is allocated. Throws when `out` fails
     + fn to_shortest_string() String
     // Writes the value like `to_shortest_string` into `buf` and returns the byte count.
     + fn to_shortest_string_in(buf: local mut &[u8], force_exponent: bool (false)) uint
-    // Writes the value like `to_shortest_string` to `buf` and returns the byte count.
-    + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint $deprecated
     // Writes the value like `to_shortest_string` to `out` and returns the bytes written.
     + fn to_shortest_string_into(out: Writer, force_exponent: bool (false)) uint !io:IoError
     // Returns the value as text; with `decimals`, with exactly that many digits after the dot.
     + fn to_string(decimals: ?uint (null), trim_zeros: bool (false)) String
     // Writes the value like `to_string` into `buf` and returns the byte count.
     + fn to_string_in(buf: local mut &[u8], decimals: ?uint (null), trim_zeros: bool (false)) uint
-    // Writes the value like `to_string` to `buf` and returns the byte count.
-    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint $deprecated
     // Writes the value like `to_string` to `out` and returns the bytes written.
     + fn to_string_into(out: Writer, decimals: ?uint (null), trim_zeros: bool (false)) uint !io:IoError
 }
@@ -5187,14 +5151,6 @@ Writes the value like `to_shortest_string` into `buf` and returns the byte count
 `buf` must hold at least `FLOAT_TEXT_SIZE` (64) bytes; a shorter buffer panics. With
 `force_exponent` the exponent form is always used. No terminating zero is written.
 
-#### to_shortest_string_in_ptr
-
-Writes the value like `to_shortest_string` to `buf` and returns the byte count.
-
-`buf` needs room for 32 bytes, unchecked. Deprecated: use `to_shortest_string_in`, which
-takes a bounds-checked slice, or `to_shortest_string_into`. No terminating zero is
-written. With `force_exponent` the exponent form is always used.
-
 #### to_shortest_string_into
 
 Writes the value like `to_shortest_string` to `out` and returns the bytes written.
@@ -5223,13 +5179,6 @@ Writes the value like `to_string` into `buf` and returns the byte count.
 `buf` must hold at least `FLOAT_TEXT_SIZE` (64) bytes; a shorter buffer panics. Nothing
 is allocated, so a stack array works: `let text: [u8 x 64] = @undefined` and
 `value.to_string_in(&text, 3)`. No terminating zero is written.
-
-#### to_string_in_ptr
-
-Writes the value like `to_string` to `buf` and returns the byte count.
-
-`buf` needs room for 64 bytes, unchecked. Deprecated: use `to_string_in`, which takes a
-bounds-checked slice, or `to_string_into`. No terminating zero is written.
 
 #### to_string_into
 
@@ -5274,8 +5223,6 @@ The text is built on the stack, so nothing is allocated. Throws when `out` fails
     + fn to_base_in(buf: local mut &[u8], base: i16, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i16, out: Writer, lowercase: bool (false)) uint !io:IoError
-    // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: i16, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -5407,15 +5354,6 @@ The text is built on the stack, so nothing is allocated. Digits above 9 are lowe
 when `lowercase` is true, uppercase otherwise; `base` is clamped as in `to_base`.
 Throws when `out` fails.
 
-#### to_base_to_ptr
-
-Writes the value as text in `base` to `result` and returns the byte count.
-
-Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
-above 36 is treated as 36 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
-takes a bounds-checked slice, or `to_base_into`.
-
 #### to_hex
 
 Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -5482,8 +5420,6 @@ u32.write_little_endian(0x01020304, &buf)
     + fn to_base_in(buf: local mut &[u8], base: i32, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i32, out: Writer, lowercase: bool (false)) uint !io:IoError
-    // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: i32, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -5615,15 +5551,6 @@ The text is built on the stack, so nothing is allocated. Digits above 9 are lowe
 when `lowercase` is true, uppercase otherwise; `base` is clamped as in `to_base`.
 Throws when `out` fails.
 
-#### to_base_to_ptr
-
-Writes the value as text in `base` to `result` and returns the byte count.
-
-Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
-above 36 is treated as 36 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
-takes a bounds-checked slice, or `to_base_into`.
-
 #### to_hex
 
 Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -5690,8 +5617,6 @@ u32.write_little_endian(0x01020304, &buf)
     + fn to_base_in(buf: local mut &[u8], base: i64, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i64, out: Writer, lowercase: bool (false)) uint !io:IoError
-    // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: i64, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -5823,15 +5748,6 @@ The text is built on the stack, so nothing is allocated. Digits above 9 are lowe
 when `lowercase` is true, uppercase otherwise; `base` is clamped as in `to_base`.
 Throws when `out` fails.
 
-#### to_base_to_ptr
-
-Writes the value as text in `base` to `result` and returns the byte count.
-
-Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
-above 36 is treated as 36 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
-takes a bounds-checked slice, or `to_base_into`.
-
 #### to_hex
 
 Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -5898,8 +5814,6 @@ u32.write_little_endian(0x01020304, &buf)
     + fn to_base_in(buf: local mut &[u8], base: i8, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i8, out: Writer, lowercase: bool (false)) uint !io:IoError
-    // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: i8, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -6031,15 +5945,6 @@ The text is built on the stack, so nothing is allocated. Digits above 9 are lowe
 when `lowercase` is true, uppercase otherwise; `base` is clamped as in `to_base`.
 Throws when `out` fails.
 
-#### to_base_to_ptr
-
-Writes the value as text in `base` to `result` and returns the byte count.
-
-Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
-above 36 is treated as 36 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
-takes a bounds-checked slice, or `to_base_into`.
-
 #### to_hex
 
 Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -6106,8 +6011,6 @@ u32.write_little_endian(0x01020304, &buf)
     + fn to_base_in(buf: local mut &[u8], base: int, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: int, out: Writer, lowercase: bool (false)) uint !io:IoError
-    // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: int, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -6238,15 +6141,6 @@ Writes the value as text in `base` to `out` and returns the bytes written.
 The text is built on the stack, so nothing is allocated. Digits above 9 are lowercase
 when `lowercase` is true, uppercase otherwise; `base` is clamped as in `to_base`.
 Throws when `out` fails.
-
-#### to_base_to_ptr
-
-Writes the value as text in `base` to `result` and returns the byte count.
-
-Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
-above 36 is treated as 36 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
-takes a bounds-checked slice, or `to_base_into`.
 
 #### to_hex
 
@@ -6777,8 +6671,6 @@ Writes `v` as `size_of(uint)` little-endian bytes to this address.
     + fn to_base_in(buf: local mut &[u8], base: u16, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u16, out: Writer, lowercase: bool (false)) uint !io:IoError
-    // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: u16, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -6910,15 +6802,6 @@ The text is built on the stack, so nothing is allocated. Digits above 9 are lowe
 when `lowercase` is true, uppercase otherwise; `base` is clamped as in `to_base`.
 Throws when `out` fails.
 
-#### to_base_to_ptr
-
-Writes the value as text in `base` to `result` and returns the byte count.
-
-Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
-above 36 is treated as 36 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
-takes a bounds-checked slice, or `to_base_into`.
-
 #### to_hex
 
 Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -6985,8 +6868,6 @@ u32.write_little_endian(0x01020304, &buf)
     + fn to_base_in(buf: local mut &[u8], base: u32, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u32, out: Writer, lowercase: bool (false)) uint !io:IoError
-    // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: u32, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -7118,15 +6999,6 @@ The text is built on the stack, so nothing is allocated. Digits above 9 are lowe
 when `lowercase` is true, uppercase otherwise; `base` is clamped as in `to_base`.
 Throws when `out` fails.
 
-#### to_base_to_ptr
-
-Writes the value as text in `base` to `result` and returns the byte count.
-
-Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
-above 36 is treated as 36 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
-takes a bounds-checked slice, or `to_base_into`.
-
 #### to_hex
 
 Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -7195,8 +7067,6 @@ u32.write_little_endian(0x01020304, &buf)
     + fn to_base_in(buf: local mut &[u8], base: u64, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u64, out: Writer, lowercase: bool (false)) uint !io:IoError
-    // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: u64, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -7334,15 +7204,6 @@ The text is built on the stack, so nothing is allocated. Digits above 9 are lowe
 when `lowercase` is true, uppercase otherwise; `base` is clamped as in `to_base`.
 Throws when `out` fails.
 
-#### to_base_to_ptr
-
-Writes the value as text in `base` to `result` and returns the byte count.
-
-Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
-above 36 is treated as 36 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
-takes a bounds-checked slice, or `to_base_into`.
-
 #### to_hex
 
 Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -7439,8 +7300,6 @@ u32.write_little_endian(0x01020304, &buf)
     + fn to_base_in(buf: local mut &[u8], base: u8, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u8, out: Writer, lowercase: bool (false)) uint !io:IoError
-    // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: u8, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -7639,15 +7498,6 @@ The text is built on the stack, so nothing is allocated. Digits above 9 are lowe
 when `lowercase` is true, uppercase otherwise; `base` is clamped as in `to_base`.
 Throws when `out` fails.
 
-#### to_base_to_ptr
-
-Writes the value as text in `base` to `result` and returns the byte count.
-
-Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
-above 36 is treated as 36 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
-takes a bounds-checked slice, or `to_base_into`.
-
 #### to_hex
 
 Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -7727,8 +7577,6 @@ u32.write_little_endian(0x01020304, &buf)
     + fn to_base_in(buf: local mut &[u8], base: uint, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: uint, out: Writer, lowercase: bool (false)) uint !io:IoError
-    // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: uint, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -7873,15 +7721,6 @@ Writes the value as text in `base` to `out` and returns the bytes written.
 The text is built on the stack, so nothing is allocated. Digits above 9 are lowercase
 when `lowercase` is true, uppercase otherwise; `base` is clamped as in `to_base`.
 Throws when `out` fails.
-
-#### to_base_to_ptr
-
-Writes the value as text in `base` to `result` and returns the byte count.
-
-Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
-above 36 is treated as 36 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
-takes a bounds-checked slice, or `to_base_into`.
 
 #### to_hex
 
@@ -8621,6 +8460,8 @@ Feeds more input into the hash.
     invalid_input
     auth
     failed
+
+    + fn to_string() String
 }
 ```
 
@@ -8638,6 +8479,8 @@ Thrown by `encrypt`, `decrypt`, `seal` and `unseal`.
 + union CryptoError {
     invalid_input
     write
+
+    + fn to_string() String
 }
 ```
 
@@ -8772,6 +8615,8 @@ Returns whether `mac` is the raw MAC of `data` under `key`, compared in constant
     invalid_input
     key
     failed
+
+    + fn to_string() String
 }
 ```
 
@@ -12274,6 +12119,8 @@ Stores the cookies of `response`, which answered a request to `url`.
     flow_control
     compression
     limit
+
+    + fn to_string() String
 }
 ```
 
@@ -12402,6 +12249,7 @@ the `Headers{ name => value }` literal.
     + get http_status: uint
     // Returns the underlying `io.IoError` if this error came from I/O, or `null`.
     + fn io_error() ?(IoError)
+    + fn to_string() String
 }
 ```
 
@@ -12443,6 +12291,8 @@ Returns the underlying `io.IoError` if this error came from I/O, or `null`.
     missing_host_header
     not_implemented
     io(IoError) $auto
+
+    + fn to_string() String
 }
 ```
 
@@ -13268,19 +13118,6 @@ Empty parts are ignored like `Router.find` ignores them, so doubled slashes and 
 missing leading `/` do not shift the values; missing parts are left out.
 
 ```js
-// A router error.
-+ union RouteError {
-    invalid
-}
-```
-
-### RouteError
-
-A router error.
-
-- `invalid`: not raised by the standard library.
-
-```js
 // Maps a method and a URL path to a handler of type `T`.
 + class Router[T] {
     // Registers `handler` for `method` and the path pattern `url`.
@@ -13591,7 +13428,7 @@ CORS headers. Middleware added first runs first. Static files and a `fast` handl
 are served without it.
 
 ```valk
-server.add_middleware(fn(req: http.Request, next: shared fn(http.Request)(http.Response)) http.Response {
+server.add_middleware(fn(req: http.Request, next: atomic fn(http.Request)(http.Response)) http.Response {
     let res = next(req)
     res.set_header("X-Frame-Options", "DENY")
     return res
@@ -13883,6 +13720,7 @@ messages waiting.
 
     // Returns the underlying `io.IoError` if this error came from socket I/O, or `null`.
     + fn io_error() ?(IoError)
+    + fn to_string() String
 }
 ```
 
@@ -14446,6 +14284,8 @@ Discards `data` and returns `data.length`.
     timeout
     range
     cancelled
+
+    + fn to_string() String
 }
 ```
 
@@ -14862,6 +14702,7 @@ let first = data["names"][0].string
     + get at_index: uint
     + get character: u8
     + get message: String
+    + fn to_string() String
 }
 ```
 
@@ -14884,6 +14725,7 @@ Thrown by typed decoding when the input does not fit the target type.
     + get at_index: uint
     + get character: u8
     + get message: String
+    + fn to_string() String
 }
 ```
 
@@ -16153,8 +15995,6 @@ Returns `value` with its fractional part removed, rounding toward zero.
 + fn copy_bytes(from: ptr, to: ptr, length: uint) void
 // Copies the `T` at `from` to `to`; the two must not overlap.
 + fn copy_value[T](from: *T, to: *T) void
-// Deprecated: old name of `equals_bytes`, kept because 0.7.0 shipped it.
-+ fn equal_bytes(a: ptr, b: ptr, length: uint) bool $deprecated
 // Returns whether `a` and `b` have the same length and bytes.
 + fn equals(a: local &[u8], b: local &[u8]) bool
 // Returns whether the `length` bytes at `a` and `b` are identical.
@@ -16249,10 +16089,6 @@ Copies `length` bytes from `from` to `to`; the two ranges must not overlap.
 Copies the `T` at `from` to `to`; the two must not overlap.
 
 `T` must be an inline value type without GC references; anything else is a compile error.
-
-### equal_bytes
-
-Deprecated: old name of `equals_bytes`, kept because 0.7.0 shipped it.
 
 ### equals
 
@@ -16741,12 +16577,13 @@ Formats the address as `"127.0.0.1"` or RFC 5952 IPv6 (`"::1"`).
 + union NetError {
     init
     connect
-    disconnected
     invalid_host
     ssl
     port_in_use
     max_connections
     io(IoError) $auto
+
+    + fn to_string() String
 }
 ```
 
@@ -16757,7 +16594,6 @@ Thrown by address resolution, sockets, connections and TLS.
 - `init`: a socket could not be created or configured, `accept` failed, or the
   resolver thread could not start.
 - `connect`: connecting to the remote address failed.
-- `disconnected`: not raised by the standard library.
 - `invalid_host`: the host could not be resolved, is not numeric where a numeric
   address is required, or has an unsupported address family.
 - `ssl`: TLS setup failed (certificate, key, CA file, version, ciphers, ALPN, SNI) or
@@ -18223,6 +18059,7 @@ characters, never at either end of the text or right after the previous split.
 
     + get message: String
     + get position: uint
+    + fn to_string() String
 }
 ```
 
@@ -18330,6 +18167,8 @@ away when `ignore` or `restore` is called for `sig` meanwhile. Throws `unsupport
 + union SignalError {
     unsupported
     init
+
+    + fn to_string() String
 }
 ```
 
@@ -18959,6 +18798,8 @@ Takes a permit when one is free, without waiting; returns whether it did.
     empty
     full
     init
+
+    + fn to_string() String
 }
 ```
 
@@ -19106,60 +18947,11 @@ type Filter (fn(Value, Array[Value])(Value))
 ```js
 // HTML escaping as an `Escape`: the default of `Engine.escape` and `RenderOptions.escape`.
 + fn html_escape(input: local &[u8], out: Writer) uint !io:IoError
-// Renders a template registered with `set_content`.
-+ fn render(name: String, data: $T, options: ?RenderOptions (null)) String !ParseError $deprecated
-// Renders the template text `content`; includes resolve against `set_content` templates.
-+ fn render_content(content: String, data: $T, options: ?RenderOptions (null)) String !ParseError $deprecated
-// Writes `render_content(content, data, options)` to `out`.
-+ fn render_content_into(content: String, data: $T, out: Writer, options: ?RenderOptions (null)) uint !ParseError $deprecated
-// Writes `render(name, data, options)` to `out`.
-+ fn render_into(name: String, data: $T, out: Writer, options: ?RenderOptions (null)) uint !ParseError $deprecated
-// Registers `content` as the template named `name` for the free `render` functions.
-+ fn set_content(name: String, content: String) void $deprecated
-// Registers every entry of `content` as a template for the free `render` functions.
-+ fn set_content_many(content: Map[String]) void $deprecated
 ```
 
 ### html_escape
 
 HTML escaping as an `Escape`: the default of `Engine.escape` and `RenderOptions.escape`.
-
-### render
-
-Renders a template registered with `set_content`.
-
-Deprecated: create an `Engine` and call its `render`.
-
-### render_content
-
-Renders the template text `content`; includes resolve against `set_content` templates.
-
-Deprecated: create an `Engine` and call its `render_content`.
-
-### render_content_into
-
-Writes `render_content(content, data, options)` to `out`.
-
-Deprecated: create an `Engine` and call its `render_content_into`.
-
-### render_into
-
-Writes `render(name, data, options)` to `out`.
-
-Deprecated: create an `Engine` and call its `render_into`.
-
-### set_content
-
-Registers `content` as the template named `name` for the free `render` functions.
-
-Deprecated: create an `Engine` and call its `set`; see `Engine` for the per-thread
-pattern. The free functions keep one registry for all threads.
-
-### set_content_many
-
-Registers every entry of `content` as a template for the free `render` functions.
-
-Deprecated: create an `Engine` and call its `set_many`.
 
 ## Classes for 'template'
 
@@ -19307,6 +19099,7 @@ Pairs with `#embed_dir`, which yields a map of relative paths to file contents.
     + get line: uint
     + get message: String
     + get template_name: String
+    + fn to_string() String
 }
 ```
 
@@ -20477,6 +20270,8 @@ Greenwich: 3600 for CET, -18000 for EST.
 + union ZoneError {
     missing
     invalid
+
+    + fn to_string() String
 }
 ```
 

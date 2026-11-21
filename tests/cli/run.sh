@@ -1028,19 +1028,44 @@ for kind in class function ordinary; do
     fi
 done
 
-deprecated_out=$("$VALK" build "$DIR/deprecated.valk" --lint 2>&1) || {
+depr_dir="$workdir/depr-check"
+mkdir -p "$depr_dir/dep/src" "$depr_dir/app/src"
+cat > "$depr_dir/dep/valk.json" <<'EOF'
+{}
+EOF
+cat > "$depr_dir/dep/src/dep.valk" <<'EOF'
+/// Deprecated: use `new_helper` instead.
++ fn old_helper() uint $deprecated { return 1 }
+EOF
+cat > "$depr_dir/app/valk.json" <<'EOF'
+{ "dependencies": { "dep": { "src": "../dep" } } }
+EOF
+cat > "$depr_dir/app/src/main.valk" <<'EOF'
+use dep
+
+/// Deprecated: use `fresh`.
+fn stale() uint $deprecated { return 1 }
+fn fresh() uint { return 2 }
+
+fn main() {
+    println(stale() + fresh() + dep.old_helper())
+    let unused = 5
+}
+EOF
+
+deprecated_out=$("$VALK" build "$depr_dir/app" --lint 2>&1) || {
     echo "# --lint rejected a call to a deprecated function"
     echo "$deprecated_out"
     exit 1
 }
-if [[ "$deprecated_out" != *"'equal_bytes' is deprecated: old name of \`equals_bytes\`, kept because 0.7.0 shipped it."* ]] \
+if [[ "$deprecated_out" != *"'old_helper' is deprecated: use \`new_helper\` instead."* ]] \
     || [[ "$deprecated_out" == *"'stale' is deprecated"* ]]; then
     echo "# A deprecated function must warn from another package and stay quiet in its own"
     echo "$deprecated_out"
     exit 1
 fi
 
-quiet_deprecated_out=$("$VALK" build "$DIR/deprecated.valk" --lint --no-warn-deprecated 2>&1) || {
+quiet_deprecated_out=$("$VALK" build "$depr_dir/app" --lint --no-warn-deprecated 2>&1) || {
     echo "# --no-warn-deprecated rejected the build"
     echo "$quiet_deprecated_out"
     exit 1
@@ -1074,14 +1099,14 @@ if [[ "$hint_error_out" != *"parameter 'p' of 'hint_pt' may keep it"* ]] || [[ "
     exit 1
 fi
 
-# `shared T` is the old spelling of `atomic T`: it still builds and warns once
-spelling_out=$("$VALK" build "$DIR/shared-spelling.valk" -o "$output" --run 2>&1) || {
-    echo "# The old 'shared T' spelling failed to build or run"
+# `shared T` was removed in 0.9.0: it must fail with a migration message
+spelling_out=$("$VALK" build "$DIR/shared-spelling.valk" -o "$output" 2>&1) && {
+    echo "# The removed 'shared T' spelling must fail to build"
     echo "$spelling_out"
     exit 1
 }
-if [ "$(printf '%s' "$spelling_out" | grep -c "'shared T' is deprecated: write 'atomic T'")" -ne 1 ] || [[ "$spelling_out" != *"7"* ]]; then
-    echo "# 'shared T' must warn once and mean 'atomic T'"
+if [[ "$spelling_out" != *"'shared T' was removed: write 'atomic T'"* ]]; then
+    echo "# 'shared T' must explain to write 'atomic T'"
     echo "$spelling_out"
     exit 1
 fi

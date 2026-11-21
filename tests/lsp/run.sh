@@ -860,6 +860,14 @@ check "0.8.10: hover on atomic_cas builtin" \
     '"value":"```valk\nfn atomic_cas(target: T, expected: T, desired: T) bool\n```"' \
     "$(request textDocument/hover v0810.valk 53 16)"
 
+check "0.9.0: hover on named union variant in is .variant" \
+    '"value":"```valk\nColor.rgb(u8, u8, u8)\n```"' \
+    "$(request textDocument/hover v0810.valk 55 24)"
+
+check "0.9.0: definition on named union variant in is .variant" \
+    '"line":27,"character":' \
+    "$(request textDocument/definition v0810.valk 55 24)"
+
 # A message with broken headers is skipped; the messages after it are still answered
 for broken in 'X-Junk-Without-Colon\r\n\r\n' 'X-No-Length: 1\r\n\r\n{"x":1}' 'Content-Length: abc\r\n\r\n{"x":1}' '{ "body without headers": 1 }\r\n\r\n'; do
     count=$((count + 1))

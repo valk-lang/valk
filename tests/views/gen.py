@@ -159,7 +159,7 @@ PRELUDE = """class Item {
     v: int (0)
     + fn lt(o: Item) bool $lt { return this.v < o.v }
     + fn eq(o: Item) bool $eq { return this.v == o.v }
-    + fn hash() uint $hash { return this.v.to(uint) }
+    + fn hash() uint { return this.v.to(uint) }
 }
 class Holder {
     p: %s %s

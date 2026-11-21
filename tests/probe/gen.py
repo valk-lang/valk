@@ -295,7 +295,7 @@ let out: ?Item = null
 lock st as s {
     s.list.append(Item{})
     let v = s.list.get(0) ! return
-    out = @W($clone(v))
+    out = @W(clone v)
 }""",
      """let st: atomic Lock[Store] = .new(Store{}) !!
 let out: ?Item = null

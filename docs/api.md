@@ -91,6 +91,8 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     truncated
     too_large
     io(IoError) $auto
+
+    + fn to_string() String
 }
 ```
 
@@ -667,8 +669,6 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn skip(amount: uint) void
     // Returns whether the contents at byte `offset` begin with `str`.
     + fn starts_with(str: String, offset: uint (0)) bool
-    // A copy of the bytes the buffer can hold, written or not.
-    + get storage: String $deprecated
     // Exchanges the contents and storage with `other`, without copying.
     + fn swap(other: ByteBuffer) void
     // Returns a copy of the contents as a new `String`.
@@ -887,6 +887,8 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 // A general-purpose error with the single variant `error`.
 + union GenericError {
     error
+
+    + fn to_string() String
 }
 ```
 
@@ -1041,6 +1043,8 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 // A resource could not be created or set up (`init`).
 + union InitError {
     init
+
+    + fn to_string() String
 }
 ```
 
@@ -1048,6 +1052,8 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 // Ends an iteration: an iterator's `_next` method throws `end` when no items are left.
 + union IterError {
     end
+
+    + fn to_string() String
 }
 ```
 
@@ -1078,6 +1084,8 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     exists
     range
     empty
+
+    + fn to_string() String
 }
 ```
 
@@ -1370,6 +1378,8 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 // Text could not be parsed (`syntax`), as thrown by the number parsers such as `to_int`.
 + union SyntaxError {
     syntax
+
+    + fn to_string() String
 }
 ```
 
@@ -1378,6 +1388,8 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 + union SystemError {
     failed
     unsupported
+
+    + fn to_string() String
 }
 ```
 
@@ -1440,16 +1452,12 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn to_shortest_string() String
     // Writes the value like `to_shortest_string` into `buf` and returns the byte count.
     + fn to_shortest_string_in(buf: local mut &[u8], force_exponent: bool (false)) uint
-    // Writes the value like `to_shortest_string` to `buf` and returns the byte count.
-    + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint $deprecated
     // Writes the value like `to_shortest_string` to `out` and returns the bytes written.
     + fn to_shortest_string_into(out: Writer, force_exponent: bool (false)) uint !io:IoError
     // Returns the value as text; with `decimals`, with exactly that many digits after the dot.
     + fn to_string(decimals: ?uint (null), trim_zeros: bool (false)) String
     // Writes the value like `to_string` into `buf` and returns the byte count.
     + fn to_string_in(buf: local mut &[u8], decimals: ?uint (null), trim_zeros: bool (false)) uint
-    // Writes the value like `to_string` to `buf` and returns the byte count.
-    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint $deprecated
     // Writes the value like `to_string` to `out` and returns the bytes written.
     + fn to_string_into(out: Writer, decimals: ?uint (null), trim_zeros: bool (false)) uint !io:IoError
 }
@@ -1484,16 +1492,12 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn to_shortest_string() String
     // Writes the value like `to_shortest_string` into `buf` and returns the byte count.
     + fn to_shortest_string_in(buf: local mut &[u8], force_exponent: bool (false)) uint
-    // Writes the value like `to_shortest_string` to `buf` and returns the byte count.
-    + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint $deprecated
     // Writes the value like `to_shortest_string` to `out` and returns the bytes written.
     + fn to_shortest_string_into(out: Writer, force_exponent: bool (false)) uint !io:IoError
     // Returns the value as text; with `decimals`, with exactly that many digits after the dot.
     + fn to_string(decimals: ?uint (null), trim_zeros: bool (false)) String
     // Writes the value like `to_string` into `buf` and returns the byte count.
     + fn to_string_in(buf: local mut &[u8], decimals: ?uint (null), trim_zeros: bool (false)) uint
-    // Writes the value like `to_string` to `buf` and returns the byte count.
-    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint $deprecated
     // Writes the value like `to_string` to `out` and returns the bytes written.
     + fn to_string_into(out: Writer, decimals: ?uint (null), trim_zeros: bool (false)) uint !io:IoError
 }
@@ -1528,16 +1532,12 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn to_shortest_string() String
     // Writes the value like `to_shortest_string` into `buf` and returns the byte count.
     + fn to_shortest_string_in(buf: local mut &[u8], force_exponent: bool (false)) uint
-    // Writes the value like `to_shortest_string` to `buf` and returns the byte count.
-    + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint $deprecated
     // Writes the value like `to_shortest_string` to `out` and returns the bytes written.
     + fn to_shortest_string_into(out: Writer, force_exponent: bool (false)) uint !io:IoError
     // Returns the value as text; with `decimals`, with exactly that many digits after the dot.
     + fn to_string(decimals: ?uint (null), trim_zeros: bool (false)) String
     // Writes the value like `to_string` into `buf` and returns the byte count.
     + fn to_string_in(buf: local mut &[u8], decimals: ?uint (null), trim_zeros: bool (false)) uint
-    // Writes the value like `to_string` to `buf` and returns the byte count.
-    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint $deprecated
     // Writes the value like `to_string` to `out` and returns the bytes written.
     + fn to_string_into(out: Writer, decimals: ?uint (null), trim_zeros: bool (false)) uint !io:IoError
 }
@@ -1580,8 +1580,6 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn to_base_in(buf: local mut &[u8], base: i16, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i16, out: Writer, lowercase: bool (false)) uint !io:IoError
-    // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: i16, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -1632,8 +1630,6 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn to_base_in(buf: local mut &[u8], base: i32, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i32, out: Writer, lowercase: bool (false)) uint !io:IoError
-    // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: i32, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -1684,8 +1680,6 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn to_base_in(buf: local mut &[u8], base: i64, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i64, out: Writer, lowercase: bool (false)) uint !io:IoError
-    // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: i64, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -1736,8 +1730,6 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn to_base_in(buf: local mut &[u8], base: i8, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i8, out: Writer, lowercase: bool (false)) uint !io:IoError
-    // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: i8, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -1788,8 +1780,6 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn to_base_in(buf: local mut &[u8], base: int, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: int, out: Writer, lowercase: bool (false)) uint !io:IoError
-    // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: int, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -1966,8 +1956,6 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn to_base_in(buf: local mut &[u8], base: u16, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u16, out: Writer, lowercase: bool (false)) uint !io:IoError
-    // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: u16, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -2018,8 +2006,6 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn to_base_in(buf: local mut &[u8], base: u32, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u32, out: Writer, lowercase: bool (false)) uint !io:IoError
-    // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: u32, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -2072,8 +2058,6 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn to_base_in(buf: local mut &[u8], base: u64, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u64, out: Writer, lowercase: bool (false)) uint !io:IoError
-    // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: u64, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -2154,8 +2138,6 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn to_base_in(buf: local mut &[u8], base: u8, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u8, out: Writer, lowercase: bool (false)) uint !io:IoError
-    // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: u8, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -2214,8 +2196,6 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn to_base_in(buf: local mut &[u8], base: uint, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: uint, out: Writer, lowercase: bool (false)) uint !io:IoError
-    // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: uint, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -2453,6 +2433,8 @@ type c_long (int)
     invalid_input
     auth
     failed
+
+    + fn to_string() String
 }
 ```
 
@@ -2461,6 +2443,8 @@ type c_long (int)
 + union CryptoError {
     invalid_input
     write
+
+    + fn to_string() String
 }
 ```
 
@@ -2510,6 +2494,8 @@ type c_long (int)
     invalid_input
     key
     failed
+
+    + fn to_string() String
 }
 ```
 
@@ -3682,6 +3668,8 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     flow_control
     compression
     limit
+
+    + fn to_string() String
 }
 ```
 
@@ -3731,6 +3719,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     + get http_status: uint
     // Returns the underlying `io.IoError` if this error came from I/O, or `null`.
     + fn io_error() ?(IoError)
+    + fn to_string() String
 }
 ```
 
@@ -3744,6 +3733,8 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     missing_host_header
     not_implemented
     io(IoError) $auto
+
+    + fn to_string() String
 }
 ```
 
@@ -3972,13 +3963,6 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 ```
 
 ```js
-// A router error.
-+ union RouteError {
-    invalid
-}
-```
-
-```js
 // Maps a method and a URL path to a handler of type `T`.
 + class Router[T] {
     // Registers `handler` for `method` and the path pattern `url`.
@@ -4124,6 +4108,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 
     // Returns the underlying `io.IoError` if this error came from socket I/O, or `null`.
     + fn io_error() ?(IoError)
+    + fn to_string() String
 }
 ```
 
@@ -4313,6 +4298,8 @@ alias Fd for i32
     timeout
     range
     cancelled
+
+    + fn to_string() String
 }
 ```
 
@@ -4454,6 +4441,7 @@ alias Fd for i32
     + get at_index: uint
     + get character: u8
     + get message: String
+    + fn to_string() String
 }
 ```
 
@@ -4467,6 +4455,7 @@ alias Fd for i32
     + get at_index: uint
     + get character: u8
     + get message: String
+    + fn to_string() String
 }
 ```
 
@@ -4885,8 +4874,6 @@ alias Fd for i32
 + fn copy_bytes(from: ptr, to: ptr, length: uint) void
 // Copies the `T` at `from` to `to`; the two must not overlap.
 + fn copy_value[T](from: *T, to: *T) void
-// Deprecated: old name of `equals_bytes`, kept because 0.7.0 shipped it.
-+ fn equal_bytes(a: ptr, b: ptr, length: uint) bool $deprecated
 // Returns whether `a` and `b` have the same length and bytes.
 + fn equals(a: local &[u8], b: local &[u8]) bool
 // Returns whether the `length` bytes at `a` and `b` are identical.
@@ -5066,12 +5053,13 @@ type c_long (int)
 + union NetError {
     init
     connect
-    disconnected
     invalid_host
     ssl
     port_in_use
     max_connections
     io(IoError) $auto
+
+    + fn to_string() String
 }
 ```
 
@@ -5497,6 +5485,7 @@ type c_long (int)
 
     + get message: String
     + get position: uint
+    + fn to_string() String
 }
 ```
 
@@ -5537,6 +5526,8 @@ type c_long (int)
 + union SignalError {
     unsupported
     init
+
+    + fn to_string() String
 }
 ```
 
@@ -5738,6 +5729,8 @@ type c_long (int)
     empty
     full
     init
+
+    + fn to_string() String
 }
 ```
 
@@ -5794,18 +5787,6 @@ type Filter (fn(Value, Array[Value])(Value))
 ```js
 // HTML escaping as an `Escape`: the default of `Engine.escape` and `RenderOptions.escape`.
 + fn html_escape(input: local &[u8], out: Writer) uint !io:IoError
-// Renders a template registered with `set_content`.
-+ fn render(name: String, data: $T, options: ?RenderOptions (null)) String !ParseError $deprecated
-// Renders the template text `content`; includes resolve against `set_content` templates.
-+ fn render_content(content: String, data: $T, options: ?RenderOptions (null)) String !ParseError $deprecated
-// Writes `render_content(content, data, options)` to `out`.
-+ fn render_content_into(content: String, data: $T, out: Writer, options: ?RenderOptions (null)) uint !ParseError $deprecated
-// Writes `render(name, data, options)` to `out`.
-+ fn render_into(name: String, data: $T, out: Writer, options: ?RenderOptions (null)) uint !ParseError $deprecated
-// Registers `content` as the template named `name` for the free `render` functions.
-+ fn set_content(name: String, content: String) void $deprecated
-// Registers every entry of `content` as a template for the free `render` functions.
-+ fn set_content_many(content: Map[String]) void $deprecated
 ```
 
 ## Classes for 'template'
@@ -5849,6 +5830,7 @@ type Filter (fn(Value, Array[Value])(Value))
     + get line: uint
     + get message: String
     + get template_name: String
+    + fn to_string() String
 }
 ```
 
@@ -6202,6 +6184,8 @@ type Filter (fn(Value, Array[Value])(Value))
 + union ZoneError {
     missing
     invalid
+
+    + fn to_string() String
 }
 ```
 
