@@ -4,7 +4,7 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.9.0
++ Release 0.9.0
 + Breaking (language): replaced `error` declarations, `extends`, `payload`, and `error_is(...)` with named tagged `union` errors (`fn f() T !MyUnion`) using the out-of-band error ABI and `$auto` variant wrapping (`!>` / `throw` auto-wrap via direct or transitive `$auto` variants)
 + Breaking (stdlib): migrated all standard library error types to named tagged unions (`GenericError`, `SystemError`, `IterError`, `InitError`, `LookupError`, `SyntaxError`, `io.IoError`, `net.NetError`, `http.HttpError`, `http.HttpParseError`, `http.H2Error`, `http.WebSocketError`, `json.ParseError`, `json.DecodeError`, `regex.RegexError`, `template.ParseError`, `crypto.*`, `compress.CompressError`, `sync.SyncError`, `signal.SignalError`, `time.ZoneError`), renamed `AnError` to `GenericError`, added `to_string() String $auto` on all stdlib error unions, and removed dead `http.RouteError` and `net.NetError.disconnected`
 + Breaking (cleanup): removed deprecated `shared T` type modifier (use `atomic T`), `$clone(x)` (use `clone x`), `$clone`/`$hash` method flags, 0.7.0 `template` free functions (`set_content*`/`render*`), `mem.equal_bytes`, `ByteBuffer.storage`, and public `to_*_ptr` helpers
