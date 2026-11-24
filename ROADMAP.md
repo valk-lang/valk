@@ -4,6 +4,8 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
+- Release 0.9.3
+
 + Release 0.9.2
 + HTTP/3: added HTTP/3 over QUIC server and client support (`Server.http3`, `Client.http3`, `Options.http3`) backed by bundled OpenSSL 3.5 QUIC, with per-worker `SO_REUSEPORT` listeners, static file caching, compression, streaming, trailers, mTLS, and pooled multiplexed client connections
 + HTTP/2: added response trailers (`Response.trailers`, `Response.set_trailer`, `Response.add_trailer`) for gRPC and streaming responses, pooled stream serving coroutines, batched frame output, and faster HPACK/request handling
