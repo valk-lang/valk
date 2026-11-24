@@ -16,15 +16,13 @@ value H2_FAIL_NONE (0)
 value H2_FAIL_CLOSED (1)
 value H2_FAIL_READ (2)
 value H2_FAIL_WRITE (3)
-value H2_FAIL_TIMEOUT (4)
-value H2_FAIL_INVALID_RESPONSE (5)
-value H2_FAIL_TOO_LARGE (6)
+value H2_FAIL_INVALID_RESPONSE (4)
+value H2_FAIL_TOO_LARGE (5)
 
 fn h2_throw_fail(kind: u8) !HttpError {
     if kind == H2_FAIL_CLOSED : throw .io(.closed)
     if kind == H2_FAIL_READ : throw .io(.read)
     if kind == H2_FAIL_WRITE : throw .io(.write)
-    if kind == H2_FAIL_TIMEOUT : throw .io(.timeout)
     if kind == H2_FAIL_TOO_LARGE : throw .response_too_large
     throw .invalid_response
 }
@@ -45,7 +43,6 @@ class H2ClientStream {
     accepts_gzip: bool (false)
     max_header_size: uint (DEFAULT_MAX_RESPONSE_HEADER_SIZE)
     max_body_size: uint (DEFAULT_MAX_RESPONSE_BODY_SIZE)
-    bytes_sent: uint (0)
     done: bool (false)
     fail_kind: u8 (H2_FAIL_NONE)
     // Failed before response headers because the connection went away
@@ -74,14 +71,12 @@ class H2ClientStream {
 
 class H2ClientConnection {
     con: net.TcpConnection
-    key: String
     idle_timeout_ms: uint (60_000)
     write_timeout_ms: uint (5_000)
     closed: bool (false)
     reader_started: bool (false)
     reader_done: bool (false)
     goaway: bool (false)
-    goaway_last_stream: u32 (0)
     next_stream_id: u32 (1)
     peer_settings: H2Settings (.{})
     decoder: HpackDecoder (.{})
@@ -98,10 +93,9 @@ class H2ClientConnection {
     write_waiters: Array[sync.Waker] (.new())
     window_waiters: Array[sync.Waker] (.new())
 
-    static fn open(con: net.TcpConnection, key: String, idle_timeout_ms: uint, write_timeout_ms: uint) SELF !HttpError {
+    static fn open(con: net.TcpConnection, idle_timeout_ms: uint, write_timeout_ms: uint) SELF !HttpError {
         let conn = SELF {
             con: con,
-            key: key,
             idle_timeout_ms: idle_timeout_ms,
             write_timeout_ms: write_timeout_ms,
             last_activity_ms: time.mono_ms(),
@@ -148,13 +142,13 @@ class H2ClientConnection {
         while view.length > 0 {
             // Frames cut off halfway leave nothing else to say on this connection
             let n = this.con.write(view) ! {
-                this.close_internal(false)
+                this.close()
                 if E == .timeout : throw .io(.timeout)
                 if E == .closed || E == .cancelled : throw .io(.closed)
                 throw .io(.write)
             }
             if n == 0 || n > view.length {
-                this.close_internal(false)
+                this.close()
                 throw .io(.write)
             }
             view = view.view(n, view.length - n)
@@ -240,7 +234,7 @@ class H2ClientConnection {
             this.recv_buf.skip(n)
         }
         this.reader_done = true
-        this.close_internal(false)
+        this.close()
     }
 
     fn process_buffered_frames() !HttpError {
@@ -321,7 +315,6 @@ class H2ClientConnection {
             let last_stream = r.read_u32_be() & 0x7fffffff
             let err_code = r.read_u32_be()
             this.goaway = true
-            this.goaway_last_stream = last_stream
             let keys = Array[u32].new()
             each this.streams as st, sid : keys.append(sid)
             each keys as sid {
@@ -532,15 +525,8 @@ class H2ClientConnection {
     }
 
     fn close() {
-        this.close_internal(true)
-    }
-
-    fn close_internal(send_goaway: bool) {
         if this.closed : return
         this.closed = true
-        if send_goaway {
-            // Best-effort close on socket interrupt/close will wake reader
-        }
         this.fail_all(H2_FAIL_CLOSED, false)
         this.con.close() ! core.cleanup_warning("Failed to close HTTP/2 connection", __FILE__, __LINE__)
     }
@@ -689,7 +675,6 @@ class H2ClientConnection {
             st.send_window -= chunk.to(int)
             let wt = ClientRequest.remaining_timeout(deadline_ms, write_timeout_ms) !>
             this.write_bytes(frame_buf.view(), wt) !>
-            st.bytes_sent += chunk
             pos += chunk
         }
     }
@@ -880,7 +865,6 @@ fn send_h2_once(method: String, raw_url: String, options: ?Options, deadline_ms:
         return send_http1_once(method, raw_url, options, deadline_ms, client, null) !>
     }
 
-    let pool: ?ConnectionPool = isset(client) ? client.connections() : null
     let key = ""
     if isset(client) {
         key = connection_key(u.scheme, u.host, port, options)
@@ -898,12 +882,12 @@ fn send_h2_once(method: String, raw_url: String, options: ?Options, deadline_ms:
     }
 
     return send_h2_fresh(method, raw_url, u, port, is_https, proxy, options, deadline_ms,
-        connect_timeout_ms, read_timeout_ms, write_timeout_ms, key, client, pool) !>
+        connect_timeout_ms, read_timeout_ms, write_timeout_ms, key, client) !>
 }
 
 fn send_h2_fresh(method: String, raw_url: String, u: url.Url, port: u16, is_https: bool, proxy: ?ProxyTarget,
     options: ?Options, deadline_ms: uint, connect_timeout_ms: uint, read_timeout_ms: uint, write_timeout_ms: uint,
-    key: String, client: ?Client, pool: ?ConnectionPool) ClientResponse !HttpError {
+    key: String, client: ?Client) ClientResponse !HttpError {
     let alpn = Array[String]{ "h2", "http/1.1" }
     let con = ClientRequest.connect_socket(is_https, u.host, port, proxy, options, deadline_ms,
         connect_timeout_ms, read_timeout_ms, write_timeout_ms, alpn) !>
@@ -916,7 +900,7 @@ fn send_h2_fresh(method: String, raw_url: String, u: url.Url, port: u16, is_http
     }
 
     let idle_ms: uint = isset(client) ? client.idle_timeout_ms : 60_000
-    let h2c = H2ClientConnection.open(con, key, idle_ms, write_timeout_ms) !>
+    let h2c = H2ClientConnection.open(con, idle_ms, write_timeout_ms) !>
     if isset(client) {
         h2_store_pooled(client, key, h2c)
         let res = h2c.execute(method, u, options, deadline_ms) !>

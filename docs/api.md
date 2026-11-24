@@ -129,7 +129,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 + value EXEC_FAILED (-1)
 // The buffer size the `_in` float formatters require: the longest text any of them writes is 40 bytes, so 64 leaves room to spare.
 + value FLOAT_TEXT_SIZE (64)
-// Methods shared by every integer type. The buffer size `to_base_in` requires: a sign plus 64 binary digits.
+// The buffer size `to_base_in` requires: a sign plus 64 binary digits.
 + value INT_TEXT_SIZE (65)
 ```
 
@@ -715,7 +715,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn write_u64_be(v: u64) void
     // Appends `v` as 8 bytes, least significant first.
     + fn write_u64_le(v: u64) void
-    // Appends `v` as text in `base`, using uppercase digits above 9.
+    // Appends `v` as text in `base`, using uppercase digits above 9 unless `lowercase` is set.
     + fn write_uint_ascii(v: uint, base: u8 (10), lowercase: bool (false)) void
 }
 ```
@@ -1297,7 +1297,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn pad_right(char: u8, length: uint) String
     // Returns `len` random bytes, each drawn uniformly from the bytes of `characters`.
     + static fn random(len: uint, characters: String ("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")) String
-    // Returns a copy of `length` bytes from `start_index`; backs `str[start .. length]`.
+    // Returns a substring of `length` bytes from `start_index`; backs `str[start .. length]`.
     + fn range(start_index: uint, length: uint) String
     // Returns a `ByteReader` that reads the string's bytes from the start without copying them.
     + fn reader() ByteReader
@@ -1337,7 +1337,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn utf8.index_of(part: String, start_index: uint (0)) uint !LookupError
     // The number of UTF-8 characters, counted by walking the string from the start.
     + get utf8.length: uint
-    // Returns a copy of `length` characters starting at character index `start_index`.
+    // Returns a substring of `length` characters starting at character index `start_index`.
     + fn utf8.range(start_index: uint, length: uint) String
     // Splits the string on every occurrence of `on` that starts on a character boundary.
     + fn utf8.split(on: String, limit: uint (0)) Array[String]
@@ -3662,7 +3662,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 ```
 
 ```js
-// An HTTP/2 framing, HPACK or flow-control violation, found by the HTTP/2 server.
+// An HTTP/2 framing, HPACK or flow-control violation, found by the HTTP/2 server or client.
 + union H2Error {
     incomplete
     protocol
@@ -3764,7 +3764,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 ```
 
 ```js
-// Settings for a client request made with `http.request`, `http.download` or `ClientRequest.create`.
+// Settings for a client request made with `http.request`, `http.download` or `ClientRequest.new`.
 + class Options {
     // The ALPN protocols offered in the TLS handshake; defaults to `http/1.1`.
     + alpn_protocols: ?Array[String]
@@ -3931,7 +3931,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     + static fn stream(reader: Reader, size: ?uint (null), content_type: String ("application/octet-stream"), filename: ?String (null)) Response
     // Creates a `text/plain; charset=utf-8` response.
     + static fn text(body: String, code: u16 (200), headers: ?Headers (null)) Response
-    // Trailing headers sent after the response body over HTTP/2, created empty on first access.
+    // Trailing headers sent after the response body over HTTP/2 and HTTP/3, created empty on first access.
     + get trailers: Headers
 }
 ```
@@ -3989,15 +3989,15 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 ```
 
 ```js
-// A multi-threaded HTTP/1.1 server, with optional TLS and experimental HTTP/2.
+// A multi-threaded HTTP/1.1 server, with optional TLS, HTTP/2 and HTTP/3.
 + class Server {
     // A worker that wakes for only a few idle keep-alive connections waits this many milliseconds before it looks for more, so one wake-up serves the requests that arrived meanwhile together: fewer system calls, and handlers on a pipelined database connection share round trips (about 25% less CPU per request under moderate load). It waits only while idle connections wake often enough that more are expected in that time, so a trickle of requests is not delayed. A request on an idle connection may wait up to this long; a busy worker never waits. 0 turns it off.
     + batch_delay_ms: uint
     // How long each read of a request body may take, in milliseconds.
     + body_timeout_ms: uint
-    // Compresses responses with gzip for clients that accept it: text, HTML, CSS, JavaScript, JSON, XML and SVG of at least 1 KiB, and such files up to 1 MiB.
+    // Compresses responses with zstd or gzip for clients that accept it: text, HTML, CSS, JavaScript, JSON, XML and SVG of at least 1 KiB, and such files up to 1 MiB.
     + compress: bool
-    // The DEFLATE level `compress` uses, from 1 (fastest) to 9 (smallest). Defaults to 1: on JSON and HTML it is about 40% faster than level 6 and the output only a few percent larger, the trade nginx makes by default.
+    // The compression level `compress` uses, from 1 (fastest) to 9 (smallest). Defaults to 1: on JSON and HTML it is about 40% faster than level 6 and the output only a few percent larger, the trade nginx makes by default.
     + compress_level: uint
     // On Linux, plain connections live in io_uring's own table of sockets instead of the process's, so the open-file limit (`RLIMIT_NOFILE`) does not cap how many a server holds, and waiting connections receive into a buffer pool the kernel fills. Such a socket has no descriptor number: its local address and socket options are not available. Ignored with TLS, on other systems and on kernels before 5.19.
     + direct: bool
@@ -4917,7 +4917,7 @@ alias Fd for i32
 ## Aliases for 'net'
 
 ```js
-// An IPv4 or IPv6 address with a port: the peer of a datagram, or a bound endpoint. The buffer size `SocketAddress.ip_in` and `to_string_in` require.
+// The buffer size `SocketAddress.ip_in` and `to_string_in` require.
 + value ADDRESS_TEXT_SIZE (64)
 type c_long (int)
 ```
@@ -5076,6 +5076,7 @@ type c_long (int)
 ```
 
 ```js
+// An IPv4 or IPv6 address with a port: the peer of a datagram, or a bound endpoint.
 + struct SocketAddress {
     // True for an IPv6 address, false for IPv4.
     + ipv6: bool
@@ -5116,7 +5117,7 @@ type c_long (int)
     ~ connected: bool
     // The OpenSSL `SSL_CTX` handle.
     ~ ctx: SSL_CTX
-    // The OpenSSL error code recorded when a handshake failed; 0 when none was.
+    // The OpenSSL error code recorded on the last failure; 0 when none was.
     ~ error_code: uint
     // The socket descriptor the handshake ran on.
     ~ fd: i32
@@ -5135,7 +5136,7 @@ type c_long (int)
     + fn custom_error(msg: String) void !NetError
     // Returns the CA bundle files `new` tries, in order.
     + static fn default_ca_cert_paths() Array[String]
-    // Returns the OpenSSL error code of the last failed handshake; 0 when there was none.
+    // Returns the OpenSSL error code of the last failure; 0 when there was none.
     + fn get_error() uint
     // Returns the text of the last recorded error.
     + fn get_error_message() String
@@ -5194,7 +5195,7 @@ type c_long (int)
 + class TcpConnection is Reader, Writer, Closer {
     // The OS socket descriptor; for a connection accepted with `TcpServer.accept_direct`, its slot in the accepting thread's io_uring table instead.
     ~ fd: i32
-    // The host the connection was made to; empty for accepted connections and `new`.
+    // The host the connection was made to; empty for accepted connections and `wrap`.
     ~+ host: String
     // The lowest speed of one `write` in bytes per second, measured over `write_timeout_ms`; 0 means no minimum. A slower write throws `timeout`.
     + min_write_rate: uint

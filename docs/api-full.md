@@ -123,9 +123,9 @@ Levels above 9 act as 9.
 
 Writes `data` compressed into `format` at `level` to `out` and returns the bytes written.
 
-The compressed bytes reach `out` in pieces as they are produced, so only the 64 KiB
-input window and the current block are held in memory. Throws when `out` fails; bytes
-written before a failure stay written.
+The compressed bytes reach `out` in pieces as they are produced, so only the block
+window (64 KiB for DEFLATE formats, 128 KiB for Zstandard) and the current block are
+held in memory. Throws when `out` fails; bytes written before a failure stay written.
 
 ### crc32
 
@@ -354,7 +354,7 @@ Fills `buf` with decompressed bytes and returns how many were written; 0 means t
 + value EXEC_FAILED (-1)
 // The buffer size the `_in` float formatters require: the longest text any of them writes is 40 bytes, so 64 leaves room to spare.
 + value FLOAT_TEXT_SIZE (64)
-// Methods shared by every integer type. The buffer size `to_base_in` requires: a sign plus 64 binary digits.
+// The buffer size `to_base_in` requires: a sign plus 64 binary digits.
 + value INT_TEXT_SIZE (65)
 ```
 
@@ -369,7 +369,6 @@ is 40 bytes, so 64 leaves room to spare.
 
 ### INT_TEXT_SIZE
 
-Methods shared by every integer type.
 The buffer size `to_base_in` requires: a sign plus 64 binary digits.
 
 ## Enums for 'core'
@@ -2100,7 +2099,7 @@ Pauses the benchmark timer and allocation tracking until `start_timer` is called
     + fn write_u64_be(v: u64) void
     // Appends `v` as 8 bytes, least significant first.
     + fn write_u64_le(v: u64) void
-    // Appends `v` as text in `base`, using uppercase digits above 9.
+    // Appends `v` as text in `base`, using uppercase digits above 9 unless `lowercase` is set.
     + fn write_uint_ascii(v: uint, base: u8 (10), lowercase: bool (false)) void
 }
 ```
@@ -2364,7 +2363,7 @@ Appends the IEEE 754 bits of `v` as 8 bytes, least significant first.
 
 Appends `v` as text in `base`, with a leading `-` when negative.
 
-Uppercase digits above 9; a `base` above 16 is treated as 16 and one below 2 as 10.
+Uses uppercase digits above 9 unless `lowercase` is set; a `base` above 16 is treated as 16 and one below 2 as 10.
 
 #### write_little_endian
 
@@ -2396,7 +2395,7 @@ Appends `v` as 8 bytes, least significant first.
 
 #### write_uint_ascii
 
-Appends `v` as text in `base`, using uppercase digits above 9.
+Appends `v` as text in `base`, using uppercase digits above 9 unless `lowercase` is set.
 
 A `base` above 16 is treated as 16 and one below 2 as 10.
 
@@ -4000,7 +3999,7 @@ Throws `write` when the child closed its end, for example because it exited, and
     + fn pad_right(char: u8, length: uint) String
     // Returns `len` random bytes, each drawn uniformly from the bytes of `characters`.
     + static fn random(len: uint, characters: String ("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")) String
-    // Returns a copy of `length` bytes from `start_index`; backs `str[start .. length]`.
+    // Returns a substring of `length` bytes from `start_index`; backs `str[start .. length]`.
     + fn range(start_index: uint, length: uint) String
     // Returns a `ByteReader` that reads the string's bytes from the start without copying them.
     + fn reader() ByteReader
@@ -4040,7 +4039,7 @@ Throws `write` when the child closed its end, for example because it exited, and
     + fn utf8.index_of(part: String, start_index: uint (0)) uint !LookupError
     // The number of UTF-8 characters, counted by walking the string from the start.
     + get utf8.length: uint
-    // Returns a copy of `length` characters starting at character index `start_index`.
+    // Returns a substring of `length` characters starting at character index `start_index`.
     + fn utf8.range(start_index: uint, length: uint) String
     // Splits the string on every occurrence of `on` that starts on a character boundary.
     + fn utf8.split(on: String, limit: uint (0)) Array[String]
@@ -4369,10 +4368,11 @@ provide random bytes.
 
 #### range
 
-Returns a copy of `length` bytes from `start_index`; backs `str[start .. length]`.
+Returns a substring of `length` bytes from `start_index`; backs `str[start .. length]`.
 
-The range is clamped to the string, and a `start_index` past the end returns an empty
-string. Offsets count bytes, so the copy can cut a UTF-8 character in half.
+Shares the underlying storage without copying. The range is clamped to the string, and a
+`start_index` past the end returns an empty string. Offsets count bytes, so the result
+can cut a UTF-8 character in half.
 
 #### reader
 
@@ -4505,9 +4505,10 @@ cannot continue it.
 
 #### utf8.range
 
-Returns a copy of `length` characters starting at character index `start_index`.
+Returns a substring of `length` characters starting at character index `start_index`.
 
-The range is clamped to the string, and a start past the end returns an empty string.
+Shares the underlying storage without copying. The range is clamped to the string, and
+a start past the end returns an empty string.
 
 #### utf8.split
 
@@ -11414,7 +11415,7 @@ Connects and prepares a request without sending it; drive it with `progress`.
 
 Fails with `invalid_url` for anything but an `http`/`https` URL with a host, a URL
 with credentials or an out-of-range port, with `invalid_request` for an invalid
-method, path or header, and with the connection/TLS errors of `ClientRequest.create`.
+method, path or header, and with the connection/TLS errors of `ClientRequest.new`.
 Redirects are not followed.
 
 ### delete
@@ -11867,7 +11868,7 @@ kept when a name is sent more than once.
 
 Returns the uploaded files of a `multipart/form-data` body, by field name.
 
-A file part without its own `Content-Type` header is skipped.
+A file part without its own `Content-Type` header defaults to `text/plain`.
 
 #### form
 
@@ -11898,7 +11899,7 @@ Leading spaces of values are removed; trailing whitespace is kept.
 
 Returns the request body as JSON.
 
-Form bodies are turned into an object of string values, see `data()`. Any other
+Form bodies are turned into an object of string values, see `form()`. Any other
 body is decoded as JSON regardless of its content type; a body that is not valid
 JSON gives an empty object. `parse_json` throws for such a body instead.
 
@@ -12118,7 +12119,7 @@ only. Its `secure` flag applies too, and `Cookie.new` sets it.
 Stores the cookies of `response`, which answered a request to `url`.
 
 ```js
-// An HTTP/2 framing, HPACK or flow-control violation, found by the HTTP/2 server.
+// An HTTP/2 framing, HPACK or flow-control violation, found by the HTTP/2 server or client.
 + union H2Error {
     incomplete
     protocol
@@ -12133,7 +12134,7 @@ Stores the cookies of `response`, which answered a request to `url`.
 
 ### H2Error
 
-An HTTP/2 framing, HPACK or flow-control violation, found by the HTTP/2 server.
+An HTTP/2 framing, HPACK or flow-control violation, found by the HTTP/2 server or client.
 
 No public function throws it; the server answers with a connection error instead.
 
@@ -12386,7 +12387,7 @@ The `Content-Type` header for this form: `multipart/form-data` with its boundary
 Returns an empty form with a random boundary.
 
 ```js
-// Settings for a client request made with `http.request`, `http.download` or `ClientRequest.create`.
+// Settings for a client request made with `http.request`, `http.download` or `ClientRequest.new`.
 + class Options {
     // The ALPN protocols offered in the TLS handshake; defaults to `http/1.1`.
     + alpn_protocols: ?Array[String]
@@ -12469,7 +12470,7 @@ Returns an empty form with a random boundary.
 ### Options
 
 Settings for a client request made with `http.request`, `http.download` or
-`ClientRequest.create`.
+`ClientRequest.new`.
 
 #### alpn_protocols
 
@@ -12772,7 +12773,7 @@ kept when a name is sent more than once.
 
 Returns the uploaded files of a `multipart/form-data` body, by field name.
 
-A file part without its own `Content-Type` header is skipped.
+A file part without its own `Content-Type` header defaults to `text/plain`.
 
 #### form
 
@@ -12803,7 +12804,7 @@ Leading spaces of values are removed; trailing whitespace is kept.
 
 Returns the request body as JSON.
 
-Form bodies are turned into an object of string values, see `data()`. Any other
+Form bodies are turned into an object of string values, see `form()`. Any other
 body is decoded as JSON regardless of its content type; a body that is not valid
 JSON gives an empty object. `parse_json` throws for such a body instead.
 
@@ -12884,7 +12885,7 @@ wins. Throws `LookupError` when the query string has no such parameter.
     + static fn stream(reader: Reader, size: ?uint (null), content_type: String ("application/octet-stream"), filename: ?String (null)) Response
     // Creates a `text/plain; charset=utf-8` response.
     + static fn text(body: String, code: u16 (200), headers: ?Headers (null)) Response
-    // Trailing headers sent after the response body over HTTP/2, created empty on first access.
+    // Trailing headers sent after the response body over HTTP/2 and HTTP/3, created empty on first access.
     + get trailers: Headers
 }
 ```
@@ -13013,7 +13014,7 @@ Creates a `text/plain; charset=utf-8` response.
 
 #### trailers
 
-Trailing headers sent after the response body over HTTP/2, created empty on first access.
+Trailing headers sent after the response body over HTTP/2 and HTTP/3, created empty on first access.
 
 ```js
 // Writes the HTTP/1.1 response for one request; passed to `fast` handlers.
@@ -13040,7 +13041,7 @@ Trailing headers sent after the response body over HTTP/2, created empty on firs
 
 Writes the HTTP/1.1 response for one request; passed to `fast` handlers.
 
-Only the first `respond`, `send_status`, `send_file` or `send_stream` call per request
+Only the first `send`, `send_status`, `send_file` or `send_stream` call per request
 has an effect; later calls are ignored. A fast handler that does not respond makes
 the server answer 400 and close the connection. Output is buffered and sent by the
 server after the handler returns.
@@ -13073,7 +13074,7 @@ be opened.
 
 The content type follows from the file extension, unless `headers` has a
 `Content-Type`. With a `filename` the file is offered as a download under that
-name. The body is left out like `respond` leaves it out.
+name. The body is left out like `send` leaves it out.
 
 A 200 response to a `GET` or `HEAD` request carries `ETag` and `Last-Modified`,
 answers 304 when the client's copy is current and 206 for a `Range` of bytes,
@@ -13092,7 +13093,7 @@ reader; a reader that ends early fails the response and closes the connection.
 Without a `size` the body is copied until the reader returns 0: chunked, or for an
 HTTP/1.0 client until the connection closes. A `Content-Type` in `headers`
 replaces `content_type`. With a `filename` the body is offered as a download under
-that name. The body is left out like `respond` leaves it out, and then the reader
+that name. The body is left out like `send` leaves it out, and then the reader
 is not read.
 
 #### send_websocket
@@ -13218,15 +13219,15 @@ Throws `missing` when no route matches. `url` must not contain the query string.
 Creates an empty router; also backs `Router[T]{}` and default construction.
 
 ```js
-// A multi-threaded HTTP/1.1 server, with optional TLS and experimental HTTP/2.
+// A multi-threaded HTTP/1.1 server, with optional TLS, HTTP/2 and HTTP/3.
 + class Server {
     // A worker that wakes for only a few idle keep-alive connections waits this many milliseconds before it looks for more, so one wake-up serves the requests that arrived meanwhile together: fewer system calls, and handlers on a pipelined database connection share round trips (about 25% less CPU per request under moderate load). It waits only while idle connections wake often enough that more are expected in that time, so a trickle of requests is not delayed. A request on an idle connection may wait up to this long; a busy worker never waits. 0 turns it off.
     + batch_delay_ms: uint
     // How long each read of a request body may take, in milliseconds.
     + body_timeout_ms: uint
-    // Compresses responses with gzip for clients that accept it: text, HTML, CSS, JavaScript, JSON, XML and SVG of at least 1 KiB, and such files up to 1 MiB.
+    // Compresses responses with zstd or gzip for clients that accept it: text, HTML, CSS, JavaScript, JSON, XML and SVG of at least 1 KiB, and such files up to 1 MiB.
     + compress: bool
-    // The DEFLATE level `compress` uses, from 1 (fastest) to 9 (smallest). Defaults to 1: on JSON and HTML it is about 40% faster than level 6 and the output only a few percent larger, the trade nginx makes by default.
+    // The compression level `compress` uses, from 1 (fastest) to 9 (smallest). Defaults to 1: on JSON and HTML it is about 40% faster than level 6 and the output only a few percent larger, the trade nginx makes by default.
     + compress_level: uint
     // On Linux, plain connections live in io_uring's own table of sockets instead of the process's, so the open-file limit (`RLIMIT_NOFILE`) does not cap how many a server holds, and waiting connections receive into a buffer pool the kernel fills. Such a socket has no descriptor number: its local address and socket options are not available. Ignored with TLS, on other systems and on kernels before 5.19.
     + direct: bool
@@ -13296,7 +13297,7 @@ Creates an empty router; also backs `Router[T]{}` and default construction.
 
 ### Server
 
-A multi-threaded HTTP/1.1 server, with optional TLS and experimental HTTP/2.
+A multi-threaded HTTP/1.1 server, with optional TLS, HTTP/2 and HTTP/3.
 
 Configure the public fields, then call `start`. A server can be started once.
 
@@ -13322,7 +13323,7 @@ How long each read of a request body may take, in milliseconds.
 
 #### compress
 
-Compresses responses with gzip for clients that accept it: text, HTML, CSS,
+Compresses responses with zstd or gzip for clients that accept it: text, HTML, CSS,
 JavaScript, JSON, XML and SVG of at least 1 KiB, and such files up to 1 MiB.
 
 Adds `Vary: Accept-Encoding`. A response with its own `Content-Encoding` and a
@@ -13330,7 +13331,7 @@ streamed response are sent as they are.
 
 #### compress_level
 
-The DEFLATE level `compress` uses, from 1 (fastest) to 9 (smallest). Defaults to 1:
+The compression level `compress` uses, from 1 (fastest) to 9 (smallest). Defaults to 1:
 on JSON and HTML it is about 40% faster than level 6 and the output only a few percent
 larger, the trade nginx makes by default.
 
@@ -13482,7 +13483,7 @@ server.add_middleware(fn(req: http.Request, next: atomic fn(http.Request)(http.R
 Serves files from the directory `path` before a request reaches the handler.
 
 Throws `open` when `path` is not a directory. A request whose path names a file
-inside the directory gets that file whatever the method (over HTTP/2: except
+inside the directory gets that file whatever the method (over HTTP/2 and HTTP/3: except
 `CONNECT`). With `prefix` (such as `"/static"`), only paths under that URL prefix
 are matched and the prefix is stripped before resolving inside `path`. The path is
 percent-decoded first (`+` stays `+`); paths containing `..` are never served. The
@@ -13502,7 +13503,7 @@ Sets a fast handler, which is used instead of the regular one.
 
 It receives the parsed `Context` and writes to a `ResponseWriter`, skipping the
 `Request`/`Response` objects. A handler that does not respond makes the server
-answer 400 and close the connection. Not supported together with `http2`.
+answer 400 and close the connection. Not supported together with `http2` or `http3`.
 
 #### handle
 
@@ -13539,9 +13540,10 @@ Serves until `request_shutdown`/`shutdown` and every worker has drained.
 Runs `worker_count` workers, one per thread, one of them on the calling thread, so
 use `co` to keep working. A count of 0 uses the number of CPU threads; the
 count is clamped to 1-128. Throws `init` when the server was started before, when
-`http2` is set with a fast handler, or when a worker thread cannot
-be started (after the started workers have drained), and a network error when the
-port cannot be bound. `SIGPIPE` is ignored process-wide from then on.
+`http2` or `http3` is set with a fast handler, when `http3` is set without `tls`,
+or when a worker thread cannot be started (after the started workers have drained),
+and a network error when the port cannot be bound. `SIGPIPE` is ignored process-wide
+from then on.
 
 #### tls
 
@@ -13716,7 +13718,7 @@ The handler runs on the connection's coroutine after the `101` response is sent;
 the connection is closed when it returns. A request that is not a valid WebSocket
 upgrade (RFC 6455 §4.2.1) gets a `400` response instead and the handler never
 runs. `Server.request_shutdown` interrupts the socket, so a blocked `read` then
-fails with `closed`. Not available over HTTP/2.
+fails with `closed`. Not available over HTTP/2 or HTTP/3.
 
 When the client offers permessage-deflate (RFC 7692), `compression` accepts or
 declines it for this endpoint; null follows `Server.websocket_compression` (off).
@@ -14676,7 +14678,7 @@ write. Throws when `out` fails.
 Converts `data` to a JSON value.
 
 Strings, numbers and bools map to their JSON kinds, `null` to `null`, arrays to
-arrays, string-keyed maps to objects, and classes and structs to objects with one
+arrays, string- or integer-keyed maps to objects, and classes and structs to objects with one
 member per field. Field tags control serialization: `$tag(json: "name")` renames a
 field, `$tag(json: "-")` skips it, and `$tag(omitempty)` omits zero/empty values.
 Types with a `to_json_value` method use it. Any other value becomes
@@ -15220,7 +15222,7 @@ Integers must be JSON integers, or whole floats such as `3.0`, within the range 
 a float accepts any JSON
 number, so an integer such as `3` converts to `3.0` (a value that overflows `f32` is
 rejected). Types with a static `from_json_value` method use it; arrays and
-string-keyed maps convert item by item. For a class or struct the value must be an
+string- or integer-keyed maps convert item by item. For a class or struct the value must be an
 object: fields that are nullable or declare an explicit default may be absent or
 `null` and then get their default, every other field is required, and unknown
 members are ignored. Field tags control deserialization: `$tag(json: "name")`
@@ -16209,14 +16211,13 @@ maximum.
 ## Aliases for 'net'
 
 ```js
-// An IPv4 or IPv6 address with a port: the peer of a datagram, or a bound endpoint. The buffer size `SocketAddress.ip_in` and `to_string_in` require.
+// The buffer size `SocketAddress.ip_in` and `to_string_in` require.
 + value ADDRESS_TEXT_SIZE (64)
 type c_long (int)
 ```
 
 ### ADDRESS_TEXT_SIZE
 
-An IPv4 or IPv6 address with a port: the peer of a datagram, or a bound endpoint.
 The buffer size `SocketAddress.ip_in` and `to_string_in` require.
 
 ## Enums for 'net'
@@ -16647,6 +16648,7 @@ Thrown by address resolution, sockets, connections and TLS.
 - `io`: an underlying `io.IoError` failed on the socket or stream.
 
 ```js
+// An IPv4 or IPv6 address with a port: the peer of a datagram, or a bound endpoint.
 + struct SocketAddress {
     // True for an IPv6 address, false for IPv4.
     + ipv6: bool
@@ -16675,6 +16677,10 @@ Thrown by address resolution, sockets, connections and TLS.
     + fn to_string_in(buf: local mut &[u8]) uint
 }
 ```
+
+### SocketAddress
+
+An IPv4 or IPv6 address with a port: the peer of a datagram, or a bound endpoint.
 
 #### ipv6
 
@@ -16748,7 +16754,7 @@ Writes `to_string()` into `buf` and returns the byte count.
     ~ connected: bool
     // The OpenSSL `SSL_CTX` handle.
     ~ ctx: SSL_CTX
-    // The OpenSSL error code recorded when a handshake failed; 0 when none was.
+    // The OpenSSL error code recorded on the last failure; 0 when none was.
     ~ error_code: uint
     // The socket descriptor the handshake ran on.
     ~ fd: i32
@@ -16767,7 +16773,7 @@ Writes `to_string()` into `buf` and returns the byte count.
     + fn custom_error(msg: String) void !NetError
     // Returns the CA bundle files `new` tries, in order.
     + static fn default_ca_cert_paths() Array[String]
-    // Returns the OpenSSL error code of the last failed handshake; 0 when there was none.
+    // Returns the OpenSSL error code of the last failure; 0 when there was none.
     + fn get_error() uint
     // Returns the text of the last recorded error.
     + fn get_error_message() String
@@ -16832,7 +16838,7 @@ The OpenSSL `SSL_CTX` handle.
 
 #### error_code
 
-The OpenSSL error code recorded when a handshake failed; 0 when none was.
+The OpenSSL error code recorded on the last failure; 0 when none was.
 
 #### fd
 
@@ -16887,7 +16893,7 @@ list is built once per thread; each call returns a new copy of it.
 
 #### get_error
 
-Returns the OpenSSL error code of the last failed handshake; 0 when there was none.
+Returns the OpenSSL error code of the last failure; 0 when there was none.
 
 #### get_error_message
 
@@ -17063,7 +17069,7 @@ the file.
 + class TcpConnection is Reader, Writer, Closer {
     // The OS socket descriptor; for a connection accepted with `TcpServer.accept_direct`, its slot in the accepting thread's io_uring table instead.
     ~ fd: i32
-    // The host the connection was made to; empty for accepted connections and `new`.
+    // The host the connection was made to; empty for accepted connections and `wrap`.
     ~+ host: String
     // The lowest speed of one `write` in bytes per second, measured over `write_timeout_ms`; 0 means no minimum. A slower write throws `timeout`.
     + min_write_rate: uint
@@ -17123,7 +17129,7 @@ slot in the accepting thread's io_uring table instead.
 
 #### host
 
-The host the connection was made to; empty for accepted connections and `new`.
+The host the connection was made to; empty for accepted connections and `wrap`.
 
 #### min_write_rate
 
@@ -17227,7 +17233,7 @@ A non-empty `host` is passed to `Ssl.set_host`: a name is sent as the server nam
 (SNI) and the certificate must match it; an IP address is not sent, the certificate
 must match it as an address. A name given with `ssl.set_host` before the call takes
 its place, such as a certificate name that differs from the address connected to. With
-an empty `host` (connections from `new` and `accept`) no server name is sent and no
+an empty `host` (connections from `wrap` and `accept`) no server name is sent and no
 name is checked, unless `ssl.set_host` was called. Does nothing when TLS is already
 enabled. Throws `ssl`, `timeout`, `closed` or `os`.
 
@@ -18254,7 +18260,7 @@ when several are ready. `timeout_ms` 0 waits forever. Throws `timeout`, `cancell
 `cancel` fires, and `empty` for an empty list. Inside a coroutine only the coroutine waits.
 
 ```valk
-let ready = sync.select(.{ jobs, quit }, timeout_ms: 1000) !
+let ready = sync.select(.{ jobs, quit }, timeout_ms: 1000) ! break
 if ready == 0 : handle(jobs.try_recv() ! continue)
 ```
 
@@ -18499,8 +18505,8 @@ different keys rarely wait for each other, unlike one `Lock[HashMap[K, V]]`. Key
 values cross threads, so they are numbers, bools, strings or `atomic` objects. A call
 works on one key at a time; `snapshot` copies all entries, shard by shard.
 
-```rust
-let hits: shared sync.ConcurrentMap[String, uint] = sync.ConcurrentMap[String, uint].new() !!
+```valk
+let hits: atomic sync.ConcurrentMap[String, uint] = sync.ConcurrentMap[String, uint].new() !!
 hits.add("home", 1)
 let count = hits.get("home") ?? 0
 ```
@@ -18698,7 +18704,7 @@ Values cross threads, so `T` is a number, bool, string or `atomic` object.
 
 ```valk
 let count: atomic sync.RwLock[uint] = sync.RwLock[uint].new(0) !!
-count.write(fn(v: uint) uint { return v + 1 })
+count.update(fn(v: uint) uint { return v + 1 })
 ```
 
 #### get
@@ -18802,8 +18808,8 @@ Limits how many tasks do something at once: `acquire` takes a permit, waiting wh
 is free, and `release` gives it back.
 
 ```valk
-let slots: shared sync.Semaphore = sync.Semaphore.new(10) !
-slots.acquire() !
+let slots: atomic sync.Semaphore = sync.Semaphore.new(10) ! return
+slots.acquire() ! return
 defer slots.release()
 ```
 
@@ -18905,12 +18911,12 @@ count is back to 0. Share it across threads as `WaitGroup`. It holds no results:
 use `await` or a `Channel` for those.
 
 ```valk
-let wg: shared sync.WaitGroup = sync.WaitGroup.new() !
+let wg: atomic sync.WaitGroup = sync.WaitGroup.new() ! return
 each urls as u {
     wg.add(1)
     co download(u, wg) // calls wg.done() when finished
 }
-wg.wait() !
+wg.wait() ! return
 ```
 
 #### add
@@ -19119,9 +19125,10 @@ Registers `filter` for `{{ value | name }}` and `{{ value | name(args) }}`.
 
 The filter receives the value and the evaluated arguments and returns the value the
 output continues with. A custom filter replaces a built-in one of the same name. The
-built-in filters are `upper`, `lower`, `capitalize`, `trim`, `length`, `default(x)`,
-`join(sep)`, `first`, `last`, `reverse`, `round(decimals)`, `truncate(n, suffix)`,
-`replace(from, to)`, `json`, `escape`, `urlencode` and `keys`.
+built-in filters are `upper`, `lower`, `capitalize`, `trim`, `length` (`len`),
+`default(x)`, `join(sep)`, `first`, `last`, `reverse`, `round(decimals)`,
+`fixed(decimals)`, `truncate(n, suffix)`, `replace(from, to)`, `json`, `escape`,
+`urlencode` and `keys`.
 
 #### set_many
 
