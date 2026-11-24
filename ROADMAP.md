@@ -4,10 +4,11 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.9.2
++ Release 0.9.2
 + HTTP/3: added HTTP/3 over QUIC server and client support (`Server.http3`, `Client.http3`, `Options.http3`) backed by bundled OpenSSL 3.5 QUIC, with per-worker `SO_REUSEPORT` listeners, static file caching, compression, streaming, trailers, mTLS, and pooled multiplexed client connections
 + HTTP/2: added response trailers (`Response.trailers`, `Response.set_trailer`, `Response.add_trailer`) for gRPC and streaming responses, pooled stream serving coroutines, batched frame output, and faster HPACK/request handling
 + Performance (`http`, `tls`, `coro`, `template`, `html`, `json`, `core`): userspace timer heap for `io_uring` `Coro.sleep()`, `SSL_free_buffers()` on idle parked TLS connections (`~29 KiB/conn`), zero-allocation typed views in `template` rendering, 16-byte SIMD `html.escape`, fast `String` ordering, and faster `json` / `ByteBuffer` encoding
++ Build: prefer bundled OpenSSL 3.5 static archives (`libssl.a` / `libcrypto.a`) over older system OpenSSL libraries on Unix targets
 
 + Release 0.9.1
 + Fix (compiler): prevent transient union-error TLS transport slots from leaking into `#loop globals` / global GC root validation when a `global` initializer calls a function with a multi-payload union error (such as `json.ParseError`)
