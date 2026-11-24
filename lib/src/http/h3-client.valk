@@ -4,6 +4,7 @@ use url
 use time
 use io
 use sync
+use coro
 
 value H3_CLIENT_MAX_STREAMS (128)
 value H3_CLIENT_READ_SLICE_MS (1_000)
@@ -230,7 +231,7 @@ class H3ClientConnection {
             let max_wait: uint = this.streams.length > 0 || this.pending_streams.length > 0 ? 25 : 250
             let wait_ms = this.quic.event_timeout_ms(max_wait)
             if wait_ms == 0 {
-                this.waker.wait(1)
+                coro.await_last()
                 continue
             }
             if !this.watcher_armed {
@@ -318,6 +319,7 @@ class H3ClientConnection {
                 let ok2, flen, p2 = h3_varint_try_read(view, p1)
                 if !ok2 : break
                 if !u.got_settings && ftype != H3_FRAME_SETTINGS : return false
+                if ftype == H3_FRAME_DATA || ftype == H3_FRAME_HEADERS || ftype == H3_FRAME_PUSH_PROMISE : return false
                 if flen > 65_536 : return false
                 u.frame_in_progress = true
                 u.frame_type = ftype
@@ -332,13 +334,15 @@ class H3ClientConnection {
             if u.frame_type == H3_FRAME_SETTINGS {
                 if u.got_settings : return false
                 u.got_settings = true
+                let seen = HashMap[u64, bool].new()
                 let sp: uint = 0
                 while sp < payload.length {
                     let ok1, id, p1 = h3_varint_try_read(payload, sp)
                     if !ok1 : return false
                     let ok2, _, p2 = h3_varint_try_read(payload, p1)
                     if !ok2 : return false
-                    if h3_is_forbidden_setting(id) : return false
+                    if h3_is_forbidden_setting(id) || seen.has(id) : return false
+                    seen.set(id, true)
                     sp = p2
                 }
             } else if u.frame_type == H3_FRAME_GOAWAY {
@@ -372,13 +376,15 @@ class H3ClientConnection {
                 @unsafe
                 while st.send_pos < st.send_buf.length {
                     let rem = st.send_buf.length - st.send_pos
+                    let flags: u64 = st.send_fin ? net.SSL_WRITE_FLAG_CONCLUDE : 0
                     let written: uint = 0
-                    let ok = net.SSL_write_ex(s, st.send_buf.data.@offset(st.send_pos), rem, @ref(written).@cast(ptr))
+                    let ok = net.SSL_write_ex2(s, st.send_buf.data.@offset(st.send_pos), rem, flags, @ref(written).@cast(ptr))
                     if ok == 1 && written > 0 {
                         progressed = true
                         this.last_activity_ms = time.mono_ms()
                         st.send_pos += written
                         st.bytes_sent += written
+                        if st.send_fin && written == rem : st.sent_fin = true
                         continue
                     }
                     let err = net.SSL_get_error(s, ok)
@@ -387,12 +393,14 @@ class H3ClientConnection {
                     }
                     break
                 }
-                if !st.done && st.send_fin && st.send_pos == st.send_buf.length {
+                if !st.done && st.send_pos == st.send_buf.length {
                     st.send_buf.clear()
                     st.send_pos = 0
-                    if net.SSL_stream_conclude(s, 0) == 1 {
-                        st.sent_fin = true
-                        progressed = true
+                    if st.send_fin && !st.sent_fin {
+                        if net.SSL_stream_conclude(s, 0) == 1 {
+                            st.sent_fin = true
+                            progressed = true
+                        }
                     }
                 }
             }
@@ -493,24 +501,20 @@ class H3ClientConnection {
                         let status: u16 = 0
                         let saw_regular = false
                         each fields as f {
-                            if f.name.bytes == 0 {
+                            if f.name.bytes == 0 || !response_header_value_is_safe(f.value) {
                                 st.fail(H2_FAIL_INVALID_RESPONSE, false)
                                 return
                             }
                             if f.name[0] == ':' {
-                                if saw_regular || f.name != ":status" || status != 0 {
+                                if saw_regular || f.name != ":status" || status != 0 || f.value.bytes != 3 {
                                     st.fail(H2_FAIL_INVALID_RESPONSE, false)
                                     return
                                 }
-                                let parsed = f.value.to_uint() ! {
+                                if f.value[0] < '1' || f.value[0] > '5' || f.value[1] < '0' || f.value[1] > '9' || f.value[2] < '0' || f.value[2] > '9' {
                                     st.fail(H2_FAIL_INVALID_RESPONSE, false)
                                     return
                                 }
-                                if parsed < 100 || parsed > 999 {
-                                    st.fail(H2_FAIL_INVALID_RESPONSE, false)
-                                    return
-                                }
-                                status = parsed.to(u16)
+                                status = ((f.value[0] - '0').to(u16) * 100) + ((f.value[1] - '0').to(u16) * 10) + (f.value[2] - '0').to(u16)
                                 continue
                             }
                             saw_regular = true
@@ -532,7 +536,7 @@ class H3ClientConnection {
                 }
             } else if st.frame_type == H3_FRAME_DATA {
                 if !st.is_head && take > 0 {
-                    if st.max_body_size > 0 && st.body_bytes + take > st.max_body_size {
+                    if st.max_body_size > 0 && (st.body_bytes > st.max_body_size || take > st.max_body_size - st.body_bytes) {
                         st.fail(H2_FAIL_TOO_LARGE, false)
                         return
                     }

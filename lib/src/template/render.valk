@@ -27,8 +27,9 @@ use html
 /// ```
 ///
 /// A template is compiled the first time it renders and the compiled form is kept until
-/// it is registered again. Output is HTML-escaped unless `escape` says otherwise, so an
-/// engine can just as well produce plain text, SQL or any other format.
+/// it is registered again. Output is context-aware HTML-escaped unless `escape` or
+/// `auto_escape` says otherwise, so an engine can just as well produce plain text, SQL
+/// or any other format.
 + class Engine {
     - sources: Map[String] (.{})
     - compiled: Map[Template] (.{})
@@ -42,7 +43,15 @@ use html
     ///     return out.write(input.to_string().replace("'", "''")) !>
     /// }
     /// ```
-    + escape: ?Escape (html_escape)
+    + escape: ?Escape (default_html_escape)
+    /// Enables context-aware HTML auto-escaping (HTML text, quoted and unquoted
+    /// attributes, URL attributes, `<script>` JS, and `<style>` / `style=` CSS) when
+    /// `escape` is the default `html_escape`. Defaults to `true`.
+    + auto_escape: bool (true)
+    /// Optional fallback loader called when a template name is not registered via `set`
+    /// or `set_many`. Loaded templates are compiled and cached until `remove` or
+    /// `clear_cache` is called.
+    + loader: ?Loader (null)
 
     /// Creates an empty engine.
     + static fn new() SELF $default {
@@ -62,6 +71,18 @@ use html
         each content as text, name : this.set(name, text)
     }
 
+    /// Removes the registered template `name` and any cached compiled form of it.
+    + fn remove(name: String) {
+        this.sources.remove(name)
+        this.compiled.remove(name)
+    }
+
+    /// Clears all cached compiled templates so they recompile (or reload via `loader`) on
+    /// next render.
+    + fn clear_cache() {
+        this.compiled = Map[Template]{}
+    }
+
     /// Registers `filter` for `{{ value | name }}` and `{{ value | name(args) }}`.
     ///
     /// The filter receives the value and the evaluated arguments and returns the value the
@@ -69,7 +90,7 @@ use html
     /// built-in filters are `upper`, `lower`, `capitalize`, `trim`, `length` (`len`),
     /// `default(x)`, `join(sep)`, `first`, `last`, `reverse`, `round(decimals)`,
     /// `fixed(decimals)`, `truncate(n, suffix)`, `replace(from, to)`, `json`, `escape`,
-    /// `urlencode` and `keys`.
+    /// `raw`, `urlencode` and `keys`.
     + fn set_filter(name: String, filter: Filter) {
         this.filters.set(name, filter)
     }
@@ -81,17 +102,18 @@ use html
 
     /// Renders the registered template `name` with `data` and returns the output.
     ///
-    /// `data` is converted with `json.from`, so template variables are its fields or map
-    /// keys. `{{ }}` output goes through the engine's `escape` (HTML by default), or
-    /// through `options.escape` when options are given, `{! !}` is written raw, and leading and trailing whitespace is trimmed
-    /// from the result. `@include` and `@extend` look templates up in this engine, may not
-    /// form a cycle, and may nest at most `options.max_depth` templates deep (64 by
-    /// default), not counting `name` itself.
+    /// `data` is read directly when it is a typed struct/class or converted via `json.from`,
+    /// so template variables are its fields or map keys. `{{ }}` output goes through the
+    /// engine's `escape` (context-aware HTML by default), or through `options.escape` when
+    /// options are given, `{! !}` and `{{ expr | raw }}` write raw, and leading and trailing
+    /// whitespace is trimmed from the result. `@include` and `@extend` look templates up in
+    /// this engine (falling back to `loader`), may not form a cycle, and may nest at most
+    /// `options.max_depth` templates deep (64 by default), not counting `name` itself.
     ///
     /// Throws `.template_not_found` when `name` is not registered, `.parse` on a syntax error,
     /// an unknown template in `@include`/`@extend`, a cycle, too deep nesting, an unknown
-    /// filter or a variable or property that does not exist (`message` names the line and
-    /// template).
+    /// filter or a variable or property that does not exist (`message` names the line,
+    /// column and template).
     + fn render(name: String, data: $T, options: ?RenderOptions (null)) String !ParseError {
         let out = ByteBuffer.new(1024)
         this.render_into(name, data, out, options) !>
@@ -108,14 +130,15 @@ use html
                 default => throw E
             }
         }
-        let renderer = Renderer { engine: this, options: options, root: datum_from(data) }
-        return renderer.render_to(compiled, Array[String]{ name }, out, name) !>
+        let renderer = Renderer.create(this, options, datum_from(data))
+        return renderer.render_to(compiled, name, out) !>
     }
 
     /// Renders the template text `content` with `data` and returns the output.
     ///
     /// Works like `render` without looking up a name first; `@include` and `@extend` still
-    /// resolve against the registered templates. Throws `.parse` as `render` does.
+    /// resolve against the registered templates (and `loader`). Throws `.parse` as `render`
+    /// does.
     + fn render_content(content: String, data: $T, options: ?RenderOptions (null)) String !ParseError {
         let out = ByteBuffer.new(1024)
         this.render_content_into(content, data, out, options) !>
@@ -127,14 +150,19 @@ use html
     /// Throws `ParseError` as `render_content` does, and `.write` when `out` fails.
     + fn render_content_into(content: String, data: $T, out: io.Writer, options: ?RenderOptions (null)) uint !ParseError {
         let compiled = Compiler { content: content }.compile() !>
-        let renderer = Renderer { engine: this, options: options, root: datum_from(data) }
-        return renderer.render_to(compiled, Array[String]{}, out, "") !>
+        let renderer = Renderer.create(this, options, datum_from(data))
+        return renderer.render_to(compiled, "", out) !>
     }
 
     // The compiled template `name`, compiled on first use since its registration
     fn compiled_template(name: String) Template !ParseError {
         this.compiled.get(name) -> ready : return ready
-        let source = this.sources.get(name) ! throw .missing(name, "Template not found", 0)
+        let source = this.sources.get(name) !? null
+        if !isset(source) {
+            let loader = this.loader
+            if isset(loader) : source = loader(name)
+        }
+        if !isset(source) : throw .missing(name, "Template not found", 0)
         let compiled = Compiler { name: name, content: source }.compile() !>
         this.compiled.set(name, compiled)
         return compiled
@@ -171,23 +199,78 @@ class Frame {
     }
 }
 
+class BlockEntry {
+    template: Template
+    nodes: Array[Node]
+    frame: Frame
+    root: Datum
+}
+
+// Ordered inheritance chain for each block name: index 0 is the most derived override,
+// followed by parent definitions so `@super()` can walk up the hierarchy.
+class BlockChain {
+    blocks: Map[Array[BlockEntry]] (.{})
+
+    fn add(name: String, entry: BlockEntry) {
+        this.blocks.get(name) -> list {
+            list.append(entry)
+            return
+        }
+        this.blocks.set(name, Array[BlockEntry]{ entry })
+    }
+
+    fn pop(name: String) {
+        this.blocks.get(name) -> list {
+            list.pop_last() ! return
+        }
+    }
+
+    fn get_list(name: String) ?Array[BlockEntry] {
+        return this.blocks.get(name) !? null
+    }
+}
+
 class Renderer {
     engine: Engine
     options: ?RenderOptions
     root: Datum
+    escape: ?Escape (null)
+    default_html: bool (false)
+    auto_escape: bool (false)
+
+    static fn create(engine: Engine, options: ?RenderOptions, root: Datum) Renderer {
+        let escape = isset(options) ? options.escape : engine.escape
+        let default_html = isset(escape) && (escape == default_html_escape || escape == html_escape)
+        let auto_escape = false
+        if default_html {
+            auto_escape = engine.auto_escape
+            if isset(options) {
+                let opt_auto = options.auto_escape
+                if isset(opt_auto) : auto_escape = opt_auto
+            }
+        }
+        return Renderer {
+            engine: engine
+            options: options
+            root: root
+            escape: escape
+            default_html: default_html
+            auto_escape: auto_escape
+        }
+    }
 
     // Renders `template` into `out`: straight into a `ByteBuffer`, through a page buffer for
     // any other writer. Returns the bytes written.
-    fn render_to(template: Template, templates: Array[String], out: io.Writer, name: String) uint !ParseError {
+    fn render_to(template: Template, name: String, out: io.Writer) uint !ParseError {
         match out {
             ByteBuffer as buf => {
                 let start = buf.length
-                this.render_template(template, Frame {}, templates, 0, Map[ByteBuffer]{}, this.root, buf) !>
+                this.render_template(template, Frame {}, null, 0, null, this.root, null, buf) !>
                 return buf.length - start
             }
             default => {
                 let page = ByteBuffer.new(1024)
-                this.render_template(template, Frame {}, templates, 0, Map[ByteBuffer]{}, this.root, page) !>
+                this.render_template(template, Frame {}, null, 0, null, this.root, null, page) !>
                 return out.write(page) ! throw .write(name, "The writer refused the rendered page")
             }
         }
@@ -197,9 +280,9 @@ class Renderer {
     // whitespace like an include or the page itself. `templates` names the templates
     // being rendered, for cycle detection, and `depth` how many includes and extends are
     // above this one.
-    fn render_template(template: Template, frame: Frame, templates: Array[String], depth: uint, chain: Map[ByteBuffer], root: Datum, out: ByteBuffer) !ParseError {
+    fn render_template(template: Template, frame: Frame, templates: ?Array[String], depth: uint, chain: ?BlockChain, root: Datum, scanner: ?HtmlScanner, out: ByteBuffer) !ParseError {
         let start = out.length
-        let state = RenderState { template: template, templates: templates, depth: depth, chain: chain, root: root }
+        let state = RenderState { template: template, templates: templates, depth: depth, chain: chain, root: root, scanner: scanner }
         this.render_nodes(template.nodes, frame, state, out) !>
 
         let parent_name = template.extends
@@ -215,63 +298,75 @@ class Renderer {
         tail.trim(u8.is_whitespace)
         out.truncate(split)
         trim_region(out, start)
-        let parent = this.load(parent_name, state, template.extends_line) !>
-        this.enter(templates, parent_name, depth, state) !>
-        this.render_template(parent, frame, templates, depth + 1, chain, root, out) !>
-        templates.pop_last() !? ""
+        let parent = this.load(parent_name, state, template.extends_line, template.extends_col, template.extends_offset) !>
+        let stack = state.ensure_templates()
+        this.enter(stack, parent_name, depth, state, template.extends_line, template.extends_col, template.extends_offset) !>
+        let parent_frame = Frame { parent: frame }
+        this.render_template(parent, parent_frame, stack, depth + 1, state.chain, root, scanner, out) !>
+        stack.pop_last() !? ""
         out.write(tail)
+    }
+
+    fn render_block_layer(block_name: String, list: Array[BlockEntry], layer: uint, state: RenderState, scanner: ?HtmlScanner, out: ByteBuffer, line: uint, col: uint, offset: uint) !ParseError {
+        let entry = list.get(layer) ! return
+        let key = block_name + "#" + layer
+        let active_blocks = state.active_blocks
+        if !isset(active_blocks) {
+            let created = Array[String]{}
+            state.active_blocks = created
+            active_blocks = created
+        }
+        each active_blocks as active {
+            if active == key : this.fail("Block cycle: '" + block_name + "'", line, col, offset, state)
+        }
+        let max_depth = TEMPLATE_MAX_DEPTH
+        let options = this.options
+        if isset(options) : max_depth = options.max_depth
+        if active_blocks.length >= max_depth : this.fail("Block nesting depth exceeds the maximum of " + max_depth, line, col, offset, state)
+        active_blocks.append(key)
+        let block_start = out.length
+        let block_state = RenderState {
+            template: entry.template
+            templates: state.templates
+            depth: state.depth
+            chain: state.chain
+            root: entry.root
+            active_block: block_name
+            active_block_index: layer
+            active_blocks: active_blocks
+            scanner: scanner
+        }
+        this.render_nodes(entry.nodes, entry.frame, block_state, out) ! {
+            active_blocks.pop_last() !? ""
+            throw E
+        }
+        active_blocks.pop_last() !? ""
+        trim_region(out, block_start)
+    }
+
+    fn child_scanner(node: Node, state: RenderState) ?HtmlScanner {
+        let cur = state.scanner
+        if isset(cur) : return cur
+        let entry = node.entry_scanner
+        if isset(entry) : return entry.clone()
+        return null
     }
 
     fn render_nodes(nodes: Array[Node], frame: Frame, state: RenderState, out: ByteBuffer) !ParseError {
         each nodes as node {
             if node.type == NODE_TEXT {
                 out.write(node.text)
+                let sc = state.scanner
+                if isset(sc) : sc.feed(node.text)
             } else if node.type == NODE_OUTPUT {
                 let expr = node.expr ?! continue
-                let value = this.eval_datum(expr, frame, state) !>
-                let options = this.options
-                let escape: ?Escape = null
-                if !node.raw : escape = isset(options) ? options.escape : this.engine.escape
-                let default_html = isset(escape) && escape == html_escape
-                // Strings and numbers fast-path straight to `out` without converting through `json.Value`
-                match value {
-                    String as text => {
-                        if default_html {
-                            html.escape_into(text, out) ! throw .write(state.template.name ?? "?", "The escape function failed")
-                        } else if isset(escape) {
-                            escape(text, out) ! throw .write(state.template.name ?? "?", "The escape function failed")
-                        } else {
-                            out.write(text)
-                        }
-                    }
-                    int as number => {
-                        if !isset(escape) || default_html {
-                            out.write_int_ascii(number)
-                        } else {
-                            let digits: [u8 x 65] = @undefined
-                            let scratch: local mut &[u8] = &digits
-                            let text = scratch.view(0, number.to_base_in(scratch, 10))
-                            escape(text, out) ! throw .write(state.template.name ?? "?", "The escape function failed")
-                        }
-                    }
-                    float as number => {
-                        let digits: [u8 x 65] = @undefined
-                        let scratch: local mut &[u8] = &digits
-                        let text = scratch.view(0, number.to_shortest_string_in(scratch))
-                        if !isset(escape) || default_html : out.write(text)
-                        else : escape(text, out) ! throw .write(state.template.name ?? "?", "The escape function failed")
-                    }
-                    default => {
-                        let text = value_text(datum_to_json(value))
-                        if default_html {
-                            html.escape_into(text, out) ! throw .write(state.template.name ?? "?", "The escape function failed")
-                        } else if isset(escape) {
-                            escape(text, out) ! throw .write(state.template.name ?? "?", "The escape function failed")
-                        } else {
-                            out.write(text)
-                        }
-                    }
+                let raw = node.raw
+                if !raw && expr.type == EXPR_FILTER && expr.name == "raw" && !isset(this.engine.filter("raw")) {
+                    raw = true
+                    expr = expr.left ?! continue
                 }
+                let value = this.eval_datum(expr, frame, state) !>
+                this.write_output_value(value, raw, node, state, out) !>
             } else if node.type == NODE_IF {
                 each node.branches as arm {
                     let cond = arm.cond
@@ -326,7 +421,7 @@ class Renderer {
                     }
                     default => {}
                 }
-                if !isset(items) : this.fail("@each value must be an array or object", node.line, state)
+                if !isset(items) : this.fail("@each value must be an array or object", node.line, node.col, node.offset, state)
                 if items.length == 0 {
                     let empty = node.empty_body
                     if isset(empty) : this.render_nodes(empty, frame, state, out) !>
@@ -345,7 +440,7 @@ class Renderer {
                     this.render_nodes(node.body, inner, state, out) !>
                 }
             } else if node.type == NODE_INCLUDE {
-                let included = this.load(node.name, state, node.line) !>
+                let included = this.load(node.name, state, node.line, node.col, node.offset) !>
                 let include_frame = frame
                 let include_root = state.root
                 let expr = node.expr
@@ -354,25 +449,120 @@ class Renderer {
                     include_root = datum_snapshot(this.eval_datum(expr, frame, state) !>)
                     include_frame = Frame {}
                 }
-                this.enter(state.templates, node.name, state.depth, state) !>
-                this.render_template(included, include_frame, state.templates, state.depth + 1, Map[ByteBuffer]{}, include_root, out) !>
-                state.templates.pop_last() !? ""
+                let stack = state.ensure_templates()
+                this.enter(stack, node.name, state.depth, state, node.line, node.col, node.offset) !>
+                let inc_scanner = this.child_scanner(node, state)
+                this.render_template(included, include_frame, stack, state.depth + 1, null, include_root, inc_scanner, out) !>
+                stack.pop_last() !? ""
             } else if node.type == NODE_EXTEND {
                 state.extend_offset = out.length
             } else if node.type == NODE_BLOCK {
-                // A block of a more derived template was stored first and wins
-                if !state.chain.has(node.name) {
-                    let body = ByteBuffer.new(256)
-                    this.render_nodes(node.body, frame, state, body) !>
-                    body.trim(u8.is_whitespace)
-                    state.chain.set(node.name, body)
+                let chain = state.ensure_chain()
+                let entry = BlockEntry { template: state.template, nodes: node.body, frame: frame, root: state.root }
+                if isset(state.template.extends) {
+                    // Extending template: record override for the parent layout
+                    chain.add(node.name, entry)
+                } else {
+                    // Root or standalone template: render the most derived override or
+                    // this default body, popping the fallback entry afterwards so loops
+                    // do not duplicate it
+                    chain.add(node.name, entry)
+                    let list = chain.get_list(node.name)
+                    if isset(list) {
+                        let block_scanner = this.child_scanner(node, state)
+                        this.render_block_layer(node.name, list, 0, state, block_scanner, out, node.line, node.col, node.offset) ! {
+                            chain.pop(node.name)
+                            throw E
+                        }
+                    }
+                    chain.pop(node.name)
                 }
             } else if node.type == NODE_YIELD {
-                let content = state.chain.get(node.name) ! this.fail("No block found named: " + node.name, node.line, state)
-                out.write(content)
+                let chain = state.chain
+                let list = isset(chain) ? chain.get_list(node.name) : null
+                if isset(list) && list.length > 0 {
+                    let block_scanner = this.child_scanner(node, state)
+                    this.render_block_layer(node.name, list, 0, state, block_scanner, out, node.line, node.col, node.offset) !>
+                } else {
+                    let fallback = node.expr
+                    if isset(fallback) {
+                        let val = this.eval_datum(fallback, frame, state) !>
+                        this.write_output_value(val, false, node, state, out) !>
+                    } else {
+                        this.fail("No block found named: " + node.name, node.line, node.col, node.offset, state)
+                    }
+                }
+            } else if node.type == NODE_SUPER {
+                let block_name = state.active_block
+                if !isset(block_name) : this.fail("@super() can only be used inside a @block", node.line, node.col, node.offset, state)
+                let chain = state.chain
+                let list = isset(chain) ? chain.get_list(block_name) : null
+                let next_layer = state.active_block_index + 1
+                if !isset(list) || next_layer >= list.length {
+                    this.fail("No parent block named '" + block_name + "' for @super()", node.line, node.col, node.offset, state)
+                }
+                this.render_block_layer(block_name, list, next_layer, state, state.scanner, out, node.line, node.col, node.offset) !>
             } else if node.type == NODE_SET {
                 let expr = node.expr ?! continue
                 frame.set_var(node.name, this.eval_datum(expr, frame, state) !>)
+            }
+        }
+    }
+
+    fn write_output_value(value: Datum, raw: bool, node: Node, state: RenderState, out: ByteBuffer) !ParseError $inline {
+        let default_html = !raw && this.default_html
+        let escape: ?Escape = raw ? null : this.escape
+        if default_html && this.auto_escape {
+            let ctx = node.ctx
+            let url_prefix = node.url_prefix
+            let sc = state.scanner
+            if isset(sc) {
+                ctx = sc.output_ctx()
+                if is_url_ctx(ctx) : url_prefix = sc.attr_val_prefix
+                if sc.state == SCAN_BEFORE_ATTR_VAL : sc.state = SCAN_ATTR_VAL_UNQ
+            }
+            if ctx != CTX_TEXT && ctx != CTX_ATTR_DQ && ctx != CTX_ATTR_SQ {
+                write_context_escaped(value, ctx, url_prefix, out) ! throw .write(state.template.name ?? "?", "The escape function failed")
+                return
+            }
+        }
+        // Strings and numbers fast-path straight to `out` without converting through `json.Value`
+        match value {
+            String as text => {
+                if default_html {
+                    html.escape_into(text, out) ! throw .write(state.template.name ?? "?", "The escape function failed")
+                } else if isset(escape) {
+                    escape(text, out) ! throw .write(state.template.name ?? "?", "The escape function failed")
+                } else {
+                    out.write(text)
+                }
+            }
+            int as number => {
+                if !isset(escape) || default_html {
+                    out.write_int_ascii(number)
+                } else {
+                    let digits: [u8 x 65] = @undefined
+                    let scratch: local mut &[u8] = &digits
+                    let text = scratch.view(0, number.to_base_in(scratch, 10))
+                    escape(text, out) ! throw .write(state.template.name ?? "?", "The escape function failed")
+                }
+            }
+            float as number => {
+                let digits: [u8 x 65] = @undefined
+                let scratch: local mut &[u8] = &digits
+                let text = scratch.view(0, number.to_shortest_string_in(scratch))
+                if !isset(escape) || default_html : out.write(text)
+                else : escape(text, out) ! throw .write(state.template.name ?? "?", "The escape function failed")
+            }
+            default => {
+                let text = value_text(datum_to_json(value))
+                if default_html {
+                    html.escape_into(text, out) ! throw .write(state.template.name ?? "?", "The escape function failed")
+                } else if isset(escape) {
+                    escape(text, out) ! throw .write(state.template.name ?? "?", "The escape function failed")
+                } else {
+                    out.write(text)
+                }
             }
         }
     }
@@ -435,7 +625,7 @@ class Renderer {
             let value = this.eval(inner, frame, state) !>
             if value.is_int : return json.from(0 - value_int(value))
             if value.is_float : return json.from(0.0 - value_number(value))
-            this.fail("'-' needs a number, not " + value_kind(value), expr.line, state)
+            this.fail("'-' needs a number, not " + value_kind(value), expr.line, expr.col, expr.offset, state)
         }
         if expr.type == EXPR_ISSET {
             let inner = expr.left ?! return null
@@ -466,9 +656,9 @@ class Renderer {
             if isset(custom) : return custom(value, args)
             let builtin = builtin_filter(expr.name, value, args)
             if isset(builtin) : return builtin
-            this.fail("Unknown filter '" + expr.name + "'", expr.line, state)
+            this.fail("Unknown filter '" + expr.name + "'", expr.line, expr.col, expr.offset, state)
         }
-        this.fail("Invalid expression", expr.line, state)
+        this.fail("Invalid expression", expr.line, expr.col, expr.offset, state)
     }
 
     // `+ - * / %`: numbers compute, `+` with text joins the text forms. Two integers give an
@@ -477,7 +667,7 @@ class Renderer {
         let op = expr.op
         if op == "+" && (a.is_string || b.is_string) : return json.from(value_text(a) + value_text(b))
         if !a.is_number || !b.is_number {
-            this.fail("'" + op + "' needs numbers, not " + value_kind(a) + " and " + value_kind(b), expr.line, state)
+            this.fail("'" + op + "' needs numbers, not " + value_kind(a) + " and " + value_kind(b), expr.line, expr.col, expr.offset, state)
         }
         if a.is_int && b.is_int {
             let x = value_int(a)
@@ -485,7 +675,7 @@ class Renderer {
             if op == "+" : return json.from(x + y)
             if op == "-" : return json.from(x - y)
             if op == "*" : return json.from(x * y)
-            if y == 0 : this.fail("Division by zero", expr.line, state)
+            if y == 0 : this.fail("Division by zero", expr.line, expr.col, expr.offset, state)
             // `int.$min / -1` overflows the division; it wraps like `+` and `*`
             if y == -1 : return json.from(op == "%" ? 0 : 0 - x)
             if op == "%" : return json.from(x % y)
@@ -497,8 +687,8 @@ class Renderer {
         if op == "+" : return json.from(x + y)
         if op == "-" : return json.from(x - y)
         if op == "*" : return json.from(x * y)
-        if op == "%" : this.fail("'%' needs integers", expr.line, state)
-        if y == 0.0 : this.fail("Division by zero", expr.line, state)
+        if op == "%" : this.fail("'%' needs integers", expr.line, expr.col, expr.offset, state)
+        if y == 0.0 : this.fail("Division by zero", expr.line, expr.col, expr.offset, state)
         return json.from(x / y)
     }
 
@@ -527,7 +717,7 @@ class Renderer {
                 default => {}
             }
             if probe : throw .missing(state.template.name ?? "?", "Data not found", expr.line)
-            this.fail("Data not found: '" + name + "'", expr.line, state)
+            this.fail("Data not found: '" + name + "'", expr.line, expr.col, expr.offset, state)
         }
         if expr.type == EXPR_MEMBER {
             let left = expr.left ?! return null
@@ -543,7 +733,7 @@ class Renderer {
                 default => {}
             }
             if probe : throw .missing(state.template.name ?? "?", "Data not found", expr.line)
-            this.fail("Property not found: '" + expr.name + "'", expr.line, state)
+            this.fail("Property not found: '" + expr.name + "'", expr.line, expr.col, expr.offset, state)
         }
         if expr.type == EXPR_INDEX {
             let left = expr.left ?! return null
@@ -580,7 +770,7 @@ class Renderer {
                 default => {}
             }
             if probe : throw .missing(state.template.name ?? "?", "Data not found", expr.line)
-            this.fail("Indexed value not found", expr.line, state)
+            this.fail("Indexed value not found", expr.line, expr.col, expr.offset, state)
         }
         return datum_from_json(this.eval(expr, frame, state) !>)
     }
@@ -592,10 +782,10 @@ class Renderer {
 
     // ---- Engine -----------------------------------------------------------------
 
-    fn load(name: String, state: RenderState, line: uint) Template !ParseError {
+    fn load(name: String, state: RenderState, line: uint, col: uint, offset: uint) Template !ParseError {
         return this.engine.compiled_template(name) ! {
             match E {
-                .missing(_, _, _) => this.fail("Template not found: " + name, line, state)
+                .missing(_, _, _) => this.fail("Template not found: " + name, line, col, offset, state)
                 default => throw E
             }
         }
@@ -603,27 +793,28 @@ class Renderer {
 
     // Pushes `name` on the stack of templates being rendered; the caller pops it. `depth` is
     // the nesting of the template doing the include or extend.
-    fn enter(templates: Array[String], name: String, depth: uint, state: RenderState) !ParseError {
+    fn enter(templates: Array[String], name: String, depth: uint, state: RenderState, line: uint, col: uint, offset: uint) !ParseError {
         each templates as active {
             if active == name {
                 let chain = templates.copy()
                 chain.append(name)
-                this.fail("Template cycle: " + chain.join(" -> "), 0, state)
+                this.fail("Template cycle: " + chain.join(" -> "), line, col, offset, state)
             }
         }
         let max_depth = TEMPLATE_MAX_DEPTH
         let options = this.options
         if isset(options) : max_depth = options.max_depth
-        if depth + 1 > max_depth : this.fail("Template depth exceeds the maximum of " + max_depth, 0, state)
+        if depth + 1 > max_depth : this.fail("Template depth exceeds the maximum of " + max_depth, line, col, offset, state)
         templates.append(name)
     }
 
-    fn fail(msg: String, line: uint, state: RenderState) !ParseError $throw {
+    fn fail(msg: String, line: uint, col: uint, offset: uint, state: RenderState) !ParseError $throw {
         let name = state.template.name ?? "{content}"
+        let loc = col > 0 ? "line " + line + ", column " + col : "line " + line
         throw .parse(
             state.template.name ?? "?",
-            "[ Error at line " + line + " in " + name + " | Error: " + msg + " ]",
-            0,
+            "[ Error at " + loc + " in " + name + " | Error: " + msg + " ]",
+            offset,
             line
         )
     }
@@ -632,13 +823,39 @@ class Renderer {
 // What one template's render carries besides its frames
 class RenderState {
     template: Template
-    templates: Array[String]
+    templates: ?Array[String] (null)
     depth: uint
-    // The blocks of the chain being rendered: the most derived template fills it first
-    chain: Map[ByteBuffer]
+    // Lazily allocated blocks of the inheritance chain being rendered (most derived at index 0)
+    chain: ?BlockChain (null)
     root: Datum
+    // Active block name and layer index when rendering inside a block (for `@super()`)
+    active_block: ?String (null)
+    active_block_index: uint (0)
+    // Lazily allocated stack of active `name#layer` blocks to detect cyclic `@yield`
+    active_blocks: ?Array[String] (null)
+    // Live HTML scanner when rendering a sub-template or block embedded inside `<script>`,
+    // `<style>`, or an HTML attribute; `null` on the normal HTML text hot path
+    scanner: ?HtmlScanner (null)
     // Where `@extend` split this template's own output
     extend_offset: uint (0)
+
+    fn ensure_templates() Array[String] {
+        let t = this.templates
+        if isset(t) : return t
+        let created = Array[String]{}
+        let n = this.template.name
+        if isset(n) : created.append(n)
+        this.templates = created
+        return created
+    }
+
+    fn ensure_chain() BlockChain {
+        let c = this.chain
+        if isset(c) : return c
+        let created = BlockChain {}
+        this.chain = created
+        return created
+    }
 }
 
 // Trims whitespace at both ends of what was written from `start` on
@@ -655,3 +872,5 @@ fn trim_region(out: ByteBuffer, start: uint) {
 + fn html_escape(input: local &[u8], out: io.Writer) uint !io.IoError {
     return html.escape_into(input, out) !>
 }
+
+global default_html_escape: Escape (html_escape)

@@ -1,0 +1,459 @@
+use valk.json
+use valk.compress
+use valk.regex
+use valk.markdown
+use valk.template
+use valk.io
+use valk.time
+
+// Deterministic xorshift64* PRNG for repeatable parser fuzzing in tests
+class FuzzParserRng {
+    state: u64 (0x9e3779b97f4a7c15)
+
+    fn next_u64() u64 {
+        let x = this.state
+        x = x ^ (x >> 12)
+        x = x ^ (x << 25)
+        x = x ^ (x >> 27)
+        this.state = x
+        return x * 0x2545f4914f6cdd1d.to(u64)
+    }
+
+    fn next_uint(bound: uint) uint {
+        if bound == 0 : return 0
+        return (this.next_u64() % bound.to(u64)).to(uint)
+    }
+
+    fn next_byte() u8 {
+        return (this.next_u64() & 0xff).to(u8)
+    }
+
+    fn random_bytes(max_len: uint) String {
+        let len = this.next_uint(max_len + 1)
+        let buf = ByteBuffer.new(len)
+        let i: uint = 0
+        while i < len {
+            buf.write_byte(this.next_byte())
+            i++
+        }
+        return buf.into_string()
+    }
+
+    fn mutate(seed: String, interesting: Array[u8]) String {
+        let buf = ByteBuffer.new(seed.bytes + 32)
+        buf.write(seed)
+        let ops = 1 + this.next_uint(4)
+        let op_i: uint = 0
+        while op_i < ops {
+            let kind = this.next_uint(6)
+            let len = buf.length
+            if kind == 0 && len > 0 {
+                let pos = this.next_uint(len)
+                let b = buf.get(pos) ^ (1 << this.next_uint(8)).to(u8)
+                let tmp = ByteBuffer.new(len)
+                if pos > 0 : tmp.write(buf.view(0, pos))
+                tmp.write_byte(b)
+                if pos + 1 < len : tmp.write(buf.view(pos + 1, len - pos - 1))
+                buf = tmp
+            } else if kind == 1 && len > 0 {
+                let pos = this.next_uint(len)
+                let b = this.next_uint(2) == 0 && interesting.length > 0
+                    ? interesting[this.next_uint(interesting.length)]
+                    : this.next_byte()
+                let tmp = ByteBuffer.new(len)
+                if pos > 0 : tmp.write(buf.view(0, pos))
+                tmp.write_byte(b)
+                if pos + 1 < len : tmp.write(buf.view(pos + 1, len - pos - 1))
+                buf = tmp
+            } else if kind == 2 && len > 0 {
+                buf.truncate(this.next_uint(len))
+            } else if kind == 3 && len < 1024 {
+                let pos = this.next_uint(len + 1)
+                let add = 1 + this.next_uint(6)
+                let tmp = ByteBuffer.new(len + add)
+                if pos > 0 : tmp.write(buf.view(0, pos))
+                let k: uint = 0
+                while k < add {
+                    let b = this.next_uint(3) != 0 && interesting.length > 0
+                        ? interesting[this.next_uint(interesting.length)]
+                        : this.next_byte()
+                    tmp.write_byte(b)
+                    k++
+                }
+                if pos < len : tmp.write(buf.view(pos, len - pos))
+                buf = tmp
+            } else if kind == 4 && len > 1 {
+                let pos = this.next_uint(len)
+                let del = 1 + this.next_uint(len - pos < 12 ? len - pos : 12)
+                let tmp = ByteBuffer.new(len)
+                if pos > 0 : tmp.write(buf.view(0, pos))
+                if pos + del < len : tmp.write(buf.view(pos + del, len - pos - del))
+                buf = tmp
+            } else if len > 0 && len < 512 {
+                let pos = this.next_uint(len)
+                let clen = 1 + this.next_uint(len - pos < 16 ? len - pos : 16)
+                buf.write(buf.view(pos, clen).to_string())
+            }
+            op_i++
+        }
+        return buf.into_string()
+    }
+}
+
+class FuzzJsonObj {
+    + name: String ("")
+    + count: int (0)
+    + small: u8 (0)
+    + ratio: f32 (0.0)
+    + flag: bool (false)
+    + kids: Array[FuzzJsonObj] (.{})
+}
+
+class FuzzJsonUtf8Obj {
+    + cafe: int (0) $tag(json: "café")
+}
+
+class FuzzChunkReader is io.Reader {
+    data: String
+    pos: uint (0)
+    step: uint (1)
+
+    + fn read(buf: local mut &[u8]) uint !io.IoError {
+        if this.pos >= this.data.bytes : return 0
+        let avail = this.data.bytes - this.pos
+        let take = this.step < avail ? this.step : avail
+        if take > buf.length : take = buf.length
+        let i: uint = 0
+        while i < take {
+            buf[i] = this.data.get(this.pos + i)
+            i++
+        }
+        this.pos += take
+        return take
+    }
+}
+
+fn fuzz_bytes(arr: Array[u8]) String {
+    let b = ByteBuffer.new(arr.length)
+    each arr as x : b.write_byte(x)
+    return b.into_string()
+}
+
+fn fuzz_stream_decompress(data: String, fmt: compress.Format, step: uint, max_out: uint) {
+    let dec = compress.Decompressor.new(FuzzChunkReader { data: data, step: step }, fmt)
+    let buf = [u8]{ 0 x 1024 }
+    let total: uint = 0
+    while true {
+        let n = dec.read(buf) ! break
+        if n == 0 : break
+        total += n
+        if total > max_out : break
+    }
+}
+
+fn fuzz_json_read_ok(input: String) bool {
+    let _ = json.read(input) ! return false
+    return true
+}
+
+// ---- Deterministic regression tests ----
+
+test "Fuzz: JSON decode_to rejects invalid UTF-8 object keys" {
+    let bad = "{\"\xff\": 1}"
+    let bad2 = "{\"\xc0\xaf\": 1}"
+    let bad3 = "{\"\xed\xa0\x80\": 1}"
+
+    each Array[String]{ bad, bad2, bad3 } as s {
+        assert(!isset(json.decode(s) !? null))
+        assert(!fuzz_json_read_ok(s))
+        assert(!isset(json.decode_to[FuzzJsonObj](s) !? null))
+    }
+
+    // Valid non-ASCII UTF-8 keys continue to decode properly
+    let ok = json.decode_to[FuzzJsonUtf8Obj]("{\"café\": 7}") !!
+    assert(ok.cafe == 7)
+}
+
+test "Fuzz: compress zstd header bounds, overflow, early FCS check, and bombs" {
+    // 9-byte truncated frame claiming 16 MiB FCS must fail cleanly as truncated without big alloc
+    let trunc_16m = fuzz_bytes(Array[u8]{ 0x28, 0xb5, 0x2f, 0xfd, 0xa0, 0x00, 0x00, 0x00, 0x01 })
+    let err_trunc = false
+    compress.unzstd(trunc_16m, 0) ! { err_trunc = E == .truncated }
+    assert(err_trunc)
+
+    // Concatenated valid frame + frame claiming u64.$max FCS (tests frame_start + fcs overflow)
+    let valid = compress.zstd("hello")
+    let huge_fcs = fuzz_bytes(Array[u8]{ 0x28, 0xb5, 0x2f, 0xfd, 0xe0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00 })
+    let err_large = false
+    compress.unzstd(valid + huge_fcs, 1024) ! { err_large = E == .too_large }
+    assert(err_large)
+
+    // Frame declaring FCS = 1 but containing a non-final RLE block of 16 bytes -> rejected early as invalid_input
+    let lying_fcs = fuzz_bytes(Array[u8]{ 0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x01, 0x82, 0x00, 0x00, 0x41 })
+    let err_lying = false
+    compress.unzstd(lying_fcs, 0) ! { err_lying = E == .invalid_input }
+    assert(err_lying)
+
+    // Same lying FCS frame through streaming Decompressor fails before EOF
+    let stream_dec = compress.Decompressor.new(FuzzChunkReader { data: lying_fcs, step: 1 }, .zstd)
+    let buf = [u8]{ 0 x 64 }
+    let stream_err = false
+    stream_dec.read(buf) ! { stream_err = true }
+    assert(stream_err)
+
+    // Skippable frame with 0xffffffff length fails cleanly as truncated
+    let huge_skip = fuzz_bytes(Array[u8]{ 0x50, 0x2a, 0x4d, 0x18, 0xff, 0xff, 0xff, 0xff, 0x00 })
+    let err_skip = false
+    compress.unzstd(huge_skip, 0) ! { err_skip = E == .truncated }
+    assert(err_skip)
+
+    // Decompression bomb blocked by max_size across all 4 formats
+    let payload = "A".repeat(65536)
+    each Array[compress.Format]{ .zstd, .gzip, .zlib, .deflate } as fmt {
+        let comp = compress.compress(payload, fmt, 3)
+        let got_large = false
+        compress.decompress(comp, fmt, 256) ! { got_large = E == .too_large }
+        assert(got_large)
+        let got_into_large = false
+        compress.decompress_into(comp, ByteBuffer.new(0), fmt, 256) ! { got_into_large = E == .too_large }
+        assert(got_into_large)
+    }
+}
+
+test "Fuzz: regex deep chained quantifiers, large charsets, and ReDoS bounds" {
+    // Chained quantifiers without groups used to overflow the stack in Compiler.node
+    each Array[String]{
+        "a" + "{1}".repeat(5000),
+        "a" + "{0}".repeat(5000),
+        "a" + "*".repeat(5000),
+        "a" + "?".repeat(5000),
+        "(".repeat(600) + "a" + ")".repeat(600),
+    } as pat {
+        let too_large = false
+        regex.Regex.new(pat) ! {
+            too_large = match E : bool { .too_large(_, _) => true default => false }
+        }
+        assert(too_large)
+    }
+
+    // Large descending character class sorts in O(N log N)
+    let start = time.mono_ms()
+    let cs = ByteBuffer.new(8000)
+    cs.write("[")
+    let i: uint = 0
+    while i < 2000 {
+        cs.write_byte(('a' + ((2000 - i) % 26)).to(u8))
+        i++
+    }
+    cs.write("]")
+    let re_cs = regex.Regex.new(cs.into_string()) !!
+    assert(re_cs.is_match("m"))
+    assert(!re_cs.is_match("0"))
+    assert(time.mono_ms() - start < 5000 * TIME_SCALE)
+
+    // Classic ReDoS patterns finish fast
+    start = time.mono_ms()
+    let hay = "a".repeat(200) + "!"
+    each Array[String]{ "(a+)+b", "((a*)*)*b", "(a|aa)+b", "^([a-z]+)*$" } as p {
+        let r = regex.Regex.new(p) !!
+        assert(!r.is_match(hay))
+    }
+    assert(time.mono_ms() - start < 5000 * TIME_SCALE)
+}
+
+test "Fuzz: markdown nested links and quadratic emphasis stay bounded and fast" {
+    // Deeply nested links used to recurse unboundedly and time out
+    let start = time.mono_ms()
+    let nested_links = "[".repeat(1500) + "x" + "](https://a.com)".repeat(1500)
+    let out = markdown.to_html(nested_links)
+    assert(out.contains("x"))
+    assert(time.mono_ms() - start < 5000 * TIME_SCALE)
+
+    // Mixed emphasis markers with stray closing tags used to go quadratic
+    start = time.mono_ms()
+    let emph = "***a **b *c ".repeat(1000)
+    let out2 = markdown.to_html(emph)
+    assert(out2.bytes > 0)
+    assert(time.mono_ms() - start < 5000 * TIME_SCALE)
+
+    // Normal nested emphasis and linked images still work
+    assert(markdown.to_html("[![alt](/ok.png)](http://ok)") == "\n<p><a href=\"http://ok\"><img src=\"/ok.png\" alt=\"alt\"/></a></p>")
+    assert(markdown.to_html("**bold *ital***") == "\n<p><strong>bold <em>ital</em></strong></p>")
+}
+
+class FuzzTplData {
+    + name: String ("<script>alert(1)</script>")
+    + url: String ("javascript:alert(1)")
+    + num: int (42)
+    + flt: float (1.5)
+    + flag: bool (true)
+    + items: Array[String] (.{ "a", "b" })
+}
+
+test "Fuzz: template cyclic blocks, deep nesting, negative filters, and non-finite JS floats" {
+    let engine = template.Engine.new()
+    let data = FuzzTplData {}
+
+    // Cyclic self-yielding and mutually-yielding blocks must error cleanly instead of stack-overflowing
+    let cyclic_cases = Array[String]{
+        "@block(\"self\")@yield(\"self\")@end",
+        "@block(\"a\")@yield(\"b\")@end@block(\"b\")@yield(\"a\")@end",
+    }
+    each cyclic_cases as tpl {
+        let failed = false
+        engine.render_content(tpl, data) ! { failed = true }
+        assert(failed)
+    }
+
+    // Cyclic @extend with self-yielding block
+    engine.set("fuzz_base", "@yield(\"body\")")
+    engine.set("fuzz_child", "@extend(\"fuzz_base\")@block(\"body\")@yield(\"body\")@end")
+    let failed_ext = false
+    engine.render("fuzz_child", data) ! { failed_ext = true }
+    assert(failed_ext)
+
+    // Deeply nested control directives and expressions must error cleanly instead of stack-overflowing
+    let deep_cases = Array[String]{
+        "@if(1)".repeat(500) + "x" + "@end".repeat(500),
+        "{{ " + "(".repeat(500) + "1" + ")".repeat(500) + " }}",
+        "{{ " + "!".repeat(500) + "1 }}",
+        "{{ " + "-".repeat(500) + "1 }}",
+        "{{ 1" + " + 1".repeat(500) + " }}",
+        "{{ name" + " | upper".repeat(500) + " }}",
+        "{{ name" + ".x".repeat(500) + " }}",
+        "{{ " + "items[".repeat(500) + "0" + "]".repeat(500) + " }}",
+    }
+    each deep_cases as tpl {
+        let failed = false
+        engine.render_content(tpl, data) ! { failed = true }
+        assert(failed)
+    }
+
+    // Negative arguments to fixed / round / truncate clamp to 0 instead of wrapping to uint.$max
+    assert(engine.render_content("{{ 1.5 | fixed(-1) }}", data) !! == "2")
+    assert(engine.render_content("{{ 1.5 | round(-1) }}", data) !! == "2")
+    assert(engine.render_content("{{ \"hello\" | truncate(-1) }}", data) !! == "…")
+
+    // Non-finite floats in JS value context emit valid JS `null`
+    assert(engine.render_content("<script>let x = {{ 1e308 * 10.0 }}; let y = {{ (1e308 * 10.0) - (1e308 * 10.0) }};</script>", data) !! == "<script>let x = null; let y = null;</script>")
+}
+
+// ---- Deterministic PRNG fuzz sweeps ----
+
+test "Fuzz: JSON PRNG sweep" {
+    let seeds = Array[String]{
+        "{\"name\":\"hi\\n\\u0041\\uD83D\\uDE00\",\"count\":-42,\"small\":255,\"ratio\":1.5,\"flag\":true,\"kids\":[]}",
+        "[null,true,false,0,-1,1.25e10,\"\\uD800\\uDC00\",\"\\uD800\"]",
+        "{\"a\":1,\"a\":2,\"b\":[1,2,3],\"c\":-9223372036854775808}",
+    }
+    let interesting = Array[u8]{ '{', '}', '[', ']', '"', ':', ',', '\\', 'u', '0', '9', '-', '.', 'e', '+', ' ', '\n', 0, 0x80, 0xff }
+    let rng = FuzzParserRng { state: 0x1111222233334444 }
+    let i: uint = 0
+    while i < 500 {
+        let input = i % 5 == 0
+            ? rng.random_bytes(128)
+            : rng.mutate(seeds[rng.next_uint(seeds.length)], interesting)
+        let _ = json.decode(input) !? null
+        json.read(input) -> view {
+            let _ = view.kind
+            let _ = view.length
+            if input.bytes < 512 : let _ = view.to_value()
+        }
+        let _ = json.decode_to[FuzzJsonObj](input) !? null
+        i++
+    }
+}
+
+test "Fuzz: compress PRNG sweep" {
+    let payload = "hello world! abcde12345 ".repeat(20)
+    let zstd_seed = compress.zstd(payload, 3)
+    let gzip_seed = compress.gzip(payload, 3)
+    let zlib_seed = compress.zlib(payload, 3)
+    let defl_seed = compress.deflate(payload, 3)
+    let interesting = Array[u8]{ 0, 1, 2, 3, 7, 8, 15, 31, 63, 127, 128, 254, 255 }
+    let rng = FuzzParserRng { state: 0x2222333344445555 }
+
+    let i: uint = 0
+    while i < 500 {
+        let which = i % 4
+        let fmt = which == 0 ? compress.Format.zstd : (which == 1 ? compress.Format.gzip : (which == 2 ? compress.Format.zlib : compress.Format.deflate))
+        let seed = which == 0 ? zstd_seed : (which == 1 ? gzip_seed : (which == 2 ? zlib_seed : defl_seed))
+        let input = (i / 4) % 5 == 0 ? rng.random_bytes(96) : rng.mutate(seed, interesting)
+        let _ = compress.decompress(input, fmt, 32768) !? ""
+        let _ = compress.decompress_into(input, ByteBuffer.new(0), fmt, 32768) !? 0
+        if i % 4 == 0 : fuzz_stream_decompress(input, fmt, 1 + rng.next_uint(5), 32768)
+        i++
+    }
+}
+
+test "Fuzz: regex PRNG sweep" {
+    let seeds = Array[String]{
+        "(?P<user>\\w+)@([\\w.]+)",
+        "(a|ab)(c|bcd)(d*)",
+        "(?i)[a-z[:digit:]\\s]+{1,3}?",
+        "\\b(?:foo|bar){1,4}\\b",
+        "[^\\x00-\\x1f]+",
+    }
+    let interesting = Array[u8]{ '(', ')', '[', ']', '{', '}', '*', '+', '?', '|', '^', '$', '.', '\\', '-', ':', '<', '>', ',', '0', '9', 'a', 'i', 'm', 's', 'd', 'w', 'b', 'x', 0, 0x80, 0xff }
+    let flags_list = Array[String]{ "", "i", "m", "s", "ims", "z" }
+    let bad_utf8 = "abc\x80\xff\xc0\xaf\xed\xa0\x80\xf0\x9f\x98\x80def\n123"
+    let rng = FuzzParserRng { state: 0x3333444455556666 }
+
+    let i: uint = 0
+    while i < 400 {
+        let pat = i % 5 == 0
+            ? rng.random_bytes(32)
+            : rng.mutate(seeds[rng.next_uint(seeds.length)], interesting)
+        let fl = flags_list[rng.next_uint(flags_list.length)]
+        let re = regex.Regex.new(pat, fl) ! { i++; continue }
+        let hay = i % 2 == 0 ? bad_utf8 : rng.random_bytes(48)
+        let _ = re.is_match(hay)
+        let m = re.find(hay)
+        if isset(m) : let _ = m.expand("$0-$1-$$")
+        let _ = re.find_all(hay, 8)
+        let _ = re.replace(hay, "[$0]", 8)
+        let _ = re.split(hay, 8)
+        i++
+    }
+}
+
+test "Fuzz: markdown PRNG sweep" {
+    let seeds = Array[String]{
+        "# Title\n\nHello **world** *em* ~~del~~ `code`.\n\n> - item 1\n> - item 2\n\n[link](https://x \"t\") ![img](https://a/b.png)\n",
+        "```\ncode\n```\n1. one\n2. two\n---\n***a **b *c***",
+    }
+    let interesting = Array[u8]{ '*', '_', '~', '`', '[', ']', '(', ')', '!', '#', '>', '-', '+', '=', '\\', '"', '\'', '&', '<', '>', '\n', '\t', ' ', '.', '1', 0, 1, 2, 3, 0x80, 0xff }
+    let rng = FuzzParserRng { state: 0x4444555566667777 }
+
+    let i: uint = 0
+    while i < 500 {
+        let input = i % 5 == 0
+            ? rng.random_bytes(128)
+            : rng.mutate(seeds[rng.next_uint(seeds.length)], interesting)
+        let _ = markdown.to_html(input)
+        i++
+    }
+}
+
+test "Fuzz: template PRNG sweep" {
+    let engine = template.Engine.new()
+    engine.set("p", "<span>{{ name }}</span>")
+    let data = FuzzTplData {}
+    let seeds = Array[String]{
+        "<div class=\"{{ name }}\">@if(flag)<a href=\"{{ url }}\">{{ num + 1 }}</a>@else{{ flt | fixed(2) }}@end</div>",
+        "<script>let a = {{ name }}; let b = '{{ name }}';</script><style>.x{color:{{ name }};}</style>",
+        "@each(items as it, k, i){{ i }}:{{ k }}={{ it | upper }}@empty none @end",
+        "{# c #} {! name !} @include(\"p\") {{ name | truncate(4) }}",
+    }
+    let interesting = Array[u8]{ '{', '}', '!', '#', '@', '(', ')', '[', ']', '|', '.', ',', '=', '<', '>', '"', '\'', '`', '/', '\\', ';', ':', '&', '+', '-', '*', '%', ' ', '\n', 0, 0x80, 0xff }
+    let rng = FuzzParserRng { state: 0x5555666677778888 }
+
+    let i: uint = 0
+    while i < 500 {
+        let tpl = i % 5 == 0
+            ? rng.random_bytes(96)
+            : rng.mutate(seeds[rng.next_uint(seeds.length)], interesting)
+        let _ = engine.render_content(tpl, data) !? ""
+        i++
+    }
+}

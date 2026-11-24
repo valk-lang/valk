@@ -1,6 +1,7 @@
 
 use valk.json
 use build
+use helper
 use valk.fs
 use valk.gc
 
@@ -130,6 +131,27 @@ fn lsp_line_col(content: String, offset: u32) LspLineCol {
     return LspLineCol { line: line, col: col }
 }
 
+fn lsp_line_col_in(src: build.Source, offset: u32) LspLineCol {
+    let content = src.content
+    let data = content.data
+    let bytes = content.bytes
+    let limit = offset.to(uint)
+    if limit > bytes : limit = bytes
+    let idx = src.line_index(limit.to(u32))
+    let starts = src.get_line_starts()
+    let p = (starts.get(idx) !? 0).to(uint)
+    let col: u32 = 1
+    while p < limit {
+        let ch = @ptrv(data, u8, p)
+        if ch == '\n' : break
+        let width = lsp_utf8_width(ch)
+        if p + width > limit : break
+        p += width
+        col += lsp_utf16_width(ch)
+    }
+    return LspLineCol { line: idx.to(u32) + 1, col: col }
+}
+
 class Diagnostic {
     // Identifies the message across builds, to report it once when several groups see it
     key: String
@@ -153,6 +175,8 @@ class DiagnosticFix {
     end_line: u32
     end_col: u32
     replacement: String
+    preferred: bool (true)
+    extra_edits: Array[DiagnosticFix] (.{})
 }
 
 // A labeled span of a diagnostic (LSP relatedInformation)
@@ -177,14 +201,25 @@ class Lsp {
     request: int (req_none)
     // Files
     file_content: Map[String] (Map[String]{})
+    file_version: uint (0)
+    file_versions: Map[uint] (Map[uint]{})
+    file_decl_sigs: Map[String] (Map[String]{})
     document_symbols: Map[json.Value] (Map[json.Value]{})
     // Paths that currently have diagnostics published, so they can be cleared
     has_errors: Array[String] (Array[String]{})
     diagnostics_on_change: bool (false)
-    // Last build result per package dir (or loose file path), see build_diagnostics
+    // Last build result per namespace dir (or loose file path), see build_diagnostics
     diagnostic_groups: Map[DiagnosticGroup] (Map[DiagnosticGroup]{})
+    // Cached package lookup per directory: dir -> pkg_dir ("" if loose)
+    pkg_dir_cache: Map[String] (Map[String]{})
+    pkg_srcdir_cache: Map[String] (Map[String]{})
+    // Cached workspace symbol index per package root (or loose file)
+    workspace_symbols: Map[WorkspaceSymbolGroup] (Map[WorkspaceSymbolGroup]{})
+    // Cached public stdlib symbols for auto-import quickfixes
+    stdlib_symbols: ?Map[Array[AutoImportEntry]] (null)
     // Buffers edited since the last diagnostics pass
     changed_files: Map[bool] (Map[bool]{})
+    did_build: bool (false)
     //
     file: String ("")
     line: uint (0)
@@ -470,8 +505,9 @@ class Lsp {
     }
 
     fn build() {
+        this.did_build = false
         this.build_wrap()
-        gc.collect()
+        if this.did_build : gc.collect()
     }
 
     fn attach_to_build(b: build.Build) {
@@ -496,6 +532,7 @@ class Lsp {
             this.log(E.msg)
             return
         }
+        this.did_build = true
         this.attach_to_build(b)
         if this.request == req_formatting : b.options.is_fmt = true
         if this.request == req_inlay_hint || this.request == req_semantic_tokens : b.options.keep_going = true
@@ -524,10 +561,71 @@ class Lsp {
     // DIAGNOSTICS
     // ########################################
 
-    // Open files are built per package (a loose file is a package of its own). Each
+    // Find the package dir containing `path` (if inside its `srcdir`), cached per directory.
+    fn find_pkg_dir_for_path(path: String) ?String {
+        let dir = fs.is_dir(path) ? path : fs.dir_of(path)
+        let pkg_dir = this.find_closest_pkg_dir(dir) ?! return null
+        let srcdir = this.pkg_srcdir(pkg_dir)
+        if path == srcdir || path.starts_with(srcdir + fs.PATH_DIV) : return pkg_dir
+        return null
+    }
+
+    fn find_closest_pkg_dir(dir: String) ?String {
+        this.pkg_dir_cache.get(dir) -> cached {
+            if cached.is_empty() : return null
+            if fs.exists(helper.add(cached, "valk.json")) : return cached
+            this.pkg_dir_cache.remove(dir)
+        }
+        if fs.exists(helper.add(dir, "valk.json")) {
+            this.pkg_dir_cache.set(dir, dir)
+            return dir
+        }
+        let parent = fs.dir_of(dir)
+        if parent == dir {
+            this.pkg_dir_cache.set(dir, "")
+            return null
+        }
+        let found = this.find_closest_pkg_dir(parent)
+        this.pkg_dir_cache.set(dir, found ?? "")
+        return found
+    }
+
+    fn pkg_srcdir(pkg_dir: String) String {
+        this.pkg_srcdir_cache.get(pkg_dir) -> cached : return cached
+        let srcdir = helper.add(pkg_dir, "src")
+        let config_path = helper.add(pkg_dir, "valk.json")
+        let config = helper.Config.load(config_path) !? null
+        if isset(config) {
+            let src = config.json.get("src")
+            match src {
+                String as p => srcdir = helper.resolve(helper.add(pkg_dir, p))
+                default => {}
+            }
+        }
+        this.pkg_srcdir_cache.set(pkg_dir, srcdir)
+        return srcdir
+    }
+
+    // Groups open files by namespace directory within their package (or by file path
+    // for loose files outside a package).
+    fn group_diagnostic_file(groups: Map[Array[String]], path: String) {
+        if !fs.exists(path) : return
+        let key = path
+        let pkg_dir = this.find_pkg_dir_for_path(path)
+        if isset(pkg_dir) {
+            key = pkg_dir + "::" + fs.dir_of(path)
+        }
+        let files = groups.get(key) !? <{
+            let created = Array[String]{}
+            groups.set(key, created)
+            return created
+        }
+        files.append(path, true)
+    }
+
+    // Open files are built per namespace (a loose file is a group of its own). Each
     // group's result is kept, and a group is only rebuilt when a file it loaded changed:
-    // in the editor since the last pass, or on disk. An edit in one package then costs
-    // one build instead of one per open package.
+    // body-only edits in one file re-check only that file without re-parsing sibling bodies.
     fn build_diagnostics() {
         let per_path = Map[Array[Diagnostic]]{}
         let no_location = Array[String]{}
@@ -540,23 +638,38 @@ class Lsp {
         let saved = this.file
         if !saved.is_empty() : per_path.set(saved, Array[Diagnostic]{})
 
-        let classifier = build.Build.init_from_args(Array[String]{}) ! {
-            this.log(E.msg)
-            return
-        }
         let groups = Map[Array[String]]{}
         each this.file_content as _, path {
-            lsp_group_diagnostic_file(classifier, groups, path)
+            this.group_diagnostic_file(groups, path)
         }
         if !saved.is_empty() && !this.file_content.has(saved) {
-            lsp_group_diagnostic_file(classifier, groups, saved)
+            this.group_diagnostic_file(groups, saved)
         }
 
         each groups as files, key {
             let group = this.diagnostic_groups.get(key) !? null
-            if !isset(group) || lsp_group_is_stale(group, files, changed) {
-                group = this.collect_diagnostic_build(files)
+            if !isset(group) {
+                let single: ?String = files.length == 1 ? (files.get(0) !? null) : null
+                group = this.collect_diagnostic_build(files, single)
                 this.diagnostic_groups.set(key, group)
+            } else {
+                let action = this.check_group_stale(group, files, changed)
+                if action.mode == 2 {
+                    let single: ?String = files.length == 1 ? (files.get(0) !? null) : null
+                    group = this.collect_diagnostic_build(files, single)
+                    this.diagnostic_groups.set(key, group)
+                } else if action.mode == 1 {
+                    let target = action.single_file
+                    let fresh = this.collect_diagnostic_build(Array[String]{ target }, target)
+                    this.merge_single_file_group(group, fresh, target, files)
+                } else {
+                    // Prune diagnostics of files that were closed in this group
+                    let old_targets = group.target_files
+                    each old_targets as old_path {
+                        if !files.contains(old_path) : group.per_path.remove(old_path)
+                    }
+                    group.target_files = files
+                }
             }
             each group.loaded as _, path : loaded_files.set(path, true)
             each group.no_location as msg : no_location.append(msg, true)
@@ -585,24 +698,130 @@ class Lsp {
         this.publish_errors(per_path, no_location, loaded_files)
     }
 
-    fn collect_diagnostic_build(args: Array[String]) DiagnosticGroup {
+    fn check_group_stale(group: DiagnosticGroup, files: Array[String], changed: Map[bool]) GroupAction {
+        let dirty_targets = Array[String]{}
+
+        each files as path {
+            if !group.loaded.has(path) : return GroupAction { mode: 2 }
+            if !group.target_files.contains(path) {
+                // Newly opened file that this group already loaded from disk
+                let disk_mtime = fs.modified_time(path) !? 0
+                let old_mtime = group.loaded.get(path) !? 0
+                if disk_mtime != old_mtime : return GroupAction { mode: 2 }
+                let buf = this.file_content.get(path) !? null
+                if isset(buf) {
+                    let disk = fs.read(path) !? ""
+                    if buf != disk {
+                        let buf_sig = this.file_decl_sigs.get(path) !? lsp_decl_signature(buf)
+                        if buf_sig != lsp_decl_signature(disk) : return GroupAction { mode: 2 }
+                    }
+                }
+                dirty_targets.append(path, true)
+                continue
+            }
+            if this.file_content.has(path) {
+                let ver = this.file_versions.get(path) !? 0
+                let old_ver = group.buffer_versions.get(path) !? 0
+                if ver != old_ver {
+                    let sig = this.file_decl_sigs.get(path) !? ""
+                    let old_sig = group.decl_sigs.get(path) !? ""
+                    if sig != old_sig || old_sig.is_empty() : return GroupAction { mode: 2 }
+                    dirty_targets.append(path, true)
+                }
+            }
+        }
+
+        // Non-open files explicitly flagged as changed (e.g. didSave without didOpen)
+        each changed as _, path {
+            if !this.file_content.has(path) && group.loaded.has(path) : return GroupAction { mode: 2 }
+        }
+
+        // Check every loaded file: open buffers by version/decl_sig, unopened files by disk mtime
+        each group.loaded as mtime, path {
+            if this.file_content.has(path) {
+                if files.contains(path) : continue
+                let ver = this.file_versions.get(path) !? 0
+                if group.buffer_versions.has(path) {
+                    let old_ver = group.buffer_versions.get(path) !? 0
+                    if ver == old_ver : continue
+                    let sig = this.file_decl_sigs.get(path) !? ""
+                    let old_sig = group.decl_sigs.get(path) !? ""
+                    if sig != old_sig : return GroupAction { mode: 2 }
+                } else {
+                    // File was unopened during the last build, now opened in another group
+                    if (fs.modified_time(path) !? 0) != mtime : return GroupAction { mode: 2 }
+                    let buf = this.file_content.get(path) !? ""
+                    let disk = fs.read(path) !? ""
+                    if buf != disk {
+                        let buf_sig = this.file_decl_sigs.get(path) !? lsp_decl_signature(buf)
+                        if buf_sig != lsp_decl_signature(disk) : return GroupAction { mode: 2 }
+                    }
+                    group.buffer_versions.set(path, ver)
+                    group.decl_sigs.set(path, this.file_decl_sigs.get(path) !? lsp_decl_signature(buf))
+                }
+                continue
+            }
+            if (fs.modified_time(path) !? 0) != mtime : return GroupAction { mode: 2 }
+        }
+
+        if dirty_targets.length == 0 : return GroupAction { mode: 0 }
+        if dirty_targets.length == 1 {
+            return GroupAction { mode: 1, single_file: dirty_targets.get(0) !? "" }
+        }
+        return GroupAction { mode: 2 }
+    }
+
+    fn merge_single_file_group(group: DiagnosticGroup, fresh: DiagnosticGroup, target: String, files: Array[String]) {
+        group.per_path.set(target, fresh.per_path.get(target) !? Array[Diagnostic]{})
+        // Also pick up any declaration/syntax diagnostics for non-open sibling files
+        each fresh.per_path as diags, path {
+            if path == target : continue
+            if files.contains(path) : continue
+            group.per_path.set(path, diags)
+        }
+        let old_targets = group.target_files
+        each old_targets as old_path {
+            if !files.contains(old_path) : group.per_path.remove(old_path)
+        }
+        each fresh.loaded as mtime, path : group.loaded.set(path, mtime)
+        each fresh.buffer_versions as ver, path : group.buffer_versions.set(path, ver)
+        each fresh.decl_sigs as sig, path : group.decl_sigs.set(path, sig)
+        group.target_files = files
+        group.no_location = fresh.no_location
+    }
+
+    fn collect_diagnostic_build(args: Array[String], single_file: ?String (null)) DiagnosticGroup {
         let group = DiagnosticGroup{}
+        group.target_files = args
         let b = build.Build.init_from_args(args) ! {
             group.no_location.append(E.msg, true)
             return group
         }
+        this.did_build = true
         this.attach_to_build(b)
         // A broken declaration elsewhere in the package must not hide the
         // errors of the file being checked.
         b.options.keep_going = true
-        b.run() ! {}
-        each args as path {
-            if this.file_content.has(path) {
-                this.document_symbols.set(path, this.symbols_for(b, path))
-            }
+
+        let prev_req = this.request
+        let prev_file = this.file
+        if isset(single_file) {
+            this.request = req_file_diagnostics
+            this.file = single_file
         }
+        b.run() ! {}
+        this.request = prev_req
+        this.file = prev_file
+
+        this.cache_symbols_for(b, args)
+
         each b.cache.loaded_files as _, path {
             group.loaded.set(path, fs.modified_time(path) !? 0)
+            if this.file_content.has(path) {
+                group.buffer_versions.set(path, this.file_versions.get(path) !? 0)
+                let sig = this.file_decl_sigs.get(path) !? ""
+                if !sig.is_empty() : group.decl_sigs.set(path, sig)
+            }
         }
 
         each b.messages as m {
@@ -617,9 +836,8 @@ class Lsp {
                 group.no_location.append(m.msg, true)
                 continue
             }
-            let content = at.src.content
-            let start = lsp_line_col(content, at.i)
-            let end = lsp_line_col(content, at.i + m.len)
+            let start = lsp_line_col_in(at.src, at.i)
+            let end = lsp_line_col_in(at.src, at.i + m.len)
             let list = group.per_path.get(path) !? <{
                 let created = Array[Diagnostic]{}
                 group.per_path.set(path, created)
@@ -654,6 +872,7 @@ class Lsp {
                     replacement: fix.replacement
                 })
             }
+            this.attach_extra_fixes(b, m, at.src, at.i, diagnostic)
             list.append(diagnostic)
         }
         return group
@@ -737,45 +956,215 @@ class Lsp {
 class DiagnosticGroup {
     // Every file the build read, with its modification time at that moment
     loaded: Map[uint] (Map[uint]{})
+    // Open buffer versions and declaration signatures at the time this group was built
+    buffer_versions: Map[uint] (Map[uint]{})
+    decl_sigs: Map[String] (Map[String]{})
+    target_files: Array[String] (Array[String]{})
     per_path: Map[Array[Diagnostic]] (Map[Array[Diagnostic]]{})
     no_location: Array[String] (Array[String]{})
 }
 
-fn lsp_group_is_stale(group: DiagnosticGroup, files: Array[String], changed: Map[bool]) bool {
-    // A newly opened file the last build never read
-    each files as path {
-        if !group.loaded.has(path) : return true
-    }
-    // An edited buffer, whether or not it was saved
-    each changed as _, path {
-        if group.loaded.has(path) : return true
-    }
-    // A change on disk outside the editor (git checkout, a generator, ...)
-    each group.loaded as mtime, path {
-        if (fs.modified_time(path) !? 0) != mtime : return true
-    }
-    return false
+class GroupAction {
+    // 0 = fresh (cache hit), 1 = single-file incremental check, 2 = full rebuild
+    mode: int (0)
+    single_file: String ("")
 }
 
-// Groups open files by the package they belong to, keyed by the package dir. A file
-// outside any package forms a group of its own, keyed by its path.
-fn lsp_group_diagnostic_file(classifier: build.Build, groups: Map[Array[String]], path: String) {
-    // A buffer whose file was deleted stays open in the editor. Building it can only
-    // fail with a position-less error, so leave it out; its (empty) diagnostics entry
-    // is still published, which clears whatever was shown before.
-    if !fs.exists(path) : return
-    let key = path
-    let pkg = classifier.find_pkg_for_path(path) !? null
-    if isset(pkg) {
-        let dir = pkg.dir
-        if isset(dir) : key = dir
+// Fingerprint of top-level and type declarations, replacing non-generic function/test/bench
+// bodies with `{}` so body-only edits can be detected quickly.
+fn lsp_decl_signature(content: String) String {
+    let bytes = content.bytes
+    let data = content.data
+    let out = ByteBuffer.new(bytes / 2 + 64)
+    let i: uint = 0
+    let brace_depth: int = 0
+    let paren_depth: int = 0
+    // Track brace depths that keep all inner bodies verbatim (traits, generic types)
+    let keep_depth: int = -1
+    let pending_keep_type = false
+    let in_fn_header = false
+    let fn_has_parens = false
+    let fn_is_generic = false
+    let fn_is_accessor = false
+
+    while i < bytes {
+        let ch = @ptrv(data, u8, i)
+
+        // Line comment
+        if ch == '/' && i + 1 < bytes && @ptrv(data, u8, i + 1) == '/' {
+            i += 2
+            while i < bytes && @ptrv(data, u8, i) != '\n' : i++
+            continue
+        }
+        // Block comment
+        if ch == '/' && i + 1 < bytes && @ptrv(data, u8, i + 1) == '*' {
+            i += 2
+            while i + 1 < bytes {
+                if @ptrv(data, u8, i) == '*' && @ptrv(data, u8, i + 1) == '/' {
+                    i += 2
+                    break
+                }
+                i++
+            }
+            continue
+        }
+        // String literal
+        if ch == '"' {
+            out.write_byte(ch)
+            i++
+            while i < bytes {
+                let c = @ptrv(data, u8, i)
+                out.write_byte(c)
+                i++
+                if c == '\\' && i < bytes {
+                    out.write_byte(@ptrv(data, u8, i))
+                    i++
+                } else if c == '"' {
+                    break
+                }
+            }
+            continue
+        }
+        // Char literal
+        if ch == '\'' {
+            out.write_byte(ch)
+            i++
+            while i < bytes {
+                let c = @ptrv(data, u8, i)
+                out.write_byte(c)
+                i++
+                if c == '\\' && i < bytes {
+                    out.write_byte(@ptrv(data, u8, i))
+                    i++
+                } else if c == '\'' {
+                    break
+                }
+            }
+            continue
+        }
+        // Collapse whitespace runs to a single space
+        if ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' {
+            if ch == '\n' : out.write_byte('\n')
+            else : out.write_byte(' ')
+            while i < bytes {
+                let c = @ptrv(data, u8, i)
+                if c != ' ' && c != '\t' && c != '\r' && c != '\n' : break
+                i++
+            }
+            continue
+        }
+
+        // Word token
+        if ch.is_alpha() || ch == '_' {
+            let start = i
+            while i < bytes {
+                let c = @ptrv(data, u8, i)
+                if !c.is_alpha_numeric() && c != '_' : break
+                i++
+            }
+            let word = content.range(start, i - start)
+            out.append_text(word)
+
+            if keep_depth < 0 && paren_depth == 0 {
+                if word == "trait" {
+                    pending_keep_type = true
+                    in_fn_header = false
+                } else if word == "class" || word == "struct" || word == "union" || word == "interface" || word == "extend" {
+                    in_fn_header = false
+                    pending_keep_type = false
+                } else if word == "fn" {
+                    in_fn_header = true
+                    fn_has_parens = false
+                    fn_is_generic = false
+                    fn_is_accessor = false
+                } else if word == "test" || word == "bench" {
+                    if brace_depth == 0 {
+                        in_fn_header = true
+                        fn_has_parens = true
+                        fn_is_generic = false
+                        fn_is_accessor = true
+                    }
+                } else if (word == "get" || word == "set") && brace_depth >= 1 {
+                    in_fn_header = true
+                    fn_has_parens = true
+                    fn_is_generic = false
+                    fn_is_accessor = true
+                }
+            }
+            continue
+        }
+
+        if ch == '[' && paren_depth == 0 {
+            if in_fn_header && !fn_has_parens : fn_is_generic = true
+            else if !in_fn_header && keep_depth < 0 : pending_keep_type = true
+        }
+        if ch == '(' {
+            if in_fn_header && paren_depth == 0 : fn_has_parens = true
+            paren_depth++
+        } else if ch == ')' && paren_depth > 0 {
+            paren_depth--
+        } else if ch == ';' && paren_depth == 0 {
+            in_fn_header = false
+        }
+
+        if ch == '{' {
+            if in_fn_header && paren_depth == 0 && !fn_is_generic && keep_depth < 0 && (fn_has_parens || fn_is_accessor) {
+                // Skip non-generic function/accessor/test/bench body
+                out.append_text("{}")
+                in_fn_header = false
+                let depth: int = 1
+                i++
+                while i < bytes && depth > 0 {
+                    let c = @ptrv(data, u8, i)
+                    if c == '/' && i + 1 < bytes && @ptrv(data, u8, i + 1) == '/' {
+                        i += 2
+                        while i < bytes && @ptrv(data, u8, i) != '\n' : i++
+                        continue
+                    }
+                    if c == '/' && i + 1 < bytes && @ptrv(data, u8, i + 1) == '*' {
+                        i += 2
+                        while i + 1 < bytes {
+                            if @ptrv(data, u8, i) == '*' && @ptrv(data, u8, i + 1) == '/' {
+                                i += 2
+                                break
+                            }
+                            i++
+                        }
+                        continue
+                    }
+                    if c == '"' || c == '\'' {
+                        let q = c
+                        i++
+                        while i < bytes {
+                            let s = @ptrv(data, u8, i)
+                            i++
+                            if s == '\\' && i < bytes : i++
+                            else if s == q : break
+                        }
+                        continue
+                    }
+                    if c == '{' : depth++
+                    else if c == '}' : depth--
+                    i++
+                }
+                continue
+            }
+            if pending_keep_type && keep_depth < 0 {
+                keep_depth = brace_depth
+                pending_keep_type = false
+            }
+            in_fn_header = false
+            brace_depth++
+        } else if ch == '}' {
+            if brace_depth > 0 : brace_depth--
+            if keep_depth >= 0 && brace_depth <= keep_depth : keep_depth = -1
+            in_fn_header = false
+        }
+
+        out.write_byte(ch)
+        i++
     }
-    let files = groups.get(key) !? <{
-        let created = Array[String]{}
-        groups.set(key, created)
-        return created
-    }
-    files.append(path, true)
+    return out.to_string()
 }
 
 fn request_for_method(method: String) int {
@@ -797,8 +1186,8 @@ fn request_for_method(method: String) int {
 fn lsp_diagnostic_span(src: build.Source, i: u32, len: u32) ?DiagnosticSpan {
     let at = build.message_resolve(src, i)
     let path = at.src.path ?! return null
-    let start = lsp_line_col(at.src.content, at.i)
-    let end = lsp_line_col(at.src.content, at.i + len)
+    let start = lsp_line_col_in(at.src, at.i)
+    let end = lsp_line_col_in(at.src, at.i + len)
     return DiagnosticSpan {
         path: path
         msg: ""

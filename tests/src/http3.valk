@@ -33,6 +33,13 @@ fn h3_test_handler(req: http.Request) http.Response {
         res.set_trailer("X-Checksum", "abc123")
         return res
     }
+    if req.path == "/stream-trailers" {
+        let pieces = Array[String].new(4)
+        each 0 .. 4 : pieces.append("chunk-" + req.query_string + ";")
+        let res = http.Response.stream(PieceReader { pieces: pieces }, content_type: "text/plain")
+        res.set_trailer("X-Stream-Id", req.query_string)
+        return res
+    }
     if req.path == "/redirect" {
         return http.Response.redirect("/hello?from=redirect", 302)
     }
@@ -50,6 +57,11 @@ fn h3_test_handler(req: http.Request) http.Response {
     }
     if req.path == "/mtls" {
         return http.Response.text(req.client_subject + "|" + req.client_certificate_sha256)
+    }
+    if req.path == "/custom-alt-svc" {
+        let res = http.Response.text("override")
+        res.set_header("Alt-Svc", "h3=\":8443\"; ma=60")
+        return res
     }
     return http.Response.text("not-found", 404)
 }
@@ -311,4 +323,162 @@ test "HTTP/3: static files with ETag, 304, and 206 Range" {
     rng.set_header("Range", "bytes=10-19")
     let r3 = client.get(url, rng) !!
     assert(r3.status == 206 && r3.body == "abcdefghij")
+}
+
+test "HTTP/3: Alt-Svc unit checks on ResponseWriter" {
+    let rw = http.ResponseWriter {}
+    rw.alt_svc = "h3=\":443\"; ma=86400"
+    rw.send("ok", 200)
+    let out1 = rw.output_buffer().to_string()
+    assert(out1.contains("Alt-Svc: h3=\":443\"; ma=86400\r\n"))
+
+    // 1xx responses must not emit Alt-Svc
+    rw.reset()
+    rw.allow_new_response()
+    rw.send("", 101)
+    let out2 = rw.output_buffer().to_string()
+    assert(!out2.contains("Alt-Svc:"))
+
+    // Explicit Alt-Svc in response headers overrides server default
+    rw.reset()
+    rw.allow_new_response()
+    let hdrs = http.Headers{ "Alt-Svc" => "clear" }
+    rw.send("ok", 200, "text/plain", hdrs)
+    let out3 = rw.output_buffer().to_string()
+    assert(out3.contains("Alt-Svc: clear\r\n"))
+    assert(!out3.contains("h3=\":443\""))
+}
+
+test "HTTP/3: automatic Alt-Svc on HTTP/1.1 and HTTP/2, omitted on HTTP/3" {
+    let dir = fs.create_temp_dir("valk-h3-altsvc-") !!
+    fs.write(fs.add(dir, "index.txt"), "static-alt-svc") !!
+    defer fs.delete_all(dir) ! {}
+
+    let port: u16 = 29447
+    let srv = http.Server.new("127.0.0.1", port, h3_test_handler)
+    srv.tls(tls_cert_path(), tls_key_path()) !!
+    srv.http2 = true
+    srv.http3 = true
+    srv.compress = true
+    srv.add_static_dir(dir, "", "/static") !!
+    co h3_run_server(srv)
+    time.sleep_ms(120)
+    defer srv.shutdown(2000)
+
+    let base = "https://127.0.0.1:" + port
+    let expected = "h3=\":" + port + "\"; ma=86400"
+
+    // HTTP/1.1 gets automatic Alt-Svc (normal, compressed, static file, 404)
+    let h1 = http.get(base + "/hello?p=1", http.Options { verify_tls_cert: false }) !!
+    assert(h1.status == 200 && (h1.headers.get("alt-svc") !? "") == expected)
+
+    let h1_cmp = http.get(base + "/compress", http.Options { verify_tls_cert: false }) !!
+    assert(h1_cmp.status == 200 && (h1_cmp.headers.get("alt-svc") !? "") == expected)
+
+    let h1_static = http.get(base + "/static/index.txt", http.Options { verify_tls_cert: false }) !!
+    assert(h1_static.status == 200 && h1_static.body == "static-alt-svc")
+    assert((h1_static.headers.get("alt-svc") !? "") == expected)
+
+    let h1_404 = http.get(base + "/missing", http.Options { verify_tls_cert: false }) !!
+    assert(h1_404.status == 404 && (h1_404.headers.get("alt-svc") !? "") == expected)
+
+    // Handler override wins over server default on HTTP/1.1
+    let h1_ovr = http.get(base + "/custom-alt-svc", http.Options { verify_tls_cert: false }) !!
+    assert(h1_ovr.status == 200 && (h1_ovr.headers.get("alt-svc") !? "") == "h3=\":8443\"; ma=60")
+    assert(h1_ovr.headers.get_all("alt-svc").length == 1)
+
+    // HTTP/2 gets automatic Alt-Svc (normal, static, and respects handler override)
+    let h2 = http.get(base + "/hello?p=2", http.Options { verify_tls_cert: false, http2: true }) !!
+    assert(h2.status == 200 && (h2.headers.get("alt-svc") !? "") == expected)
+
+    let h2_static = http.get(base + "/static/index.txt", http.Options { verify_tls_cert: false, http2: true }) !!
+    assert(h2_static.status == 200 && (h2_static.headers.get("alt-svc") !? "") == expected)
+
+    let h2_ovr = http.get(base + "/custom-alt-svc", http.Options { verify_tls_cert: false, http2: true }) !!
+    assert(h2_ovr.status == 200 && (h2_ovr.headers.get("alt-svc") !? "") == "h3=\":8443\"; ma=60")
+    assert(h2_ovr.headers.get_all("alt-svc").length == 1)
+
+    // HTTP/3 does NOT redundantly emit automatic Alt-Svc
+    let h3 = http.get(base + "/hello?p=3", http.Options { verify_tls_cert: false, http3: true }) !!
+    assert(h3.status == 200 && !h3.headers.has("alt-svc"))
+}
+
+test "HTTP/3: Alt-Svc custom value and opt-out" {
+    // Custom server-wide Alt-Svc
+    let port1: u16 = 29448
+    let srv1 = http.Server.new("127.0.0.1", port1, h3_test_handler)
+    srv1.tls(tls_cert_path(), tls_key_path()) !!
+    srv1.http2 = true
+    srv1.http3 = true
+    srv1.alt_svc = "h3=\":443\"; ma=3600"
+    co h3_run_server(srv1)
+    time.sleep_ms(120)
+    defer srv1.shutdown(2000)
+
+    let base1 = "https://127.0.0.1:" + port1
+    let c1 = http.get(base1 + "/hello", http.Options { verify_tls_cert: false }) !!
+    assert((c1.headers.get("alt-svc") !? "") == "h3=\":443\"; ma=3600")
+    let c2 = http.get(base1 + "/hello", http.Options { verify_tls_cert: false, http2: true }) !!
+    assert((c2.headers.get("alt-svc") !? "") == "h3=\":443\"; ma=3600")
+    let c3 = http.get(base1 + "/hello", http.Options { verify_tls_cert: false, http3: true }) !!
+    assert(!c3.headers.has("alt-svc"))
+
+    // Opt-out with empty string
+    let port2: u16 = 29449
+    let srv2 = http.Server.new("127.0.0.1", port2, h3_test_handler)
+    srv2.tls(tls_cert_path(), tls_key_path()) !!
+    srv2.http2 = true
+    srv2.http3 = true
+    srv2.alt_svc = ""
+    co h3_run_server(srv2)
+    time.sleep_ms(120)
+    defer srv2.shutdown(2000)
+
+    let base2 = "https://127.0.0.1:" + port2
+    let d1 = http.get(base2 + "/hello", http.Options { verify_tls_cert: false }) !!
+    assert(!d1.headers.has("alt-svc"))
+    let d2 = http.get(base2 + "/hello", http.Options { verify_tls_cert: false, http2: true }) !!
+    assert(!d2.headers.has("alt-svc"))
+
+    // Custom Alt-Svc also works with fast handler
+    let port3: u16 = 29450
+    let srv3 = http.Server.new("127.0.0.1", port3)
+    srv3.alt_svc = "h3=\":443\"; ma=120"
+    srv3.fast(fn(ctx: http.Context, res: http.ResponseWriter) { res.send("fast-ok") })
+    co h3_run_server(srv3)
+    time.sleep_ms(100)
+    defer srv3.shutdown(2000)
+
+    let f1 = http.get("http://127.0.0.1:" + port3 + "/") !!
+    assert(f1.status == 200 && f1.body == "fast-ok")
+    assert((f1.headers.get("alt-svc") !? "") == "h3=\":443\"; ma=120")
+}
+
+test "HTTP/3: Expect 100-continue and concurrent streamed trailers" {
+    let port: u16 = 29451
+    let srv = h3_start_test_server(port)
+    defer srv.shutdown(2000)
+
+    let client = http.Client.new()
+    client.http3 = true
+    defer client.close()
+
+    let base = "https://127.0.0.1:" + port
+
+    // Expect: 100-continue receives interim 100 and completes with 200
+    let opts = http.Options { verify_tls_cert: false }
+    opts.set_header("Expect", "100-continue")
+    let r1 = client.post(base + "/echo", "continue-payload", opts) !!
+    assert(r1.status == 200 && r1.body == "POST:continue-payload")
+
+    // Concurrent streamed responses with trailers do not clobber each other
+    let tasks = Array[co(String)]{}
+    each 0 .. 8 as i {
+        tasks.append(co h3_concurrent_req(client, base + "/stream-trailers?id=" + i))
+    }
+    each tasks as task, i {
+        let got = await task
+        let want = ("chunk-id=" + i + ";").repeat(4)
+        assert(got == want)
+    }
 }

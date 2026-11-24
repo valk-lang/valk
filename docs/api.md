@@ -3991,6 +3991,8 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 ```js
 // A multi-threaded HTTP/1.1 server, with optional TLS, HTTP/2 and HTTP/3.
 + class Server {
+    // The `Alt-Svc` header advertised on TCP (HTTP/1.1 and HTTP/2) responses.
+    + alt_svc: ?String
     // A worker that wakes for only a few idle keep-alive connections waits this many milliseconds before it looks for more, so one wake-up serves the requests that arrived meanwhile together: fewer system calls, and handlers on a pipelined database connection share round trips (about 25% less CPU per request under moderate load). It waits only while idle connections wake often enough that more are expected in that time, so a trickle of requests is not delayed. A request on an idle connection may wait up to this long; a busy worker never waits. 0 turns it off.
     + batch_delay_ms: uint
     // How long each read of a request body may take, in milliseconds.
@@ -5793,6 +5795,7 @@ type c_long (int)
 ```js
 type Escape (fn(local &[u8], Writer)(uint !IoError))
 type Filter (fn(Value, Array[Value])(Value))
+type Loader (fn(String)(?String))
 ```
 
 ## Functions for 'template'
@@ -5807,13 +5810,21 @@ type Filter (fn(Value, Array[Value])(Value))
 ```js
 // A set of templates and their filters.
 + class Engine {
+    // Enables context-aware HTML auto-escaping (HTML text, quoted and unquoted attributes, URL attributes, `<script>` JS, and `<style>` / `style=` CSS) when `escape` is the default `html_escape`. Defaults to `true`.
+    + auto_escape: bool
     // Writes every `{{ }}` output escaped; HTML escaping by default. Set it to `null` for plain text, or to your own `Escape` for another format: templates are not tied to HTML. A `RenderOptions.escape` overrides it for one render.
     + escape: ?fn(local &[u8], Writer)(uint !IoError)
+    // Optional fallback loader called when a template name is not registered via `set` or `set_many`. Loaded templates are compiled and cached until `remove` or `clear_cache` is called.
+    + loader: ?fn(String)(?String)
 
+    // Clears all cached compiled templates so they recompile (or reload via `loader`) on next render.
+    + fn clear_cache() void
     // Whether a template named `name` is registered.
     + fn has(name: String) bool
     // Creates an empty engine.
     + static fn new() Engine
+    // Removes the registered template `name` and any cached compiled form of it.
+    + fn remove(name: String) void
     // Renders the registered template `name` with `data` and returns the output.
     + fn render(name: String, data: $T, options: ?RenderOptions (null)) String !ParseError
     // Renders the template text `content` with `data` and returns the output.
@@ -5839,6 +5850,8 @@ type Filter (fn(Value, Array[Value])(Value))
     missing(String, String, uint)
     write(String, String)
 
+    // 1-based column number where the error occurred, or `0` when not available.
+    + get column: uint
     + get index: uint
     + get line: uint
     + get message: String
@@ -5850,6 +5863,8 @@ type Filter (fn(Value, Array[Value])(Value))
 ```js
 // Options for one `render` or `render_content` call.
 + class RenderOptions {
+    // Overrides `Engine.auto_escape` for this render when set (`null` inherits the engine's setting). Only applies when `escape` is the default `html_escape`.
+    + auto_escape: ?bool
     // The `Escape` applied to every `{{ }}` output of this render; HTML escaping by default, `null` for none. Options replace the engine's `escape` for the render, so an engine with an escape of its own passes it along: `RenderOptions { escape: engine.escape, max_depth: 2 }`.
     + escape: ?fn(local &[u8], Writer)(uint !IoError)
     // Maximum nesting of `@include`/`@extend` templates.

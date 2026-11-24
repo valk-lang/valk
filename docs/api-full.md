@@ -13221,6 +13221,8 @@ Creates an empty router; also backs `Router[T]{}` and default construction.
 ```js
 // A multi-threaded HTTP/1.1 server, with optional TLS, HTTP/2 and HTTP/3.
 + class Server {
+    // The `Alt-Svc` header advertised on TCP (HTTP/1.1 and HTTP/2) responses.
+    + alt_svc: ?String
     // A worker that wakes for only a few idle keep-alive connections waits this many milliseconds before it looks for more, so one wake-up serves the requests that arrived meanwhile together: fewer system calls, and handlers on a pipelined database connection share round trips (about 25% less CPU per request under moderate load). It waits only while idle connections wake often enough that more are expected in that time, so a trickle of requests is not delayed. A request on an idle connection may wait up to this long; a busy worker never waits. 0 turns it off.
     + batch_delay_ms: uint
     // How long each read of a request body may take, in milliseconds.
@@ -13306,6 +13308,16 @@ let s = http.Server.new("127.0.0.1", 9000, handler)
 s.max_request_body_size = 1024 * 1024
 s.start() ! { println("Failed to start http server"); return }
 ```
+
+#### alt_svc
+
+The `Alt-Svc` header advertised on TCP (HTTP/1.1 and HTTP/2) responses.
+
+When `null` (the default) and `http3` is enabled, the server emits
+`h3=":<port>"; ma=86400` for its bound port. Set to `""` to disable automatic
+advertisement, or to a custom value (such as `h3=":443"; ma=3600` behind a proxy).
+Responses that already set `Alt-Svc` keep their own header; HTTP/3 responses are
+unaffected.
 
 #### batch_delay_ms
 
@@ -18988,6 +19000,7 @@ Wakes the waiter; safe from any thread, and kept for the next `wait` when nobody
 ```js
 type Escape (fn(local &[u8], Writer)(uint !IoError))
 type Filter (fn(Value, Array[Value])(Value))
+type Loader (fn(String)(?String))
 ```
 
 ## Functions for 'template'
@@ -19006,13 +19019,21 @@ HTML escaping as an `Escape`: the default of `Engine.escape` and `RenderOptions.
 ```js
 // A set of templates and their filters.
 + class Engine {
+    // Enables context-aware HTML auto-escaping (HTML text, quoted and unquoted attributes, URL attributes, `<script>` JS, and `<style>` / `style=` CSS) when `escape` is the default `html_escape`. Defaults to `true`.
+    + auto_escape: bool
     // Writes every `{{ }}` output escaped; HTML escaping by default. Set it to `null` for plain text, or to your own `Escape` for another format: templates are not tied to HTML. A `RenderOptions.escape` overrides it for one render.
     + escape: ?fn(local &[u8], Writer)(uint !IoError)
+    // Optional fallback loader called when a template name is not registered via `set` or `set_many`. Loaded templates are compiled and cached until `remove` or `clear_cache` is called.
+    + loader: ?fn(String)(?String)
 
+    // Clears all cached compiled templates so they recompile (or reload via `loader`) on next render.
+    + fn clear_cache() void
     // Whether a template named `name` is registered.
     + fn has(name: String) bool
     // Creates an empty engine.
     + static fn new() Engine
+    // Removes the registered template `name` and any cached compiled form of it.
+    + fn remove(name: String) void
     // Renders the registered template `name` with `data` and returns the output.
     + fn render(name: String, data: $T, options: ?RenderOptions (null)) String !ParseError
     // Renders the template text `content` with `data` and returns the output.
@@ -19057,8 +19078,15 @@ fn handler(req: http.Request) http.Response {
 ```
 
 A template is compiled the first time it renders and the compiled form is kept until
-it is registered again. Output is HTML-escaped unless `escape` says otherwise, so an
-engine can just as well produce plain text, SQL or any other format.
+it is registered again. Output is context-aware HTML-escaped unless `escape` or
+`auto_escape` says otherwise, so an engine can just as well produce plain text, SQL
+or any other format.
+
+#### auto_escape
+
+Enables context-aware HTML auto-escaping (HTML text, quoted and unquoted
+attributes, URL attributes, `<script>` JS, and `<style>` / `style=` CSS) when
+`escape` is the default `html_escape`. Defaults to `true`.
 
 #### escape
 
@@ -19072,6 +19100,17 @@ engine.escape = fn(input: local &[u8], out: io.Writer) uint !io.IoError {
 }
 ```
 
+#### loader
+
+Optional fallback loader called when a template name is not registered via `set`
+or `set_many`. Loaded templates are compiled and cached until `remove` or
+`clear_cache` is called.
+
+#### clear_cache
+
+Clears all cached compiled templates so they recompile (or reload via `loader`) on
+next render.
+
 #### has
 
 Whether a template named `name` is registered.
@@ -19080,28 +19119,34 @@ Whether a template named `name` is registered.
 
 Creates an empty engine.
 
+#### remove
+
+Removes the registered template `name` and any cached compiled form of it.
+
 #### render
 
 Renders the registered template `name` with `data` and returns the output.
 
-`data` is converted with `json.from`, so template variables are its fields or map
-keys. `{{ }}` output goes through the engine's `escape` (HTML by default), or
-through `options.escape` when options are given, `{! !}` is written raw, and leading and trailing whitespace is trimmed
-from the result. `@include` and `@extend` look templates up in this engine, may not
-form a cycle, and may nest at most `options.max_depth` templates deep (64 by
-default), not counting `name` itself.
+`data` is read directly when it is a typed struct/class or converted via `json.from`,
+so template variables are its fields or map keys. `{{ }}` output goes through the
+engine's `escape` (context-aware HTML by default), or through `options.escape` when
+options are given, `{! !}` and `{{ expr | raw }}` write raw, and leading and trailing
+whitespace is trimmed from the result. `@include` and `@extend` look templates up in
+this engine (falling back to `loader`), may not form a cycle, and may nest at most
+`options.max_depth` templates deep (64 by default), not counting `name` itself.
 
 Throws `.template_not_found` when `name` is not registered, `.parse` on a syntax error,
 an unknown template in `@include`/`@extend`, a cycle, too deep nesting, an unknown
-filter or a variable or property that does not exist (`message` names the line and
-template).
+filter or a variable or property that does not exist (`message` names the line,
+column and template).
 
 #### render_content
 
 Renders the template text `content` with `data` and returns the output.
 
 Works like `render` without looking up a name first; `@include` and `@extend` still
-resolve against the registered templates. Throws `.parse` as `render` does.
+resolve against the registered templates (and `loader`). Throws `.parse` as `render`
+does.
 
 #### render_content_into
 
@@ -19128,7 +19173,7 @@ output continues with. A custom filter replaces a built-in one of the same name.
 built-in filters are `upper`, `lower`, `capitalize`, `trim`, `length` (`len`),
 `default(x)`, `join(sep)`, `first`, `last`, `reverse`, `round(decimals)`,
 `fixed(decimals)`, `truncate(n, suffix)`, `replace(from, to)`, `json`, `escape`,
-`urlencode` and `keys`.
+`raw`, `urlencode` and `keys`.
 
 #### set_many
 
@@ -19144,6 +19189,8 @@ Pairs with `#embed_dir`, which yields a map of relative paths to file contents.
     missing(String, String, uint)
     write(String, String)
 
+    // 1-based column number where the error occurred, or `0` when not available.
+    + get column: uint
     + get index: uint
     + get line: uint
     + get message: String
@@ -19165,9 +19212,15 @@ Thrown by `render` and `render_content` when a template cannot be rendered.
 - `write(template_name, message)`: `render_into` / `render_content_into` could not write
   to the writer.
 
+#### column
+
+1-based column number where the error occurred, or `0` when not available.
+
 ```js
 // Options for one `render` or `render_content` call.
 + class RenderOptions {
+    // Overrides `Engine.auto_escape` for this render when set (`null` inherits the engine's setting). Only applies when `escape` is the default `html_escape`.
+    + auto_escape: ?bool
     // The `Escape` applied to every `{{ }}` output of this render; HTML escaping by default, `null` for none. Options replace the engine's `escape` for the render, so an engine with an escape of its own passes it along: `RenderOptions { escape: engine.escape, max_depth: 2 }`.
     + escape: ?fn(local &[u8], Writer)(uint !IoError)
     // Maximum nesting of `@include`/`@extend` templates.
@@ -19178,6 +19231,11 @@ Thrown by `render` and `render_content` when a template cannot be rendered.
 ### RenderOptions
 
 Options for one `render` or `render_content` call.
+
+#### auto_escape
+
+Overrides `Engine.auto_escape` for this render when set (`null` inherits the
+engine's setting). Only applies when `escape` is the default `html_escape`.
 
 #### escape
 

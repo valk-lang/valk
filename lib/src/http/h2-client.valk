@@ -267,14 +267,24 @@ class H2ClientConnection {
             throw .invalid_response
         }
 
+        if frame.kind == H2_PUSH_PROMISE : throw .invalid_response
+
         if frame.kind == H2_SETTINGS {
             if (frame.flags & 1) != 0 : return
-            let old_init = this.peer_settings.initial_window_size.to(int)
-            this.peer_settings.apply(frame, true) ! throw .invalid_response
-            let new_init = this.peer_settings.initial_window_size.to(int)
-            let delta = new_init - old_init
-            if delta != 0 {
+            let start_window = this.peer_settings.initial_window_size.to(int)
+            let highest: int = 0
+            let pos: uint = 0
+            let payload = frame.payload.view()
+            while pos < payload.length {
+                this.peer_settings.apply_raw(0, 0, payload.view(pos, 6), true) ! throw .invalid_response
+                let delta = this.peer_settings.initial_window_size.to(int) - start_window
+                if delta > highest : highest = delta
+                pos += 6
+            }
+            let delta = this.peer_settings.initial_window_size.to(int) - start_window
+            if delta != 0 || highest > 0 {
                 each this.streams as st {
+                    if st.send_window + highest > 0x7fffffff : throw .invalid_response
                     st.send_window += delta
                     if delta > 0 : st.wake_window_waiters()
                 }
@@ -298,11 +308,18 @@ class H2ClientConnection {
             let inc = (r.read_u32_be() & 0x7fffffff).to(int)
             if inc <= 0 : throw .invalid_response
             if frame.stream == 0 {
+                if this.send_window + inc > 0x7fffffff : throw .invalid_response
                 this.send_window += inc
                 this.wake_window_waiters()
             } else {
                 let st = this.streams.get(frame.stream) !? null
                 if isset(st) {
+                    if st.send_window + inc > 0x7fffffff {
+                        this.streams.remove(frame.stream)
+                        this.send_rst_stream(frame.stream, 3)
+                        st.fail(H2_FAIL_INVALID_RESPONSE)
+                        return
+                    }
                     st.send_window += inc
                     st.wake_window_waiters()
                 }
@@ -352,16 +369,31 @@ class H2ClientConnection {
 
             if !st.headers_done {
                 let status_str = ""
+                let saw_regular = false
                 let size: uint = 0
                 let limit = st.max_header_size == 0 ? uint.$max : st.max_header_size
                 let hdrs = Headers.new()
                 each fields as field {
+                    if field.name.bytes == 0 || !response_header_value_is_safe(field.value) {
+                        this.streams.remove(stream_id)
+                        st.fail(H2_FAIL_INVALID_RESPONSE)
+                        return
+                    }
                     if field.name == ":status" {
-                        if status_str.bytes > 0 : { st.fail(H2_FAIL_INVALID_RESPONSE); return }
+                        if saw_regular || status_str.bytes > 0 {
+                            this.streams.remove(stream_id)
+                            st.fail(H2_FAIL_INVALID_RESPONSE)
+                            return
+                        }
                         status_str = field.value
                         continue
                     }
-                    if field.name.starts_with(":") : { st.fail(H2_FAIL_INVALID_RESPONSE); return }
+                    if field.name.starts_with(":") {
+                        this.streams.remove(stream_id)
+                        st.fail(H2_FAIL_INVALID_RESPONSE)
+                        return
+                    }
+                    saw_regular = true
                     let add = field.name.bytes + field.value.bytes + 32
                     if add > limit || size > limit - add {
                         this.streams.remove(stream_id)

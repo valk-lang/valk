@@ -1,0 +1,799 @@
+use io
+use json
+use html
+
+// Compile-time HTML context analysis and context-aware auto-escaping.
+//
+// Each `NODE_OUTPUT` is stamped with a `CTX_*` constant when its template is compiled,
+// so the hot path (`CTX_TEXT`, `CTX_ATTR_DQ`, `CTX_ATTR_SQ`) keeps the zero-allocation
+// SIMD `html.escape_into` path with no runtime HTML scanning.
+
+value CTX_TEXT (0)
+value CTX_ATTR_DQ (1)
+value CTX_ATTR_SQ (2)
+value CTX_ATTR_UNQUOTED (3)
+value CTX_URL_DQ (4)
+value CTX_URL_SQ (5)
+value CTX_URL_UNQUOTED (6)
+value CTX_JS_VALUE (7)
+value CTX_JS_STRING_DQ (8)
+value CTX_JS_STRING_SQ (9)
+value CTX_JS_STRING_BT (10)
+value CTX_JS_ATTR_VALUE (11)
+value CTX_JS_ATTR_DQ (12)
+value CTX_JS_ATTR_SQ (13)
+value CTX_JS_ATTR_BT (14)
+value CTX_CSS_VALUE (15)
+value CTX_CSS_STRING_DQ (16)
+value CTX_CSS_STRING_SQ (17)
+value CTX_CSS_ATTR_VALUE (18)
+value CTX_CSS_ATTR_DQ (19)
+value CTX_CSS_ATTR_SQ (20)
+value CTX_CSS_ATTR_UNQ (21)
+
+value SCAN_TEXT (0)
+value SCAN_COMMENT (1)
+value SCAN_TAG_NAME (2)
+value SCAN_TAG_SPACE (3)
+value SCAN_ATTR_NAME (4)
+value SCAN_AFTER_ATTR_NAME (5)
+value SCAN_BEFORE_ATTR_VAL (6)
+value SCAN_ATTR_VAL_DQ (7)
+value SCAN_ATTR_VAL_SQ (8)
+value SCAN_ATTR_VAL_UNQ (9)
+value SCAN_RAW_SCRIPT (10)
+value SCAN_RAW_STYLE (11)
+
+value ATTR_NORMAL (0)
+value ATTR_URL (1)
+value ATTR_JS (2)
+value ATTR_CSS (3)
+
+fn analyze_template(template: Template) {
+    let scanner = HtmlScanner {}
+    scanner.scan_nodes(template.nodes)
+}
+
+class HtmlScanner {
+    state: int (SCAN_TEXT)
+    tag_name: String ("")
+    is_end_tag: bool (false)
+    attr_name: String ("")
+    attr_kind: int (ATTR_NORMAL)
+    attr_val_prefix: String ("")
+    sub_quote: u8 (0)
+    sub_escape: bool (false)
+    sub_comment: int (0)
+
+    fn clone() HtmlScanner {
+        return HtmlScanner {
+            state: this.state
+            tag_name: this.tag_name
+            is_end_tag: this.is_end_tag
+            attr_name: this.attr_name
+            attr_kind: this.attr_kind
+            attr_val_prefix: this.attr_val_prefix
+            sub_quote: this.sub_quote
+            sub_escape: this.sub_escape
+            sub_comment: this.sub_comment
+        }
+    }
+
+    fn copy_from(other: HtmlScanner) {
+        this.state = other.state
+        this.tag_name = other.tag_name
+        this.is_end_tag = other.is_end_tag
+        this.attr_name = other.attr_name
+        this.attr_kind = other.attr_kind
+        this.attr_val_prefix = other.attr_val_prefix
+        this.sub_quote = other.sub_quote
+        this.sub_escape = other.sub_escape
+        this.sub_comment = other.sub_comment
+    }
+
+    fn scan_nodes(nodes: Array[Node]) {
+        each nodes as node {
+            if node.type == NODE_TEXT {
+                this.feed(node.text)
+            } else if node.type == NODE_OUTPUT {
+                node.ctx = this.output_ctx()
+                if is_url_ctx(node.ctx) : node.url_prefix = this.attr_val_prefix
+                if this.state == SCAN_BEFORE_ATTR_VAL : this.state = SCAN_ATTR_VAL_UNQ
+            } else if node.type == NODE_IF {
+                let before = this.clone()
+                let after: ?HtmlScanner = null
+                each node.branches as arm {
+                    let s = before.clone()
+                    s.scan_nodes(arm.nodes)
+                    if !isset(after) : after = s
+                }
+                if isset(after) : this.copy_from(after)
+            } else if node.type == NODE_EACH {
+                let before = this.clone()
+                let body_s = before.clone()
+                body_s.scan_nodes(node.body)
+                let empty = node.empty_body
+                if isset(empty) {
+                    let empty_s = before.clone()
+                    empty_s.scan_nodes(empty)
+                }
+            } else if node.type == NODE_BLOCK {
+                if this.state != SCAN_TEXT : node.entry_scanner = this.clone()
+                let s = this.clone()
+                s.scan_nodes(node.body)
+            } else if node.type == NODE_YIELD {
+                node.ctx = this.output_ctx()
+                if is_url_ctx(node.ctx) : node.url_prefix = this.attr_val_prefix
+                if this.state != SCAN_TEXT : node.entry_scanner = this.clone()
+                if this.state == SCAN_BEFORE_ATTR_VAL : this.state = SCAN_ATTR_VAL_UNQ
+            } else if node.type == NODE_INCLUDE {
+                if this.state != SCAN_TEXT : node.entry_scanner = this.clone()
+                if this.state == SCAN_BEFORE_ATTR_VAL : this.state = SCAN_ATTR_VAL_UNQ
+            }
+        }
+    }
+
+    fn output_ctx() int {
+        let st = this.state
+        if st == SCAN_TEXT || st == SCAN_COMMENT : return CTX_TEXT
+        if st == SCAN_RAW_SCRIPT {
+            if this.sub_quote == '"' : return CTX_JS_STRING_DQ
+            if this.sub_quote == '\'' : return CTX_JS_STRING_SQ
+            if this.sub_quote == '`' : return CTX_JS_STRING_BT
+            return CTX_JS_VALUE
+        }
+        if st == SCAN_RAW_STYLE {
+            if this.sub_quote == '"' : return CTX_CSS_STRING_DQ
+            if this.sub_quote == '\'' : return CTX_CSS_STRING_SQ
+            return CTX_CSS_VALUE
+        }
+        if st == SCAN_ATTR_VAL_DQ || st == SCAN_ATTR_VAL_SQ || st == SCAN_ATTR_VAL_UNQ || st == SCAN_BEFORE_ATTR_VAL {
+            let unquoted = st == SCAN_ATTR_VAL_UNQ || st == SCAN_BEFORE_ATTR_VAL
+            if this.attr_kind == ATTR_URL {
+                if unquoted : return CTX_URL_UNQUOTED
+                return st == SCAN_ATTR_VAL_DQ ? CTX_URL_DQ : CTX_URL_SQ
+            }
+            if this.attr_kind == ATTR_JS {
+                if unquoted : return CTX_ATTR_UNQUOTED
+                if this.sub_quote == '"' : return CTX_JS_ATTR_DQ
+                if this.sub_quote == '\'' : return CTX_JS_ATTR_SQ
+                if this.sub_quote == '`' : return CTX_JS_ATTR_BT
+                return CTX_JS_ATTR_VALUE
+            }
+            if this.attr_kind == ATTR_CSS {
+                if unquoted : return CTX_CSS_ATTR_UNQ
+                if this.sub_quote == '"' : return CTX_CSS_ATTR_DQ
+                if this.sub_quote == '\'' : return CTX_CSS_ATTR_SQ
+                return CTX_CSS_ATTR_VALUE
+            }
+            if unquoted : return CTX_ATTR_UNQUOTED
+            return st == SCAN_ATTR_VAL_DQ ? CTX_ATTR_DQ : CTX_ATTR_SQ
+        }
+        return CTX_TEXT
+    }
+
+    fn feed(text: String) {
+        let len = text.bytes
+        let i: uint = 0
+        while i < len {
+            let ch = text.get(i)
+            let st = this.state
+            if st == SCAN_TEXT {
+                if ch == '<' && i + 1 < len {
+                    let next = text.get(i + 1)
+                    if next == '!' && i + 3 < len && text.get(i + 2) == '-' && text.get(i + 3) == '-' {
+                        this.state = SCAN_COMMENT
+                        i += 4
+                        continue
+                    }
+                    if next == '/' && i + 2 < len && text.get(i + 2).is_alpha() {
+                        this.is_end_tag = true
+                        this.tag_name = ""
+                        this.state = SCAN_TAG_NAME
+                        i += 2
+                        continue
+                    }
+                    if next.is_alpha() {
+                        this.is_end_tag = false
+                        this.tag_name = ""
+                        this.state = SCAN_TAG_NAME
+                        i++
+                        continue
+                    }
+                }
+                i++
+            } else if st == SCAN_COMMENT {
+                if ch == '-' && i + 2 < len && text.get(i + 1) == '-' && text.get(i + 2) == '>' {
+                    this.state = SCAN_TEXT
+                    i += 3
+                    continue
+                }
+                i++
+            } else if st == SCAN_TAG_NAME {
+                if ch == '>' {
+                    this.close_tag()
+                    i++
+                } else if ch.is_html_whitespace() || ch == '/' {
+                    this.state = SCAN_TAG_SPACE
+                    i++
+                } else {
+                    if this.tag_name.bytes < 32 : this.tag_name += ascii_lower_str(ch)
+                    i++
+                }
+            } else if st == SCAN_TAG_SPACE {
+                if ch == '>' {
+                    this.close_tag()
+                    i++
+                } else if ch.is_html_whitespace() || ch == '/' {
+                    i++
+                } else {
+                    this.attr_name = ""
+                    this.state = SCAN_ATTR_NAME
+                }
+            } else if st == SCAN_ATTR_NAME {
+                if ch == '=' {
+                    this.begin_attr_value()
+                    i++
+                } else if ch.is_html_whitespace() {
+                    this.state = SCAN_AFTER_ATTR_NAME
+                    i++
+                } else if ch == '>' {
+                    this.close_tag()
+                    i++
+                } else if ch == '/' {
+                    this.state = SCAN_TAG_SPACE
+                    i++
+                } else {
+                    if this.attr_name.bytes < 64 : this.attr_name += ascii_lower_str(ch)
+                    i++
+                }
+            } else if st == SCAN_AFTER_ATTR_NAME {
+                if ch.is_html_whitespace() {
+                    i++
+                } else if ch == '=' {
+                    this.begin_attr_value()
+                    i++
+                } else if ch == '>' {
+                    this.close_tag()
+                    i++
+                } else if ch == '/' {
+                    this.state = SCAN_TAG_SPACE
+                    i++
+                } else {
+                    this.attr_name = ""
+                    this.state = SCAN_ATTR_NAME
+                }
+            } else if st == SCAN_BEFORE_ATTR_VAL {
+                if ch.is_html_whitespace() {
+                    i++
+                } else if ch == '"' {
+                    this.state = SCAN_ATTR_VAL_DQ
+                    i++
+                } else if ch == '\'' {
+                    this.state = SCAN_ATTR_VAL_SQ
+                    i++
+                } else if ch == '>' {
+                    this.close_tag()
+                    i++
+                } else {
+                    this.state = SCAN_ATTR_VAL_UNQ
+                }
+            } else if st == SCAN_ATTR_VAL_DQ || st == SCAN_ATTR_VAL_SQ {
+                let close: u8 = st == SCAN_ATTR_VAL_DQ ? '"' : '\''
+                if ch == close {
+                    this.state = SCAN_TAG_SPACE
+                    i++
+                } else {
+                    let next: u8 = i + 1 < len ? text.get(i + 1) : 0
+                    if next == close : next = 0
+                    i += this.step_attr_char(ch, next)
+                }
+            } else if st == SCAN_ATTR_VAL_UNQ {
+                if ch.is_html_whitespace() {
+                    this.state = SCAN_TAG_SPACE
+                    i++
+                } else if ch == '>' {
+                    this.close_tag()
+                    i++
+                } else {
+                    let next: u8 = i + 1 < len ? text.get(i + 1) : 0
+                    if next == '>' || next.is_html_whitespace() : next = 0
+                    i += this.step_attr_char(ch, next)
+                }
+            } else if st == SCAN_RAW_SCRIPT {
+                if ch == '<' && match_close_tag(text, i, "script") {
+                    i += 8
+                    while i < len && text.get(i) != '>' : i++
+                    if i < len : i++
+                    this.state = SCAN_TEXT
+                    continue
+                }
+                let next: u8 = i + 1 < len ? text.get(i + 1) : 0
+                i += this.step_js(ch, next)
+            } else if st == SCAN_RAW_STYLE {
+                if ch == '<' && match_close_tag(text, i, "style") {
+                    i += 7
+                    while i < len && text.get(i) != '>' : i++
+                    if i < len : i++
+                    this.state = SCAN_TEXT
+                    continue
+                }
+                let next: u8 = i + 1 < len ? text.get(i + 1) : 0
+                i += this.step_css(ch, next)
+            } else {
+                i++
+            }
+        }
+    }
+
+    fn close_tag() {
+        if !this.is_end_tag && this.tag_name == "script" {
+            this.state = SCAN_RAW_SCRIPT
+            this.sub_quote = 0
+            this.sub_escape = false
+            this.sub_comment = 0
+        } else if !this.is_end_tag && this.tag_name == "style" {
+            this.state = SCAN_RAW_STYLE
+            this.sub_quote = 0
+            this.sub_escape = false
+            this.sub_comment = 0
+        } else {
+            this.state = SCAN_TEXT
+        }
+        this.tag_name = ""
+        this.is_end_tag = false
+    }
+
+    fn begin_attr_value() {
+        this.attr_kind = classify_attr(this.attr_name)
+        this.attr_val_prefix = ""
+        this.sub_quote = 0
+        this.sub_escape = false
+        this.sub_comment = 0
+        this.state = SCAN_BEFORE_ATTR_VAL
+    }
+
+    fn step_attr_char(ch: u8, next: u8) uint {
+        if this.attr_kind == ATTR_URL {
+            if this.attr_val_prefix.bytes < 64 : this.attr_val_prefix += byte_to_string(ch)
+            return 1
+        }
+        if this.attr_kind == ATTR_JS : return this.step_js(ch, next)
+        if this.attr_kind == ATTR_CSS : return this.step_css(ch, next)
+        return 1
+    }
+
+    fn step_js(ch: u8, next: u8) uint {
+        if this.sub_comment == 1 {
+            if ch == '\n' || ch == '\r' : this.sub_comment = 0
+            return 1
+        }
+        if this.sub_comment == 2 {
+            if ch == '*' && next == '/' {
+                this.sub_comment = 0
+                return 2
+            }
+            return 1
+        }
+        if this.sub_quote != 0 {
+            if this.sub_escape {
+                this.sub_escape = false
+                return 1
+            }
+            if ch == '\\' {
+                this.sub_escape = true
+                return 1
+            }
+            if ch == this.sub_quote : this.sub_quote = 0
+            return 1
+        }
+        if ch == '/' && next == '/' {
+            this.sub_comment = 1
+            return 2
+        }
+        if ch == '/' && next == '*' {
+            this.sub_comment = 2
+            return 2
+        }
+        if ch == '"' || ch == '\'' || ch == '`' : this.sub_quote = ch
+        return 1
+    }
+
+    fn step_css(ch: u8, next: u8) uint {
+        if this.sub_comment == 2 {
+            if ch == '*' && next == '/' {
+                this.sub_comment = 0
+                return 2
+            }
+            return 1
+        }
+        if this.sub_quote != 0 {
+            if this.sub_escape {
+                this.sub_escape = false
+                return 1
+            }
+            if ch == '\\' {
+                this.sub_escape = true
+                return 1
+            }
+            if ch == this.sub_quote : this.sub_quote = 0
+            return 1
+        }
+        if ch == '/' && next == '*' {
+            this.sub_comment = 2
+            return 2
+        }
+        if ch == '"' || ch == '\'' : this.sub_quote = ch
+        return 1
+    }
+}
+
+fn is_url_ctx(ctx: int) bool {
+    return ctx == CTX_URL_DQ || ctx == CTX_URL_SQ || ctx == CTX_URL_UNQUOTED
+}
+
+fn classify_attr(name: String) int {
+    if name == "href" || name == "src" || name == "action" || name == "formaction"
+        || name == "poster" || name == "cite" || name == "background" || name == "xlink:href"
+        || name == "data" || name == "codebase" || name == "longdesc" || name == "usemap"
+        || name == "profile" || name == "manifest" {
+        return ATTR_URL
+    }
+    if name == "style" : return ATTR_CSS
+    if name.bytes >= 3 && name.get(0) == 'o' && name.get(1) == 'n' {
+        let i: uint = 2
+        while i < name.bytes {
+            if !name.get(i).is_alpha() : return ATTR_NORMAL
+            i++
+        }
+        return ATTR_JS
+    }
+    return ATTR_NORMAL
+}
+
+fn match_close_tag(text: String, at: uint, name: String) bool {
+    let need = 2 + name.bytes
+    if at + need > text.bytes : return false
+    if text.get(at) != '<' || text.get(at + 1) != '/' : return false
+    each 0 .. name.bytes as k {
+        if ascii_lower(text.get(at + 2 + k)) != name.get(k) : return false
+    }
+    if at + need == text.bytes : return true
+    let after = text.get(at + need)
+    return after == '>' || after == '/' || after.is_html_whitespace()
+}
+
+fn ascii_lower(ch: u8) u8 {
+    if ch >= 'A' && ch <= 'Z' : return ch + 32
+    return ch
+}
+
+fn ascii_lower_str(ch: u8) String {
+    return byte_to_string(ascii_lower(ch))
+}
+
+fn byte_to_string(ch: u8) String {
+    let buf = ByteBuffer.new(1)
+    buf.write_byte(ch)
+    return buf.into_string()
+}
+
+// ---- Context-aware value writers ----------------------------------------------------
+
+// Writes `value` escaped for `ctx` directly into `out`.
+// `CTX_TEXT`, `CTX_ATTR_DQ`, `CTX_ATTR_SQ` are handled on the hot path in `render.valk`;
+// this handles all other HTML contexts without intermediate string allocations for scalars.
+fn write_context_escaped(value: Datum, ctx: int, url_prefix: String, out: ByteBuffer) !io.IoError {
+    if ctx == CTX_TEXT || ctx == CTX_ATTR_DQ || ctx == CTX_ATTR_SQ {
+        match value {
+            String as text => {
+                html.escape_into(text, out) !>
+            }
+            int as number => {
+                out.write_int_ascii(number)
+            }
+            float as number => {
+                let digits: [u8 x 65] = @undefined
+                let scratch: local mut &[u8] = &digits
+                out.write(scratch.view(0, number.to_shortest_string_in(scratch)))
+            }
+            default => {
+                html.escape_into(value_text(datum_to_json(value)), out) !>
+            }
+        }
+        return
+    }
+    if ctx == CTX_JS_VALUE || ctx == CTX_JS_ATTR_VALUE {
+        write_js_value(value, out, ctx == CTX_JS_ATTR_VALUE)
+        return
+    }
+    if ctx == CTX_JS_STRING_DQ || ctx == CTX_JS_STRING_SQ || ctx == CTX_JS_STRING_BT
+        || ctx == CTX_JS_ATTR_DQ || ctx == CTX_JS_ATTR_SQ || ctx == CTX_JS_ATTR_BT {
+        let esc_dollar = ctx == CTX_JS_STRING_BT || ctx == CTX_JS_ATTR_BT
+        let for_attr = ctx == CTX_JS_ATTR_DQ || ctx == CTX_JS_ATTR_SQ || ctx == CTX_JS_ATTR_BT
+        match value {
+            String as text => write_js_string(text, out, esc_dollar, for_attr)
+            int as number => out.write_int_ascii(number)
+            float as number => {
+                let digits: [u8 x 65] = @undefined
+                let scratch: local mut &[u8] = &digits
+                out.write(scratch.view(0, number.to_shortest_string_in(scratch)))
+            }
+            default => write_js_string(value_text(datum_to_json(value)), out, esc_dollar, for_attr)
+        }
+        return
+    }
+    if ctx == CTX_CSS_VALUE || ctx == CTX_CSS_ATTR_VALUE || ctx == CTX_CSS_ATTR_UNQ {
+        let unquoted = ctx == CTX_CSS_ATTR_UNQ
+        match value {
+            String as text => write_css_value(text, out, unquoted)
+            int as number => out.write_int_ascii(number)
+            float as number => {
+                let digits: [u8 x 65] = @undefined
+                let scratch: local mut &[u8] = &digits
+                out.write(scratch.view(0, number.to_shortest_string_in(scratch)))
+            }
+            default => write_css_value(value_text(datum_to_json(value)), out, unquoted)
+        }
+        return
+    }
+    if ctx == CTX_CSS_STRING_DQ || ctx == CTX_CSS_STRING_SQ || ctx == CTX_CSS_ATTR_DQ || ctx == CTX_CSS_ATTR_SQ {
+        match value {
+            String as text => write_css_string(text, out)
+            int as number => out.write_int_ascii(number)
+            float as number => {
+                let digits: [u8 x 65] = @undefined
+                let scratch: local mut &[u8] = &digits
+                out.write(scratch.view(0, number.to_shortest_string_in(scratch)))
+            }
+            default => write_css_string(value_text(datum_to_json(value)), out)
+        }
+        return
+    }
+    if ctx == CTX_ATTR_UNQUOTED {
+        match value {
+            String as text => write_unquoted_attr(text, out)
+            int as number => out.write_int_ascii(number)
+            float as number => {
+                let digits: [u8 x 65] = @undefined
+                let scratch: local mut &[u8] = &digits
+                out.write(scratch.view(0, number.to_shortest_string_in(scratch)))
+            }
+            default => write_unquoted_attr(value_text(datum_to_json(value)), out)
+        }
+        return
+    }
+    if is_url_ctx(ctx) {
+        match value {
+            String as text => write_url_attr(text, ctx, url_prefix, out) !>
+            int as number => out.write_int_ascii(number)
+            float as number => {
+                let digits: [u8 x 65] = @undefined
+                let scratch: local mut &[u8] = &digits
+                out.write(scratch.view(0, number.to_shortest_string_in(scratch)))
+            }
+            default => write_url_attr(value_text(datum_to_json(value)), ctx, url_prefix, out) !>
+        }
+        return
+    }
+}
+
+fn write_unquoted_attr(input: local &[u8], out: ByteBuffer) {
+    let len = input.length
+    if len == 0 {
+        out.write("\"\"")
+        return
+    }
+    let start: uint = 0
+    let i: uint = 0
+    while i < len {
+        let ch = input[i]
+        let rep = ""
+        if ch == '&' : rep = "&amp;"
+        else if ch == '<' : rep = "&lt;"
+        else if ch == '>' : rep = "&gt;"
+        else if ch == '"' : rep = "&quot;"
+        else if ch == '\'' : rep = "&#39;"
+        else if ch == '`' : rep = "&#96;"
+        else if ch == '=' : rep = "&#61;"
+        else if ch == ' ' : rep = "&#32;"
+        else if ch == '\t' : rep = "&#9;"
+        else if ch == '\n' : rep = "&#10;"
+        else if ch == '\f' : rep = "&#12;"
+        else if ch == '\r' : rep = "&#13;"
+        else {
+            i++
+            continue
+        }
+        if i > start : out.write(input.view(start, i - start))
+        out.write(rep)
+        i++
+        start = i
+    }
+    if len > start : out.write(input.view(start, len - start))
+}
+
+// Returns true when `prefix` already fixes the URL as relative (`/`, `?`, `#`) or
+// already has an explicit scheme (`:`) before the dynamic value.
+fn url_prefix_fixes_scheme(prefix: String) bool {
+    let i: uint = 0
+    let len = prefix.bytes
+    while i < len && prefix.get(i) <= ' ' : i++
+    while i < len {
+        let ch = prefix.get(i)
+        if ch == '/' || ch == '?' || ch == '#' : return true
+        if ch == ':' : return html.url_is_allowed(prefix)
+        i++
+    }
+    return false
+}
+
+fn write_url_attr(text: String, ctx: int, url_prefix: String, out: ByteBuffer) !io.IoError {
+    let unquoted = ctx == CTX_URL_UNQUOTED
+    if !url_prefix_fixes_scheme(url_prefix) {
+        let candidate = url_prefix.bytes == 0 ? text : url_prefix + text
+        if !html.url_is_allowed(candidate) {
+            if unquoted : out.write("\"\"")
+            return
+        }
+    }
+    if unquoted {
+        write_unquoted_attr(text, out)
+    } else {
+        html.escape_into(text, out) !>
+    }
+}
+
+fn write_js_string(input: local &[u8], out: ByteBuffer, escape_dollar: bool, for_attr: bool) {
+    let len = input.length
+    let start: uint = 0
+    let i: uint = 0
+    while i < len {
+        let ch = input[i]
+        // Unicode line/paragraph separators U+2028 (E2 80 A8) and U+2029 (E2 80 A9)
+        if ch == 0xE2 && i + 2 < len && input[i + 1] == 0x80 && (input[i + 2] == 0xA8 || input[i + 2] == 0xA9) {
+            if i > start : out.write(input.view(start, i - start))
+            out.write(input[i + 2] == 0xA8 ? "\\u2028" : "\\u2029")
+            i += 3
+            start = i
+            continue
+        }
+        let rep = ""
+        if ch == '\\' : rep = "\\\\"
+        else if ch == '"' : rep = for_attr ? "\\u0022" : "\\\""
+        else if ch == '\'' : rep = "\\u0027"
+        else if ch == '`' : rep = "\\u0060"
+        else if ch == '$' && escape_dollar : rep = "\\u0024"
+        else if ch == '\n' : rep = "\\n"
+        else if ch == '\r' : rep = "\\r"
+        else if ch == '\t' : rep = "\\t"
+        else if ch == '<' : rep = "\\u003c"
+        else if ch == '>' : rep = "\\u003e"
+        else if ch == '&' : rep = "\\u0026"
+        else if ch == '/' : rep = "\\/"
+        else if ch < 0x20 {
+            if i > start : out.write(input.view(start, i - start))
+            let hex = "0123456789abcdef"
+            out.write("\\u00")
+            out.write_byte(hex.get((ch >> 4).to(uint)))
+            out.write_byte(hex.get((ch & 0x0F).to(uint)))
+            i++
+            start = i
+            continue
+        } else {
+            i++
+            continue
+        }
+        if i > start : out.write(input.view(start, i - start))
+        out.write(rep)
+        i++
+        start = i
+    }
+    if len > start : out.write(input.view(start, len - start))
+}
+
+fn write_js_json(raw: local &[u8], out: ByteBuffer, for_attr: bool) {
+    let len = raw.length
+    let start: uint = 0
+    let i: uint = 0
+    while i < len {
+        let ch = raw[i]
+        if ch == 0xE2 && i + 2 < len && raw[i + 1] == 0x80 && (raw[i + 2] == 0xA8 || raw[i + 2] == 0xA9) {
+            if i > start : out.write(raw.view(start, i - start))
+            out.write(raw[i + 2] == 0xA8 ? "\\u2028" : "\\u2029")
+            i += 3
+            start = i
+            continue
+        }
+        let rep = ""
+        if ch == '<' : rep = "\\u003c"
+        else if ch == '>' : rep = "\\u003e"
+        else if ch == '&' : rep = "\\u0026"
+        else if ch == '"' && for_attr : rep = "&quot;"
+        else if ch == '\'' && for_attr : rep = "&#39;"
+        else {
+            i++
+            continue
+        }
+        if i > start : out.write(raw.view(start, i - start))
+        out.write(rep)
+        i++
+        start = i
+    }
+    if len > start : out.write(raw.view(start, len - start))
+}
+
+fn write_js_value(value: Datum, out: ByteBuffer, for_attr: bool) {
+    match value {
+        null => out.write("null")
+        bool as b => out.write(b ? "true" : "false")
+        int as number => out.write_int_ascii(number)
+        float as number => {
+            if number != number || number.is_infinite() {
+                out.write("null")
+            } else {
+                let digits: [u8 x 65] = @undefined
+                let scratch: local mut &[u8] = &digits
+                out.write(scratch.view(0, number.to_shortest_string_in(scratch)))
+            }
+        }
+        String as text => {
+            out.write(for_attr ? "&quot;" : "\"")
+            write_js_string(text, out, false, for_attr)
+            out.write(for_attr ? "&quot;" : "\"")
+        }
+        default => {
+            let encoded = json.encode(datum_to_json(value))
+            write_js_json(encoded, out, for_attr)
+        }
+    }
+}
+
+fn write_css_hex(ch: u8, out: ByteBuffer) {
+    let hex = "0123456789abcdef"
+    out.write_byte('\\')
+    out.write_byte(hex.get((ch >> 4).to(uint)))
+    out.write_byte(hex.get((ch & 0x0F).to(uint)))
+    out.write_byte(' ')
+}
+
+fn write_css_string(input: local &[u8], out: ByteBuffer) {
+    let len = input.length
+    let start: uint = 0
+    let i: uint = 0
+    while i < len {
+        let ch = input[i]
+        let unsafe = ch < 0x20 || ch == 0x7F || ch == '\\' || ch == '"' || ch == '\''
+            || ch == '<' || ch == '>' || ch == '&' || ch == '/' || ch == '(' || ch == ')' || ch == ';'
+        if !unsafe {
+            i++
+            continue
+        }
+        if i > start : out.write(input.view(start, i - start))
+        write_css_hex(ch, out)
+        i++
+        start = i
+    }
+    if len > start : out.write(input.view(start, len - start))
+}
+
+fn write_css_value(input: local &[u8], out: ByteBuffer, unquoted_attr: bool) {
+    let len = input.length
+    let start: uint = 0
+    let i: uint = 0
+    while i < len {
+        let ch = input[i]
+        let safe = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')
+            || ch == '#' || ch == '.' || ch == '-' || ch == '_' || ch == '%' || ch == ',' || ch == '+'
+            || (ch == ' ' && !unquoted_attr)
+        if safe {
+            i++
+            continue
+        }
+        if i > start : out.write(input.view(start, i - start))
+        write_css_hex(ch, out)
+        i++
+        start = i
+    }
+    if len > start : out.write(input.view(start, len - start))
+}

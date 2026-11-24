@@ -864,6 +864,324 @@ check "0.9.0: definition on named union variant in is .variant" \
     '"line":27,"character":' \
     "$(request textDocument/definition v0810.valk 55 24)"
 
+# ########################################
+# Workspace symbol search
+# ########################################
+
+mkdir -p "$workdir/ws-sym/src/extra"
+printf '{}\n' > "$workdir/ws-sym/valk.json"
+cat > "$workdir/ws-sym/src/main.valk" <<'EOF'
+value WS_LIMIT (42)
+global ws_total: uint (0)
+type WsId (uint)
+mode WsMeters for uint {}
+
+interface WsDrawable {
+    fn draw() uint
+}
+
+trait WsNamed {
+    fn label() String {
+        return "named"
+    }
+}
+
+enum WsKind {
+    alpha
+    beta
+}
+
+union WsShape {
+    circle(f64)
+    rect(f64, f64)
+    point
+}
+
+struct WsPoint {
+    x: int
+    y: int
+}
+
+fn ws_entry() uint {
+    return WS_LIMIT + ws_total
+}
+EOF
+cat > "$workdir/ws-sym/src/extra/extra.valk" <<'EOF'
+class WsWidget {
+    name: String
+
+    fn title() String {
+        return this.name
+    }
+}
+
+alias WsWidgetAlias for WsWidget
+EOF
+cat > "$workdir/ws-sym/src/extra/ext.valk" <<'EOF'
+extend WsWidget {
+    fn ext_method() uint {
+        return 7
+    }
+}
+EOF
+
+init_ws=$(printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"rootUri":"file://%s"}}' "$workdir/ws-sym")
+ws_query() {
+    printf '{"jsonrpc":"2.0","id":2,"method":"workspace/symbol","params":{"query":"%s"}}' "$1"
+}
+
+check_with_init "workspace/symbol empty query finds declarations across all namespaces" '"name":"WsWidget","kind":5' \
+    "$init_ws" "$(ws_query "")"
+check_absent_with_init "workspace/symbol empty query skips stdlib declarations" '"name":"Array"' \
+    "$init_ws" "$(ws_query "")"
+check_with_init "workspace/symbol matches struct case-insensitively" '"name":"WsPoint","kind":23' \
+    "$init_ws" "$(ws_query "wSpOiNt")"
+check_with_init "workspace/symbol finds named union variant with container" '"name":"circle","kind":22,"location":' \
+    "$init_ws" "$(ws_query "circle")"
+check_with_init "workspace/symbol names union container for variant" '"containerName":"WsShape"' \
+    "$init_ws" "$(ws_query "circle")"
+check_with_init "workspace/symbol finds extend method in another file" '"name":"ext_method","kind":6' \
+    "$init_ws" "$(ws_query "ext_method")"
+check_with_init "workspace/symbol points extend method to its own file" 'src/extra/ext.valk' \
+    "$init_ws" "$(ws_query "ext_method")"
+check_with_init "workspace/symbol finds value constants" '"name":"WS_LIMIT","kind":14' \
+    "$init_ws" "$(ws_query "ws_limit")"
+check_with_init "workspace/symbol finds type aliases, aliases, modes, interfaces, traits and globals" '"name":"WsId","kind":5' \
+    "$init_ws" "$(ws_query "WsId")"
+check_with_init "workspace/symbol finds alias declarations" '"name":"WsWidgetAlias","kind":5' \
+    "$init_ws" "$(ws_query "WsWidgetAlias")"
+check_with_init "workspace/symbol finds mode declarations" '"name":"WsMeters","kind":5' \
+    "$init_ws" "$(ws_query "WsMeters")"
+check_with_init "workspace/symbol finds interface declarations" '"name":"WsDrawable","kind":11' \
+    "$init_ws" "$(ws_query "WsDrawable")"
+check_with_init "workspace/symbol finds trait declarations" '"name":"WsNamed","kind":11' \
+    "$init_ws" "$(ws_query "WsNamed")"
+check_with_init "workspace/symbol finds global declarations" '"name":"ws_total","kind":13' \
+    "$init_ws" "$(ws_query "ws_total")"
+check_with_init "workspace/symbol supports container-qualified queries" '"name":"ext_method","kind":6' \
+    "$init_ws" "$(ws_query "WsWidget.ext_method")"
+check_with_init "workspace/symbol supports fuzzy subsequence queries" '"name":"WsPoint","kind":23' \
+    "$init_ws" "$(ws_query "wspt")"
+
+# Cache invalidation on buffer edit
+check_with_init "workspace/symbol reflects edits in open files" '"name":"ws_renamed_entry"' \
+    "$init_ws" \
+    "$(ws_query "ws_entry")" \
+    "$(printf '{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file://%s","text":"fn ws_renamed_entry() uint { return 1 }\\n"}}}' "$workdir/ws-sym/src/main.valk")" \
+    '{"jsonrpc":"2.0","id":3,"method":"workspace/symbol","params":{"query":"ws_renamed"}}'
+
+# Result cap (<= 200) on a large workspace (the compiler repo itself)
+count=$((count + 1))
+echo "> workspace/symbol caps results at 200 on a large workspace"
+init_repo=$(printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"rootUri":"file://%s"}}' "$ROOT")
+out=$(printf '%s' "$(frame "$init_repo")$(frame "$(ws_query "")")" | $TIMEOUT "$VALK" lsp run 2>&1)
+sym_count=$(printf '%s' "$out" | grep -o '"location":{"uri":' | wc -l | tr -d ' ')
+if [ "$sym_count" -lt 100 ] || [ "$sym_count" -gt 200 ]; then
+    echo "# Expected workspace/symbol empty query on repo to return 100..200 symbols, got $sym_count"
+    failed=1
+fi
+
+# ########################################
+# Richer quick-fix code actions
+# ########################################
+
+code_action_path() {
+    printf '{"jsonrpc":"2.0","id":2,"method":"textDocument/codeAction","params":{"textDocument":{"uri":"file://%s"},"range":{"start":{"line":%s,"character":0},"end":{"line":%s,"character":0}},"context":{"diagnostics":[]}}}' \
+        "$1" "$2" "$3"
+}
+
+mkdir -p "$workdir/ca-pkg/src/utils" "$workdir/ca-pkg/src/sub"
+printf '{}\n' > "$workdir/ca-pkg/valk.json"
+cat > "$workdir/ca-pkg/src/utils/util.valk" <<'EOF'
+fn helper() int {
+    return 1
+}
+fn make_thing() int {
+    return 2
+}
+EOF
+cat > "$workdir/ca-pkg/src/sub/pair.valk" <<'EOF'
+struct Pair {
+    a: int
+    b: int
+}
+EOF
+
+# Auto-import: stdlib namespace, stdlib type namespace, workspace namespace, stdlib & workspace symbol
+cat > "$workdir/ca-pkg/src/autoimport.valk" <<'EOF'
+use valk.fs
+
+fn main() {
+    let _ = fs.cwd() !? ""
+    let a = json.encode(1)
+    let b: ?http.Server = null
+    let c = utils.helper()
+    let d: ?Regex = null
+    let e = make_thing()
+}
+EOF
+check "codeAction auto-imports missing stdlib namespace after existing use" \
+    '"title":"Add '\''use valk.json'\''"' \
+    "$(notify_open_path "$workdir/ca-pkg/src/autoimport.valk")" \
+    "$(code_action_path "$workdir/ca-pkg/src/autoimport.valk" 4 4)"
+check "codeAction auto-import inserts at exact line after existing use" \
+    '"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":0}},"newText":"use valk.json\n"' \
+    "$(notify_open_path "$workdir/ca-pkg/src/autoimport.valk")" \
+    "$(code_action_path "$workdir/ca-pkg/src/autoimport.valk" 4 4)"
+check "codeAction auto-imports missing namespace in type position" \
+    '"title":"Add '\''use valk.http'\''"' \
+    "$(notify_open_path "$workdir/ca-pkg/src/autoimport.valk")" \
+    "$(code_action_path "$workdir/ca-pkg/src/autoimport.valk" 5 5)"
+check "codeAction auto-imports missing workspace namespace" \
+    '"title":"Add '\''use utils'\''"' \
+    "$(notify_open_path "$workdir/ca-pkg/src/autoimport.valk")" \
+    "$(code_action_path "$workdir/ca-pkg/src/autoimport.valk" 6 6)"
+check "codeAction auto-imports stdlib symbol and preserves nullable '?'" \
+    '"range":{"start":{"line":7,"character":12},"end":{"line":7,"character":17}},"newText":"regex.Regex"' \
+    "$(notify_open_path "$workdir/ca-pkg/src/autoimport.valk")" \
+    "$(code_action_path "$workdir/ca-pkg/src/autoimport.valk" 7 7)"
+check "codeAction auto-imports workspace symbol and qualifies call" \
+    '"range":{"start":{"line":8,"character":12},"end":{"line":8,"character":22}},"newText":"utils.make_thing"' \
+    "$(notify_open_path "$workdir/ca-pkg/src/autoimport.valk")" \
+    "$(code_action_path "$workdir/ca-pkg/src/autoimport.valk" 8 8)"
+
+# Duplicate import avoidance when namespace is already imported
+cat > "$workdir/ca-pkg/src/already-imported.valk" <<'EOF'
+use valk.regex
+
+fn check_dup() {
+    let r: ?Regex = null
+    let _ = r
+}
+EOF
+check "codeAction qualifies symbol without duplicate use when already imported" \
+    '"title":"Qualify as '\''regex.Regex'\''"' \
+    "$(notify_open_path "$workdir/ca-pkg/src/already-imported.valk")" \
+    "$(code_action_path "$workdir/ca-pkg/src/already-imported.valk" 3 3)"
+check_absent "codeAction does not insert duplicate use valk.regex" \
+    '"newText":"use valk.regex\n"' \
+    "$(notify_open_path "$workdir/ca-pkg/src/already-imported.valk")" \
+    "$(code_action_path "$workdir/ca-pkg/src/already-imported.valk" 3 3)"
+
+# Add `local` to borrow parameter (slice, mut slice, nullable slice, namespace-qualified struct)
+cat > "$workdir/ca-pkg/src/local-param.valk" <<'EOF'
+use sub
+
+fn sum_bytes(data: &[u8], mdata: mut &[u8], opt: ?&[u8], p: &sub.Pair) int {
+    let n = isset(opt) ? opt.length.to(int) : 0
+    return data.length.to(int) + mdata.length.to(int) + p.a + n
+}
+EOF
+check "codeAction inserts 'local ' before &[u8]" \
+    '"range":{"start":{"line":2,"character":19},"end":{"line":2,"character":19}},"newText":"local "' \
+    "$(notify_open_path "$workdir/ca-pkg/src/local-param.valk")" \
+    "$(code_action_path "$workdir/ca-pkg/src/local-param.valk" 2 2)"
+check "codeAction inserts 'local ' before mut &[u8]" \
+    '"range":{"start":{"line":2,"character":33},"end":{"line":2,"character":33}},"newText":"local "' \
+    "$(notify_open_path "$workdir/ca-pkg/src/local-param.valk")" \
+    "$(code_action_path "$workdir/ca-pkg/src/local-param.valk" 2 2)"
+check "codeAction inserts 'local ' after '?' in ?&[u8]" \
+    '"range":{"start":{"line":2,"character":50},"end":{"line":2,"character":50}},"newText":"local "' \
+    "$(notify_open_path "$workdir/ca-pkg/src/local-param.valk")" \
+    "$(code_action_path "$workdir/ca-pkg/src/local-param.valk" 2 2)"
+check "codeAction inserts 'local ' before &sub.Pair preserving qualifier" \
+    '"range":{"start":{"line":2,"character":60},"end":{"line":2,"character":60}},"newText":"local "' \
+    "$(notify_open_path "$workdir/ca-pkg/src/local-param.valk")" \
+    "$(code_action_path "$workdir/ca-pkg/src/local-param.valk" 2 2)"
+
+# Generate missing match arms (enum, named union with payload, default)
+cat > "$workdir/ca-pkg/src/match-fix.valk" <<'EOF'
+enum Color {
+    red
+    green
+    blue
+}
+union Shape {
+    circle(f64)
+    rect(f64, f64)
+    point
+}
+fn test_enum(c: Color) int {
+    return match c : int {
+        .red => 1
+    }
+}
+fn test_union(s: Shape) int {
+    return match s : int {
+        .circle(r) => 1
+    }
+}
+fn test_int(x: int) int {
+    return match x : int {
+        1 => 10
+    }
+}
+EOF
+check "codeAction generates missing enum match arms with indentation" \
+    '"range":{"start":{"line":13,"character":0},"end":{"line":13,"character":0}},"newText":"        .green => panic(\"TODO\")\n        .blue => panic(\"TODO\")\n"' \
+    "$(notify_open_path "$workdir/ca-pkg/src/match-fix.valk")" \
+    "$(code_action_path "$workdir/ca-pkg/src/match-fix.valk" 11 13)"
+check "codeAction generates missing named union arms with payload placeholders" \
+    '"range":{"start":{"line":18,"character":0},"end":{"line":18,"character":0}},"newText":"        .rect(_, _) => panic(\"TODO\")\n        .point => panic(\"TODO\")\n"' \
+    "$(notify_open_path "$workdir/ca-pkg/src/match-fix.valk")" \
+    "$(code_action_path "$workdir/ca-pkg/src/match-fix.valk" 16 18)"
+check "codeAction generates default match arm for open-ended match" \
+    '"range":{"start":{"line":23,"character":0},"end":{"line":23,"character":0}},"newText":"        default => panic(\"TODO\")\n"' \
+    "$(notify_open_path "$workdir/ca-pkg/src/match-fix.valk")" \
+    "$(code_action_path "$workdir/ca-pkg/src/match-fix.valk" 21 23)"
+
+# Typo suggestion and `use json` -> `use valk.json`
+cat > "$workdir/ca-pkg/src/typo-fix.valk" <<'EOF'
+use json
+
+fn typo_fn() {
+    let hello_world = 1
+    println(hello_wrold)
+}
+EOF
+check "codeAction fixes missing valk. prefix in use statement" \
+    '"range":{"start":{"line":0,"character":4},"end":{"line":0,"character":8}},"newText":"valk.json"' \
+    "$(notify_open_path "$workdir/ca-pkg/src/typo-fix.valk")" \
+    "$(code_action_path "$workdir/ca-pkg/src/typo-fix.valk" 0 0)"
+check "codeAction offers typo replacement from Did you mean" \
+    '"range":{"start":{"line":4,"character":12},"end":{"line":4,"character":23}},"newText":"hello_world"' \
+    "$(notify_open_path "$workdir/ca-pkg/src/typo-fix.valk")" \
+    "$(code_action_path "$workdir/ca-pkg/src/typo-fix.valk" 4 4)"
+
+# ########################################
+# Incremental diagnostics correctness
+# ########################################
+
+mkdir -p "$workdir/inc-pkg/src/libns" "$workdir/inc-pkg/src/app"
+printf '{}\n' > "$workdir/inc-pkg/valk.json"
+printf 'fn compute(x: int) int {\n    return x + 1\n}\n' > "$workdir/inc-pkg/src/libns/math.valk"
+printf 'fn sibling_err() {\n    missing_sibling_ident\n}\n' > "$workdir/inc-pkg/src/libns/sib.valk"
+printf 'use libns\nfn run_app() int {\n    return libns.compute(1)\n}\n' > "$workdir/inc-pkg/src/app/app.valk"
+
+# Body-only edit in math.valk keeps sibling_err diagnostics intact AND signature change invalidates app.valk
+count=$((count + 1))
+echo "> incremental diagnostics preserve sibling errors on body edit and invalidate dependents on signature change"
+open_math=$(notify_open_path "$workdir/inc-pkg/src/libns/math.valk")
+open_sib=$(notify_open_path "$workdir/inc-pkg/src/libns/sib.valk")
+open_app=$(notify_open_path "$workdir/inc-pkg/src/app/app.valk")
+body_edit=$(printf '{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file://%s"},"contentChanges":[{"text":"fn compute(x: int) int {\\n    return x + bad_body_xyz\\n}\\n"}]}}' "$workdir/inc-pkg/src/libns/math.valk")
+sig_edit=$(printf '{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file://%s"},"contentChanges":[{"text":"fn compute(x: bool) int {\\n    return 1\\n}\\n"}]}}' "$workdir/inc-pkg/src/libns/math.valk")
+out=$({
+    printf '%s' "$(frame "$init_live")$(frame "$open_math")$(frame "$open_sib")$(frame "$open_app")"
+    sleep 0.4
+    printf '%s' "$(frame "$body_edit")"
+    sleep 0.4
+    printf '%s' "$(frame "$sig_edit")"
+} | $TIMEOUT "$VALK" lsp run 2>&1)
+case "$out" in
+    *'bad_body_xyz'*'missing_sibling_ident'*'Expected '\''bool'\'', got '\''int'\'''*) ;;
+    *)
+        echo "# Incremental diagnostics missed body error, sibling error, or cross-namespace signature error"
+        echo "$out" | head -c 3000
+        failed=1
+        ;;
+esac
+
 # A message with broken headers is skipped; the messages after it are still answered
 for broken in 'X-Junk-Without-Colon\r\n\r\n' 'X-No-Length: 1\r\n\r\n{"x":1}' 'Content-Length: abc\r\n\r\n{"x":1}' '{ "body without headers": 1 }\r\n\r\n'; do
     count=$((count + 1))

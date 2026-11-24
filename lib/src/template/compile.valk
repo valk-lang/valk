@@ -6,8 +6,8 @@ use json
 //   {{ expr }}  {! expr !}  {# comment #}
 //   @if(expr) ... @elif(expr) ... @else ... @end
 //   @each(expr as value[, key[, index]]) ... @empty ... @end
-//   @include("name"[, expr])   @extend("name")   @block("name") ... @end   @yield("name")
-//   @set(name = expr)
+//   @include("name"[, expr])   @extend("name")   @block("name") ... @end
+//   @yield("name"[, default_expr])   @super()   @set(name = expr)
 //
 // A directive that has nothing but spaces around it on its line takes the whole line
 // with it, so control flow does not leave blank lines in the output.
@@ -18,33 +18,47 @@ value TOK_NUMBER (2)
 value TOK_STRING (3)
 value TOK_SIGN (4)     // punctuation and operators
 
+value TEMPLATE_MAX_CONTROL_DEPTH (128)
+value TEMPLATE_MAX_EXPR_DEPTH (128)
+value TEMPLATE_MAX_AST_DEPTH (256)
+
 class Compiler {
     name: ?String (null)
     content: String
     // Scan position inside directives and expressions
     i: uint (0)
     line: uint (1)
+    line_start: uint (0)
     token: String ("")
     token_type: int (TOK_END)
     token_line: uint (1)
+    token_col: uint (1)
+    token_offset: uint (0)
+    // Compile-time structural tracking
+    nesting_depth: uint (0)
+    expr_depth: uint (0)
+    block_depth: uint (0)
+    seen_blocks: Map[uint] (.{})
+    extends_name: ?String (null)
+    extends_line: uint (0)
+    extends_col: uint (0)
+    extends_offset: uint (0)
 
     fn compile() Template !ParseError {
         let template = Template { name: this.name }
         let closers = Array[String]{}
-        template.nodes = this.compile_nodes(closers, 0) !>
-        each template.nodes as node {
-            if node.type == NODE_EXTEND {
-                if isset(template.extends) : this.fail("A template can extend one template", node.line)
-                template.extends = node.name
-                template.extends_line = node.line
-            }
-        }
+        template.nodes = this.compile_nodes(closers, "", 0) !>
+        template.extends = this.extends_name
+        template.extends_line = this.extends_line
+        template.extends_col = this.extends_col
+        template.extends_offset = this.extends_offset
+        analyze_template(template)
         return template
     }
 
     // Reads nodes until the end of the text or one of `closers` (`@end`, `@else`, ...),
     // which is left in `this.token` for the caller
-    fn compile_nodes(closers: Array[String], line: uint) Array[Node] !ParseError {
+    fn compile_nodes(closers: Array[String], opener: String, opener_offset: uint) Array[Node] !ParseError {
         let nodes = Array[Node]{}
         let content = this.content
         let length = content.bytes
@@ -65,12 +79,15 @@ class Compiler {
                 continue
             }
             if ch == '{' && next == '#' {
-                let start_line = this.line
+                let start_offset = this.i
                 let at_line_start = !dirty && this.text_ends_line(text)
-                let close = content.index_of("#}", this.i + 2) ! this.fail("Missing '#}' after '{#'", start_line)
+                let close = content.index_of("#}", this.i + 2) ! this.fail("Unclosed comment: missing '#}' after '{#'", start_offset)
                 let k = this.i
                 while k < close {
-                    if content.get(k) == '\n' : this.line++
+                    if content.get(k) == '\n' {
+                        this.line++
+                        this.line_start = k + 1
+                    }
                     k++
                 }
                 this.i = close + 2
@@ -80,12 +97,14 @@ class Compiler {
             if ch == '{' && (next == '{' || next == '!') {
                 this.flush_text(nodes, text, text_line)
                 let raw = next == '!'
+                let node_offset = this.i
                 let node_line = this.line
+                let node_col = this.col_at(node_offset)
                 this.i += 2
                 this.next_token() !>
                 let expr = this.parse_expr() !>
                 this.expect_sign(raw ? "!}" : "}}", true) !>
-                nodes.append(Node { type: NODE_OUTPUT, line: node_line, expr: expr, raw: raw })
+                nodes.append(Node { type: NODE_OUTPUT, line: node_line, col: node_col, offset: node_offset, expr: expr, raw: raw })
                 text_line = this.line
                 dirty = true
                 continue
@@ -108,17 +127,28 @@ class Compiler {
                                 this.closer_at_line_start = at_line_start
                                 return nodes
                             }
-                            this.fail("Unexpected '" + word + "'", this.line)
+                            if word == "@end" : this.fail("Unexpected '@end' with no matching block opener", this.i)
+                            if word == "@else" || word == "@elif" {
+                                if opener == "@if" : this.fail("Unexpected '" + word + "' after '@else'", this.i)
+                                this.fail("Unexpected '" + word + "' (only valid inside '@if')", this.i)
+                            }
+                            if word == "@empty" {
+                                if opener == "@each" : this.fail("Unexpected '@empty' after '@empty'", this.i)
+                                this.fail("Unexpected '@empty' (only valid inside '@each')", this.i)
+                            }
+                            this.fail("Unexpected '" + word + "'", this.i)
                         }
                         let at_line_start = !dirty && this.text_ends_line(text)
                         this.flush_text(nodes, text, text_line)
+                        let node_offset = this.i
                         let node_line = this.line
+                        let node_col = this.col_at(node_offset)
                         this.i = after
                         // A control directive alone on its line vanishes with the line;
                         // `compile_directive` consumes it right after the arguments, before
                         // the body that may follow
-                        let node = this.compile_directive(word, node_line, at_line_start, nodes) !>
-                        if node.type == NODE_INCLUDE || node.type == NODE_YIELD : dirty = true
+                        let node = this.compile_directive(word, node_line, node_col, node_offset, at_line_start, nodes) !>
+                        if node.type == NODE_INCLUDE || node.type == NODE_YIELD || node.type == NODE_SUPER : dirty = true
                         nodes.append(node)
                         text_line = this.line
                         continue
@@ -127,12 +157,13 @@ class Compiler {
             }
             if ch == '\n' {
                 this.line++
+                this.line_start = this.i + 1
                 dirty = false
             }
             text.write_byte(ch)
             this.i++
         }
-        if closers.length > 0 : this.fail("Missing '@end'", line)
+        if closers.length > 0 : this.fail("Unclosed '" + opener + "': missing '@end'", opener_offset)
         this.flush_text(nodes, text, text_line)
         this.token = ""
         return nodes
@@ -141,95 +172,134 @@ class Compiler {
     // Set by `compile_nodes` when it returns on a closer: the closer started its line
     closer_at_line_start: bool (false)
 
-    fn compile_directive(word: String, node_line: uint, at_line_start: bool, before: Array[Node]) Node !ParseError {
+    fn compile_directive(word: String, node_line: uint, node_col: uint, node_offset: uint, at_line_start: bool, before: Array[Node]) Node !ParseError {
         if word == "@if" {
-            let node = Node { type: NODE_IF, line: node_line }
+            let node = Node { type: NODE_IF, line: node_line, col: node_col, offset: node_offset }
             this.expect_open() !>
             let cond = this.parse_expr() !>
             this.expect_sign(")", true) !>
             if at_line_start : this.consume_line_end_at(before)
+            if this.nesting_depth >= TEMPLATE_MAX_CONTROL_DEPTH : this.fail("Template directives nest too deeply", node_offset)
+            this.nesting_depth++
             while true {
                 let arm = Branch { cond: cond }
-                arm.nodes = this.compile_nodes(Array[String]{ "@end", "@else", "@elif" }, node_line) !>
+                arm.nodes = this.compile_nodes(Array[String]{ "@end", "@else", "@elif" }, "@if", node_offset) !>
                 node.branches.append(arm)
                 let closer = this.token
-                let at_line_start = this.closer_at_line_start
+                let closer_line_start = this.closer_at_line_start
                 if closer == "@elif" {
                     this.expect_open() !>
                     cond = this.parse_expr() !>
                     this.expect_sign(")", true) !>
-                    if at_line_start : this.consume_line_end_at(arm.nodes)
+                    if closer_line_start : this.consume_line_end_at(arm.nodes)
                     continue
                 }
                 if closer == "@else" {
-                    if at_line_start : this.consume_line_end_at(arm.nodes)
+                    if closer_line_start : this.consume_line_end_at(arm.nodes)
                     let rest = Branch {}
-                    rest.nodes = this.compile_nodes(Array[String]{ "@end" }, node_line) !>
+                    rest.nodes = this.compile_nodes(Array[String]{ "@end" }, "@if", node_offset) !>
                     node.branches.append(rest)
                     if this.closer_at_line_start : this.consume_line_end_at(rest.nodes)
+                    this.nesting_depth--
                     return node
                 }
-                if at_line_start : this.consume_line_end_at(arm.nodes)
+                if closer_line_start : this.consume_line_end_at(arm.nodes)
+                this.nesting_depth--
                 return node
             }
         }
         if word == "@each" {
-            let node = Node { type: NODE_EACH, line: node_line }
+            let node = Node { type: NODE_EACH, line: node_line, col: node_col, offset: node_offset }
             this.expect_open() !>
             node.expr = this.parse_expr() !>
-            if this.token != "as" : this.fail("Expected 'as' after the @each value", this.token_line)
+            if this.token_type != TOK_WORD || this.token != "as" : this.fail("Expected 'as' after the @each value", this.token_offset)
             this.next_token() !>
             node.vname = this.read_name() !>
-            if this.accept_sign(",") {
+            if this.accept_sign(",") !> {
                 node.kname = this.read_name() !>
-                if this.accept_sign(",") : node.iname = this.read_name() !>
+                if this.accept_sign(",") !> : node.iname = this.read_name() !>
             }
             this.expect_sign(")", true) !>
             if at_line_start : this.consume_line_end_at(before)
-            node.body = this.compile_nodes(Array[String]{ "@end", "@empty" }, node_line) !>
+            if this.nesting_depth >= TEMPLATE_MAX_CONTROL_DEPTH : this.fail("Template directives nest too deeply", node_offset)
+            this.nesting_depth++
+            node.body = this.compile_nodes(Array[String]{ "@end", "@empty" }, "@each", node_offset) !>
             if this.closer_at_line_start : this.consume_line_end_at(node.body)
             if this.token == "@empty" {
-                let empty = this.compile_nodes(Array[String]{ "@end" }, node_line) !>
+                let empty = this.compile_nodes(Array[String]{ "@end" }, "@each", node_offset) !>
                 if this.closer_at_line_start : this.consume_line_end_at(empty)
                 node.empty_body = empty
             }
+            this.nesting_depth--
             return node
         }
         if word == "@include" {
-            let node = Node { type: NODE_INCLUDE, line: node_line }
+            let node = Node { type: NODE_INCLUDE, line: node_line, col: node_col, offset: node_offset }
             this.expect_open() !>
+            let name_offset = this.token_offset
             node.name = this.read_string_token() !>
-            if this.accept_sign(",") : node.expr = this.parse_expr() !>
+            if node.name.bytes == 0 : this.fail("Template name cannot be empty", name_offset)
+            if this.accept_sign(",") !> : node.expr = this.parse_expr() !>
             this.expect_sign(")", true) !>
             return node
         }
         if word == "@extend" {
-            let node = Node { type: NODE_EXTEND, line: node_line }
+            if this.nesting_depth > 0 : this.fail("@extend cannot be placed inside a block or control directive", node_offset)
+            if isset(this.extends_name) : this.fail("A template can only have one @extend directive", node_offset)
+            let node = Node { type: NODE_EXTEND, line: node_line, col: node_col, offset: node_offset }
             this.expect_open() !>
+            let name_offset = this.token_offset
             node.name = this.read_string_token() !>
+            if node.name.bytes == 0 : this.fail("Template name cannot be empty", name_offset)
             this.expect_sign(")", true) !>
             if at_line_start : this.consume_line_end_at(before)
+            this.extends_name = node.name
+            this.extends_line = node_line
+            this.extends_col = node_col
+            this.extends_offset = node_offset
             return node
         }
         if word == "@yield" {
-            let node = Node { type: NODE_YIELD, line: node_line }
+            let node = Node { type: NODE_YIELD, line: node_line, col: node_col, offset: node_offset }
             this.expect_open() !>
+            let name_offset = this.token_offset
             node.name = this.read_string_token() !>
+            if node.name.bytes == 0 : this.fail("Block name cannot be empty", name_offset)
+            if this.accept_sign(",") !> : node.expr = this.parse_expr() !>
             this.expect_sign(")", true) !>
             return node
         }
         if word == "@block" {
-            let node = Node { type: NODE_BLOCK, line: node_line }
+            let node = Node { type: NODE_BLOCK, line: node_line, col: node_col, offset: node_offset }
             this.expect_open() !>
+            let name_offset = this.token_offset
             node.name = this.read_string_token() !>
+            if node.name.bytes == 0 : this.fail("Block name cannot be empty", name_offset)
+            if this.seen_blocks.has(node.name) {
+                let first = this.seen_blocks.get(node.name) !? 0
+                this.fail("Duplicate block '" + node.name + "' (already defined at line " + first + ")", node_offset)
+            }
+            this.seen_blocks.set(node.name, node_line)
             this.expect_sign(")", true) !>
             if at_line_start : this.consume_line_end_at(before)
-            node.body = this.compile_nodes(Array[String]{ "@end" }, node_line) !>
+            if this.nesting_depth >= TEMPLATE_MAX_CONTROL_DEPTH : this.fail("Template directives nest too deeply", node_offset)
+            this.nesting_depth++
+            this.block_depth++
+            node.body = this.compile_nodes(Array[String]{ "@end" }, "@block", node_offset) !>
+            this.block_depth--
+            this.nesting_depth--
             if this.closer_at_line_start : this.consume_line_end_at(node.body)
             return node
         }
+        if word == "@super" {
+            if this.block_depth == 0 : this.fail("@super() can only be used inside a @block", node_offset)
+            let node = Node { type: NODE_SUPER, line: node_line, col: node_col, offset: node_offset }
+            this.expect_open() !>
+            this.expect_sign(")", true) !>
+            return node
+        }
         if word == "@set" {
-            let node = Node { type: NODE_SET, line: node_line }
+            let node = Node { type: NODE_SET, line: node_line, col: node_col, offset: node_offset }
             this.expect_open() !>
             node.name = this.read_name() !>
             this.expect_sign("=") !>
@@ -238,7 +308,7 @@ class Compiler {
             if at_line_start : this.consume_line_end_at(before)
             return node
         }
-        this.fail("Unknown directive '" + word + "'", node_line)
+        this.fail("Unknown directive '" + word + "'", node_offset)
     }
 
     // ---- Whitespace ----------------------------------------------------------------
@@ -273,6 +343,7 @@ class Compiler {
         if j < length {
             this.line++
             j++
+            this.line_start = j
         }
         this.i = j
     }
@@ -307,14 +378,38 @@ class Compiler {
     // Grammar, lowest precedence first: or, and, comparison, `+ -`, `* / %`, not and
     // negation, filter, postfix, primary
 
+    fn check_ast_depth(depth: uint, offset: uint) uint !ParseError {
+        if depth > TEMPLATE_MAX_AST_DEPTH : this.fail("Expression is nested too deeply", offset)
+        return depth
+    }
+
     fn parse_expr() Expr !ParseError {
-        let left = this.parse_and() !>
+        if this.expr_depth >= TEMPLATE_MAX_EXPR_DEPTH : this.fail("Expression is nested too deeply", this.token_offset)
+        this.expr_depth++
+        let left = this.parse_and() ! {
+            this.expr_depth--
+            throw E
+        }
         while this.token_type == TOK_SIGN && this.token == "||" {
             let line = this.token_line
-            this.next_token() !>
-            let right = this.parse_and() !>
-            left = Expr { type: EXPR_OR, line: line, left: left, right: right }
+            let col = this.token_col
+            let offset = this.token_offset
+            this.next_token() ! {
+                this.expr_depth--
+                throw E
+            }
+            let right = this.parse_and() ! {
+                this.expr_depth--
+                throw E
+            }
+            let d = (left.depth > right.depth ? left.depth : right.depth) + 1
+            let depth = this.check_ast_depth(d, offset) ! {
+                this.expr_depth--
+                throw E
+            }
+            left = Expr { type: EXPR_OR, line: line, col: col, offset: offset, left: left, right: right, depth: depth }
         }
+        this.expr_depth--
         return left
     }
 
@@ -322,9 +417,13 @@ class Compiler {
         let left = this.parse_compare() !>
         while this.token_type == TOK_SIGN && this.token == "&&" {
             let line = this.token_line
+            let col = this.token_col
+            let offset = this.token_offset
             this.next_token() !>
             let right = this.parse_compare() !>
-            left = Expr { type: EXPR_AND, line: line, left: left, right: right }
+            let d = (left.depth > right.depth ? left.depth : right.depth) + 1
+            let depth = this.check_ast_depth(d, offset) !>
+            left = Expr { type: EXPR_AND, line: line, col: col, offset: offset, left: left, right: right, depth: depth }
         }
         return left
     }
@@ -334,9 +433,13 @@ class Compiler {
         while this.token_type == TOK_SIGN && (this.token == "==" || this.token == "!=" || this.token == "<" || this.token == "<=" || this.token == ">" || this.token == ">=") {
             let op = this.token
             let line = this.token_line
+            let col = this.token_col
+            let offset = this.token_offset
             this.next_token() !>
             let right = this.parse_sum() !>
-            left = Expr { type: EXPR_COMPARE, line: line, left: left, right: right, op: op }
+            let d = (left.depth > right.depth ? left.depth : right.depth) + 1
+            let depth = this.check_ast_depth(d, offset) !>
+            left = Expr { type: EXPR_COMPARE, line: line, col: col, offset: offset, left: left, right: right, op: op, depth: depth }
         }
         return left
     }
@@ -346,9 +449,13 @@ class Compiler {
         while this.token_type == TOK_SIGN && (this.token == "+" || this.token == "-") {
             let op = this.token
             let line = this.token_line
+            let col = this.token_col
+            let offset = this.token_offset
             this.next_token() !>
             let right = this.parse_product() !>
-            left = Expr { type: EXPR_ARITH, line: line, left: left, right: right, op: op }
+            let d = (left.depth > right.depth ? left.depth : right.depth) + 1
+            let depth = this.check_ast_depth(d, offset) !>
+            left = Expr { type: EXPR_ARITH, line: line, col: col, offset: offset, left: left, right: right, op: op, depth: depth }
         }
         return left
     }
@@ -358,20 +465,36 @@ class Compiler {
         while this.token_type == TOK_SIGN && (this.token == "*" || this.token == "/" || this.token == "%") {
             let op = this.token
             let line = this.token_line
+            let col = this.token_col
+            let offset = this.token_offset
             this.next_token() !>
             let right = this.parse_not() !>
-            left = Expr { type: EXPR_ARITH, line: line, left: left, right: right, op: op }
+            let d = (left.depth > right.depth ? left.depth : right.depth) + 1
+            let depth = this.check_ast_depth(d, offset) !>
+            left = Expr { type: EXPR_ARITH, line: line, col: col, offset: offset, left: left, right: right, op: op, depth: depth }
         }
         return left
     }
 
     fn parse_not() Expr !ParseError {
         if this.token_type == TOK_SIGN && (this.token == "!" || this.token == "-") {
+            if this.expr_depth >= TEMPLATE_MAX_EXPR_DEPTH : this.fail("Expression is nested too deeply", this.token_offset)
             let negate = this.token == "-"
             let line = this.token_line
-            this.next_token() !>
-            let inner = this.parse_not() !>
-            return Expr { type: negate ? EXPR_NEGATE : EXPR_NOT, line: line, left: inner }
+            let col = this.token_col
+            let offset = this.token_offset
+            this.expr_depth++
+            this.next_token() ! {
+                this.expr_depth--
+                throw E
+            }
+            let inner = this.parse_not() ! {
+                this.expr_depth--
+                throw E
+            }
+            this.expr_depth--
+            let depth = this.check_ast_depth(inner.depth + 1, offset) !>
+            return Expr { type: negate ? EXPR_NEGATE : EXPR_NOT, line: line, col: col, offset: offset, left: inner, depth: depth }
         }
         return this.parse_filter() !>
     }
@@ -379,20 +502,26 @@ class Compiler {
     fn parse_filter() Expr !ParseError {
         let expr = this.parse_postfix() !>
         while this.token_type == TOK_SIGN && this.token == "|" {
-            let line = this.token_line
             this.next_token() !>
-            let filter = Expr { type: EXPR_FILTER, line: line, left: expr }
+            let line = this.token_line
+            let col = this.token_col
+            let offset = this.token_offset
+            let max_d = expr.depth
+            let filter = Expr { type: EXPR_FILTER, line: line, col: col, offset: offset, left: expr }
             filter.name = this.read_name() !>
-            if this.accept_sign("(") {
-                if !this.accept_sign(")") {
+            if this.accept_sign("(") !> {
+                if !(this.accept_sign(")") !>) {
                     while true {
-                        filter.args.append(this.parse_expr() !>)
-                        if this.accept_sign(",") : continue
+                        let arg = this.parse_expr() !>
+                        if arg.depth > max_d : max_d = arg.depth
+                        filter.args.append(arg)
+                        if this.accept_sign(",") !> : continue
                         this.expect_sign(")") !>
                         break
                     }
                 }
             }
+            filter.depth = this.check_ast_depth(max_d + 1, offset) !>
             expr = filter
         }
         return expr
@@ -402,18 +531,25 @@ class Compiler {
         let expr = this.parse_primary() !>
         while true {
             if this.token_type == TOK_SIGN && this.token == "." {
-                let line = this.token_line
                 this.next_token() !>
+                let line = this.token_line
+                let col = this.token_col
+                let offset = this.token_offset
                 let name = this.read_name() !>
-                expr = Expr { type: EXPR_MEMBER, line: line, left: expr, name: name }
+                let depth = this.check_ast_depth(expr.depth + 1, offset) !>
+                expr = Expr { type: EXPR_MEMBER, line: line, col: col, offset: offset, left: expr, name: name, depth: depth }
                 continue
             }
             if this.token_type == TOK_SIGN && this.token == "[" {
                 let line = this.token_line
+                let col = this.token_col
+                let offset = this.token_offset
                 this.next_token() !>
                 let index = this.parse_expr() !>
                 this.expect_sign("]") !>
-                expr = Expr { type: EXPR_INDEX, line: line, left: expr, right: index }
+                let d = (expr.depth > index.depth ? expr.depth : index.depth) + 1
+                let depth = this.check_ast_depth(d, offset) !>
+                expr = Expr { type: EXPR_INDEX, line: line, col: col, offset: offset, left: expr, right: index, depth: depth }
                 continue
             }
             break
@@ -423,18 +559,20 @@ class Compiler {
 
     fn parse_primary() Expr !ParseError {
         let line = this.token_line
+        let col = this.token_col
+        let offset = this.token_offset
         if this.token_type == TOK_STRING {
             let value = this.token
             this.next_token() !>
-            return Expr { type: EXPR_LITERAL, line: line, value: json.from(value) }
+            return Expr { type: EXPR_LITERAL, line: line, col: col, offset: offset, value: json.from(value) }
         }
         if this.token_type == TOK_NUMBER {
             let text = this.token
             this.next_token() !>
             // A whole number beyond `int` is read as a float
             let whole: ?int = text.contains(".") ? null : (text.to_int() !? null)
-            if isset(whole) : return Expr { type: EXPR_LITERAL, line: line, value: json.from(whole) }
-            return Expr { type: EXPR_LITERAL, line: line, value: json.from(text.to_float() !? 0.0) }
+            if isset(whole) : return Expr { type: EXPR_LITERAL, line: line, col: col, offset: offset, value: json.from(whole) }
+            return Expr { type: EXPR_LITERAL, line: line, col: col, offset: offset, value: json.from(text.to_float() !? 0.0) }
         }
         if this.token_type == TOK_SIGN && this.token == "(" {
             this.next_token() !>
@@ -446,25 +584,26 @@ class Compiler {
             let word = this.token
             if word == "true" || word == "false" {
                 this.next_token() !>
-                return Expr { type: EXPR_LITERAL, line: line, value: json.from(word == "true") }
+                return Expr { type: EXPR_LITERAL, line: line, col: col, offset: offset, value: json.from(word == "true") }
             }
             if word == "null" {
                 this.next_token() !>
-                return Expr { type: EXPR_LITERAL, line: line, value: null }
+                return Expr { type: EXPR_LITERAL, line: line, col: col, offset: offset, value: null }
             }
             if word == "@isset" || word == "@len" || word == "@length" {
                 this.next_token() !>
                 this.expect_sign("(") !>
                 let inner = this.parse_expr() !>
                 this.expect_sign(")") !>
-                return Expr { type: word == "@isset" ? EXPR_ISSET : EXPR_LEN, line: line, left: inner }
+                let depth = this.check_ast_depth(inner.depth + 1, offset) !>
+                return Expr { type: word == "@isset" ? EXPR_ISSET : EXPR_LEN, line: line, col: col, offset: offset, left: inner, depth: depth }
             }
-            if word.get(0) == '@' : this.fail("Unknown function '" + word + "'", line)
+            if word.get(0) == '@' : this.fail("Unknown function '" + word + "'", offset)
             this.next_token() !>
-            return Expr { type: EXPR_VAR, line: line, name: word }
+            return Expr { type: EXPR_VAR, line: line, col: col, offset: offset, name: word }
         }
-        if this.token_type == TOK_END : this.fail("Unexpected end of the template inside an expression", line)
-        this.fail("Unexpected '" + this.token + "'", line)
+        if this.token_type == TOK_END : this.fail("Unexpected end of the template inside an expression", offset)
+        this.fail("Unexpected '" + this.token + "'", offset)
     }
 
     // ---- Tokens ----------------------------------------------------------------------
@@ -475,14 +614,19 @@ class Compiler {
         let i = this.i
         while i < length {
             let ch = content.get(i)
-            if ch == '\n' : this.line++
+            if ch == '\n' {
+                this.line++
+                this.line_start = i + 1
+            }
             if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
                 i++
                 continue
             }
             break
         }
+        this.token_offset = i
         this.token_line = this.line
+        this.token_col = this.col_at(i)
         if i >= length {
             this.i = i
             this.token = ""
@@ -515,21 +659,26 @@ class Compiler {
             this.i = j
             return
         }
-        if ch == '"' {
+        if ch == '"' || ch == '\'' {
+            let quote = ch
             let j = i + 1
             let text = ByteBuffer.new(32)
             while true {
-                if j >= length : this.fail("Missing closing '\"'", this.token_line)
+                if j >= length : this.fail(quote == '"' ? "Unclosed string literal: missing closing '\"'" : "Unclosed string literal: missing closing '''", this.token_offset)
                 let c = content.get(j)
-                if c == '"' : break
+                if c == quote : break
                 if c == '\\' && j + 1 < length {
                     j++
                     let e = content.get(j)
                     if e == 'n' : text.write_byte('\n')
                     else if e == 't' : text.write_byte('\t')
+                    else if e == 'r' : text.write_byte('\r')
                     else : text.write_byte(e)
                 } else {
-                    if c == '\n' : this.line++
+                    if c == '\n' {
+                        this.line++
+                        this.line_start = j + 1
+                    }
                     text.write_byte(c)
                 }
                 j++
@@ -568,38 +717,96 @@ class Compiler {
     fn expect_sign(sign: String, stop: bool (false)) !ParseError {
         if this.token_type != TOK_SIGN || this.token != sign {
             let found = this.token_type == TOK_END ? "the end of the template" : "'" + this.token + "'"
-            this.fail("Expected '" + sign + "' instead of " + found, this.token_line)
+            this.fail("Expected '" + sign + "' instead of " + found, this.token_offset)
         }
         if stop : return
         this.next_token() !>
     }
 
-    fn accept_sign(sign: String) bool {
+    fn accept_sign(sign: String) bool !ParseError {
         if this.token_type != TOK_SIGN || this.token != sign : return false
-        this.next_token() ! return false
+        this.next_token() !>
         return true
     }
 
     fn read_name() String !ParseError {
-        if this.token_type != TOK_WORD || this.token.get(0) == '@' : this.fail("Expected a name instead of '" + this.token + "'", this.token_line)
+        if this.token_type != TOK_WORD || this.token.get(0) == '@' {
+            let found = this.token_type == TOK_END ? "the end of the template" : "'" + this.token + "'"
+            this.fail("Expected a name instead of " + found, this.token_offset)
+        }
         let name = this.token
         this.next_token() !>
         return name
     }
 
     fn read_string_token() String !ParseError {
-        if this.token_type != TOK_STRING : this.fail("Expected a quoted name instead of '" + this.token + "'", this.token_line)
+        if this.token_type != TOK_STRING {
+            let found = this.token_type == TOK_END ? "the end of the template" : "'" + this.token + "'"
+            this.fail("Expected a quoted name instead of " + found, this.token_offset)
+        }
         let text = this.token
         this.next_token() !>
         return text
     }
 
-    fn fail(msg: String, line: uint) !ParseError $throw {
-        throw .parse(
-            this.name ?? "?",
-            "[ Error at line " + line + " in " + (this.name ?? "{content}") + " | Error: " + msg + " ]",
-            this.i,
-            line
-        )
+    // 1-based Unicode character column for `pos` on the current line
+    fn col_at(pos: uint) uint {
+        let content = this.content
+        let limit = pos <= content.bytes ? pos : content.bytes
+        let k = this.line_start
+        let col: uint = 1
+        while k < limit {
+            if (content.get(k) & 0xC0) != 0x80 : col++
+            k++
+        }
+        return col
+    }
+
+    // Computes exact 1-based `(line, col)` and builds a helpful caret snippet from `offset`
+    fn fail(msg: String, offset: uint) !ParseError $throw {
+        let content = this.content
+        let len = content.bytes
+        let target = offset <= len ? offset : len
+        let ln: uint = 1
+        let ls: uint = 0
+        let k: uint = 0
+        while k < target {
+            if content.get(k) == '\n' {
+                ln++
+                ls = k + 1
+            }
+            k++
+        }
+        let col: uint = 1
+        let ck = ls
+        while ck < target {
+            if (content.get(ck) & 0xC0) != 0x80 : col++
+            ck++
+        }
+        let le = ls
+        while le < len && content.get(le) != '\n' : le++
+        if le > ls && content.get(le - 1) == '\r' : le--
+
+        let header = "[ Error at line " + ln + ", column " + col + " in " + (this.name ?? "{content}") + " | Error: " + msg + " ]"
+        if le > ls && (le - ls) <= 200 {
+            let prefix = "  " + ln + " | "
+            let snippet = ByteBuffer.new(header.bytes + (le - ls) * 2 + 32)
+            snippet.write(header)
+            snippet.write("\n")
+            snippet.write(prefix)
+            snippet.write(content.range(ls, le - ls))
+            snippet.write("\n")
+            each 0 .. prefix.bytes as _ : snippet.write_byte(' ')
+            let p = ls
+            while p < target && p < le {
+                let ch = content.get(p)
+                if ch == '\t' : snippet.write_byte('\t')
+                else if (ch & 0xC0) != 0x80 : snippet.write_byte(' ')
+                p++
+            }
+            snippet.write_byte('^')
+            header = snippet.into_string()
+        }
+        throw .parse(this.name ?? "?", header, target, ln)
     }
 }

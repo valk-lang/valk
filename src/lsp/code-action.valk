@@ -1,11 +1,49 @@
 
+use build
+use helper
 use valk.json
+use valk.fs
+
+class AutoImportEntry {
+    import_path: String
+    ns_name: String
+    is_type: bool
+    is_global: bool
+}
+
+class FileUseInfo {
+    // import_path (e.g. "valk.http") -> local alias (e.g. "http")
+    imported_paths: Map[String] (.{})
+    // local alias (e.g. "http") -> import_path (e.g. "valk.http")
+    imported_aliases: Map[String] (.{})
+    insert_line: u32 (1)
+    trailing_blank: bool (false)
+}
 
 extend Lsp {
-    // Quickfixes for the diagnostics of the last pass that carry a suggested
-    // edit and touch the requested range. No build is needed: the fixes were
-    // collected when the diagnostics were published.
+    // Quickfixes for diagnostics touching the requested range. Flushes any pending
+    // diagnostics first so a request right after didOpen/didChange sees fresh results.
     fn code_action() {
+        if isset(this.pending_diagnostics) {
+            let saved_data = this.data
+            let saved_id = this.id
+            let saved_is_req = this.is_request
+            let saved_req = this.request
+            let saved_resp = this.responded
+            let saved_file = this.file
+            let saved_line = this.line
+            let saved_col = this.col
+            this.flush_pending()
+            this.data = saved_data
+            this.id = saved_id
+            this.is_request = saved_is_req
+            this.request = saved_req
+            this.responded = saved_resp
+            this.file = saved_file
+            this.line = saved_line
+            this.col = saved_col
+        }
+
         let uri = this.request_file() ?! {
             this.success(json.new_array())
             return
@@ -15,23 +53,836 @@ extend Lsp {
         let until_line = range.get("end").get("line").int.to(u32) + 1
 
         let actions = json.new_array()
+        let seen = Map[bool]{}
         each this.diagnostic_groups as group {
             let diagnostics = group.per_path.get(uri) ! continue
             each diagnostics as d {
                 if d.fixes.length == 0 : continue
                 if d.line > until_line || d.end_line < from_line : continue
-                each d.fixes as fix : actions.append(lsp_code_action(d, fix))
+                each d.fixes as fix {
+                    let key = fix.title + "@" + fix.path + ":" + fix.line + ":" + fix.col + ":" + fix.replacement
+                    if seen.has(key) : continue
+                    seen.set(key, true)
+                    actions.append(lsp_code_action(d, fix))
+                }
             }
         }
         this.success(actions)
     }
+
+    // Enrich a diagnostic with LSP-level quick fixes (local borrow refinement, auto-import,
+    // missing match arms, typo suggestions).
+    fn attach_extra_fixes(b: build.Build, m: build.Message, src: build.Source, offset: u32, d: Diagnostic) {
+        let path = src.path ?! return
+        let msg = m.msg
+
+        // Refine compiler's param-could-be-local fix to insert `local ` before `&` / `mut &`
+        // so namespace qualifiers and aliases in the parameter type are preserved.
+        if m.code == "param-could-be-local" {
+            ca_refine_local_fix(src, offset, m.len, d)
+            return
+        }
+
+        // `use json` -> `use valk.json`
+        let use_hint = ". Did you mean 'use valk."
+        let uh_idx = msg.index_of(use_hint) !? u32.$max.to(uint)
+        if uh_idx != u32.$max.to(uint) && msg.ends_with("'?") {
+            let start = uh_idx + use_hint.bytes
+            let ns_name = msg.range(start, msg.bytes - start - 2)
+            if !ns_name.is_empty() {
+                let span_text = offset.to(uint) + m.len.to(uint) <= src.content.bytes
+                    ? src.content.range(offset.to(uint), m.len.to(uint))
+                    : ""
+                let replacement = span_text.starts_with("use ") ? "use valk." + ns_name : "valk." + ns_name
+                d.fixes.append(DiagnosticFix {
+                    title: "Replace with 'use valk." + ns_name + "'"
+                    path: path
+                    line: d.line
+                    col: d.col
+                    end_line: d.end_line
+                    end_col: d.end_col
+                    replacement: replacement
+                })
+            }
+            return
+        }
+
+        // Typo suggestion: "Unknown identifier: foo. Did you mean 'bar'?"
+        let did_mean = ". Did you mean '"
+        let dm_idx = msg.index_of(did_mean) !? u32.$max.to(uint)
+        if dm_idx != u32.$max.to(uint) && msg.ends_with("'?") {
+            let start = dm_idx + did_mean.bytes
+            let suggestion = msg.range(start, msg.bytes - start - 2)
+            if !suggestion.is_empty() {
+                d.fixes.append(DiagnosticFix {
+                    title: "Replace with '" + suggestion + "'"
+                    path: path
+                    line: d.line
+                    col: d.col
+                    end_line: d.end_line
+                    end_col: d.end_col
+                    replacement: suggestion
+                })
+            }
+        }
+
+        // Auto-import missing namespace / identifier / type
+        if msg.starts_with("Unknown namespace: ") {
+            let name = ca_first_ident(msg.range(19, msg.bytes - 19))
+            if !name.is_empty() {
+                this.add_auto_import_fixes(b, src, path, offset, m.len, name, true, false, d)
+            }
+            return
+        }
+        if msg.starts_with("Unknown identifier: ") {
+            let rest = msg.range(20, msg.bytes - 20)
+            let name = ca_extract_unqualified_name(rest)
+            if !name.is_empty() {
+                this.add_auto_import_fixes(b, src, path, offset, m.len, name, false, false, d)
+            }
+            return
+        }
+        if msg.starts_with("Unknown type: ") {
+            let rest = msg.range(14, msg.bytes - 14)
+            let name = ca_extract_unqualified_name(rest)
+            if !name.is_empty() {
+                this.add_auto_import_fixes(b, src, path, offset, m.len, name, false, true, d)
+            }
+            return
+        }
+
+        // Non-exhaustive match: generate missing arms or `default` arm
+        let match_prefix = "The match does not cover: "
+        let match_suffix = ". Add cases for them or a 'default' case"
+        if msg.starts_with(match_prefix) && msg.ends_with(match_suffix) {
+            let items_str = msg.range(match_prefix.bytes, msg.bytes - match_prefix.bytes - match_suffix.bytes)
+            ca_add_match_arm_fixes(b, src, path, offset, m.len, items_str, d)
+            return
+        }
+        if msg == "The match statement must have a 'default' case because it does not cover all values" {
+            ca_add_default_match_fix(src, path, offset, m.len, true, d)
+            return
+        }
+    }
+
+    fn add_auto_import_fixes(
+        b: build.Build,
+        src: build.Source,
+        path: String,
+        offset: u32,
+        len: u32,
+        name: String,
+        ns_only: bool,
+        types_only: bool,
+        d: Diagnostic
+    ) {
+        let uses = ca_parse_file_uses(src.content)
+        let main_pkg = b.main_pkg
+        let cur_ns_name = ""
+        let src_ns = src.ns
+        if isset(src_ns) : cur_ns_name = src_ns.name
+
+        let offered_imports = Map[bool]{}
+        let added_count: uint = 0
+
+        // 1. Check if `name` is a namespace (workspace local, stdlib `valk.<name>`, or dependency)
+        if !types_only && !uses.imported_aliases.has(name) {
+            if isset(main_pkg) && name != cur_ns_name {
+                if !main_pkg.pkg_exists(name) && ca_pkg_has_namespace(main_pkg, name) {
+                    ca_append_use_fix(d, path, uses, name, true)
+                    offered_imports.set(name, true)
+                    added_count++
+                }
+            }
+            let std_ns_dir = helper.add(helper.add(helper.valk_lib_dir(), "src"), name)
+            if name != "core" && fs.is_dir(std_ns_dir) {
+                let imp = "valk." + name
+                if !uses.imported_paths.has(imp) {
+                    ca_append_use_fix(d, path, uses, imp, added_count == 0)
+                    offered_imports.set(imp, true)
+                    added_count++
+                }
+            }
+            if isset(main_pkg) {
+                let config = main_pkg.config
+                if isset(config) {
+                    each config.json.get("dependencies") as _, dep_key {
+                        let dep_name = dep_key.string
+                        let dep_dir = main_pkg.sub_pkg_dir(dep_name) ! continue
+                        let dep_src = helper.add(dep_dir, "src")
+                        if fs.is_dir(helper.add(dep_src, name)) || fs.exists(helper.add(dep_src, name + ".valk")) {
+                            let imp = dep_name + "." + name
+                            if !uses.imported_paths.has(imp) && !offered_imports.has(imp) {
+                                ca_append_use_fix(d, path, uses, imp, added_count == 0)
+                                offered_imports.set(imp, true)
+                                added_count++
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if ns_only : return
+
+        // 2. Check if `name` is a symbol declared in another workspace namespace or stdlib namespace
+        let candidates = Array[AutoImportEntry]{}
+        if isset(main_pkg) {
+            this.find_workspace_symbol_imports(main_pkg, cur_ns_name, name, types_only, candidates)
+        }
+        let std_map = this.get_stdlib_symbols()
+        std_map.get(name) -> entries {
+            each entries as entry {
+                if types_only && !entry.is_type : continue
+                candidates.append(entry)
+            }
+        }
+
+        // Locate the exact identifier span inside [offset, offset + len] (e.g. `?Regex` -> `Regex`)
+        let q_line = d.line
+        let q_col = d.col
+        let q_end_line = d.end_line
+        let q_end_col = d.end_col
+        let word_at = build.lsp_find_word_range(src.content, name, offset, offset + len, true)
+        if word_at != u32.$max {
+            let ws = lsp_line_col_in(src, word_at)
+            let we = lsp_line_col_in(src, word_at + name.bytes.to(u32))
+            q_line = ws.line
+            q_col = ws.col
+            q_end_line = we.line
+            q_end_col = we.col
+        }
+
+        let sym_added: uint = 0
+        each candidates as entry {
+            if sym_added >= 5 : break
+            if offered_imports.has(entry.import_path) : continue
+            offered_imports.set(entry.import_path, true)
+
+            let existing_alias = uses.imported_paths.get(entry.import_path) !? null
+            if entry.is_global {
+                if !isset(existing_alias) {
+                    ca_append_use_fix(d, path, uses, entry.import_path, added_count == 0 && sym_added == 0)
+                    sym_added++
+                }
+                continue
+            }
+            if isset(existing_alias) {
+                let qualified = existing_alias + "." + name
+                d.fixes.append(DiagnosticFix {
+                    title: "Qualify as '" + qualified + "'"
+                    path: path
+                    line: q_line
+                    col: q_col
+                    end_line: q_end_line
+                    end_col: q_end_col
+                    replacement: qualified
+                    preferred: added_count == 0 && sym_added == 0
+                })
+                sym_added++
+                continue
+            }
+
+            let qualified = entry.ns_name + "." + name
+            let use_text = "use " + entry.import_path + "\n" + (uses.trailing_blank ? "\n" : "")
+            let qualify_edit = DiagnosticFix {
+                title: ""
+                path: path
+                line: q_line
+                col: q_col
+                end_line: q_end_line
+                end_col: q_end_col
+                replacement: qualified
+            }
+            let fix = DiagnosticFix {
+                title: "Import '" + entry.import_path + "' (" + qualified + ")"
+                path: path
+                line: uses.insert_line
+                col: 1
+                end_line: uses.insert_line
+                end_col: 1
+                replacement: use_text
+                preferred: added_count == 0 && sym_added == 0
+            }
+            fix.extra_edits.append(qualify_edit)
+            d.fixes.append(fix)
+            sym_added++
+        }
+    }
+
+    fn find_workspace_symbol_imports(
+        pkg: build.Pkg,
+        cur_ns_name: String,
+        target: String,
+        types_only: bool,
+        out: Array[AutoImportEntry]
+    ) {
+        let srcdir = pkg.srcdir ?! return
+        if !fs.is_dir(srcdir) : return
+        let pkg_dir = pkg.dir
+        let vendor = isset(pkg_dir) ? helper.resolve(helper.add(pkg_dir, "vendor")) : ""
+
+        let ns_names = Array[String]{}
+        if cur_ns_name != "main" : ns_names.append("main")
+        let dirs = fs.files_in(srcdir, false, false, true, true) !? Array[String]{}
+        each dirs as dir {
+            if dir == cur_ns_name : continue
+            let full = helper.resolve(helper.add(srcdir, dir))
+            if vendor != "" && full.starts_with(vendor) : continue
+            ns_names.append(dir)
+        }
+
+        each ns_names as ns_name {
+            let ndir = ns_name == "main" ? srcdir : helper.add(srcdir, ns_name)
+            let files = fs.files_in(ndir, false, true, false, false) !? Array[String]{}
+            let found = false
+            each files as fpath {
+                if !fpath.ends_with(".valk") : continue
+                let content = this.file_content.get(fpath) !? (fs.read(fpath) !? "")
+                if !content.contains(target) : continue
+                let hit = ca_scan_file_for_decl(content, target, false, types_only)
+                if isset(hit) {
+                    out.append(AutoImportEntry {
+                        import_path: ns_name
+                        ns_name: ns_name
+                        is_type: hit.is_type
+                        is_global: hit.is_global
+                    })
+                    found = true
+                    break
+                }
+            }
+            if found : continue
+        }
+    }
+
+    fn get_stdlib_symbols() Map[Array[AutoImportEntry]] {
+        let cached = this.stdlib_symbols
+        if isset(cached) : return cached
+
+        let map = Map[Array[AutoImportEntry]]{}
+        let std_src = helper.add(helper.valk_lib_dir(), "src")
+        let dirs = fs.files_in(std_src, false, false, true, true) !? Array[String]{}
+        each dirs as ns_name {
+            if ns_name == "core" : continue
+            let ndir = helper.add(std_src, ns_name)
+            let files = fs.files_in(ndir, false, true, false, false) !? Array[String]{}
+            let seen_in_ns = Map[bool]{}
+            each files as fpath {
+                if !fpath.ends_with(".valk") : continue
+                let content = fs.read(fpath) !? ""
+                ca_index_public_decls(content, "valk." + ns_name, ns_name, seen_in_ns, map)
+            }
+        }
+        this.stdlib_symbols = map
+        return map
+    }
+}
+
+class DeclScanHit {
+    is_type: bool
+    is_global: bool
+}
+
+fn ca_pkg_has_namespace(pkg: build.Pkg, name: String) bool {
+    if name == "main" {
+        let srcdir = pkg.srcdir ?! return false
+        let files = fs.files_in(srcdir, false, true, false, false) !? Array[String]{}
+        each files as f {
+            if f.ends_with(".valk") : return true
+        }
+        return false
+    }
+    return pkg.has_local_namespace(name)
+}
+
+fn ca_refine_local_fix(src: build.Source, offset: u32, len: u32, d: Diagnostic) {
+    let content = src.content
+    if offset.to(uint) + len.to(uint) > content.bytes : return
+    let text = content.range(offset.to(uint), len.to(uint))
+    let amp = text.index_of("&") ! return
+
+    // Insert right before `mut &` when present, else right before `&`
+    let ins_rel = amp
+    let p = amp
+    while p > 0 && (text.get(p - 1) == ' ' || text.get(p - 1) == '\t') : p--
+    if p >= 3 && text.range(p - 3, 3) == "mut" {
+        let before_mut = p - 3
+        let boundary = before_mut == 0 || !lsp_word_byte(text.get(before_mut - 1))
+        if boundary : ins_rel = before_mut
+    }
+
+    let ins = lsp_line_col_in(src, offset + ins_rel.to(u32))
+    let fix = d.fixes.get(0) !? null
+    if isset(fix) {
+        fix.line = ins.line
+        fix.col = ins.col
+        fix.end_line = ins.line
+        fix.end_col = ins.col
+        fix.replacement = "local "
+    } else {
+        let path = src.path ?! return
+        d.fixes.append(DiagnosticFix {
+            title: "Add 'local'"
+            path: path
+            line: ins.line
+            col: ins.col
+            end_line: ins.line
+            end_col: ins.col
+            replacement: "local "
+        })
+    }
+}
+
+fn ca_first_ident(text: String) String {
+    let i: uint = 0
+    while i < text.bytes && (text.get(i) == ' ' || text.get(i) == '\'') : i++
+    let start = i
+    while i < text.bytes && lsp_word_byte(text.get(i)) : i++
+    return text.range(start, i - start)
+}
+
+// Extracts an unqualified identifier from e.g. "Server", "'Server'", "json. Did you mean ...".
+// Returns "" for qualified names like "ns.Foo".
+fn ca_extract_unqualified_name(text: String) String {
+    let i: uint = 0
+    while i < text.bytes && (text.get(i) == ' ' || text.get(i) == '\'') : i++
+    let start = i
+    while i < text.bytes && lsp_word_byte(text.get(i)) : i++
+    let name = text.range(start, i - start)
+    if name.is_empty() : return ""
+    // Qualified name `ns.member`: followed by `.` and another identifier char
+    if i + 1 < text.bytes && text.get(i) == '.' && lsp_word_byte(text.get(i + 1)) : return ""
+    return name
+}
+
+fn ca_append_use_fix(d: Diagnostic, path: String, uses: FileUseInfo, import_path: String, preferred: bool) {
+    let use_text = "use " + import_path + "\n" + (uses.trailing_blank ? "\n" : "")
+    d.fixes.append(DiagnosticFix {
+        title: "Add 'use " + import_path + "'"
+        path: path
+        line: uses.insert_line
+        col: 1
+        end_line: uses.insert_line
+        end_col: 1
+        replacement: use_text
+        preferred: preferred
+    })
+}
+
+fn ca_parse_file_uses(content: String) FileUseInfo {
+    let info = FileUseInfo{}
+    let lines = content.split("\n")
+    let last_use_line: u32 = 0
+    let first_code_line: u32 = 0
+    let first_code_is_blank = false
+
+    each lines as raw, idx {
+        let line_no = (idx + 1).to(u32)
+        let trimmed = raw.trim(" ").trim("\t").trim("\r")
+        if trimmed.is_empty() {
+            continue
+        }
+        if trimmed.starts_with("//") {
+            continue
+        }
+        if trimmed.starts_with("@") && last_use_line == 0 {
+            continue
+        }
+        if trimmed.starts_with("use ") {
+            last_use_line = line_no
+            let rest = trimmed.range(4, trimmed.bytes - 4).trim(" ").trim("\t")
+            let parts = rest.split(" ")
+            let imp = (parts.get(0) !? "").trim(";")
+            if !imp.is_empty() {
+                let alias_name = ca_default_ns_alias(imp)
+                if parts.length >= 3 && (parts.get(1) !? "") == "as" {
+                    let custom = (parts.get(2) !? "").trim(";")
+                    if !custom.is_empty() : alias_name = custom
+                }
+                info.imported_paths.set(imp, alias_name)
+                info.imported_aliases.set(alias_name, imp)
+            }
+            continue
+        }
+        if first_code_line == 0 {
+            first_code_line = line_no
+        }
+        break
+    }
+
+    if last_use_line > 0 {
+        info.insert_line = last_use_line + 1
+        info.trailing_blank = false
+        return info
+    }
+
+    if first_code_line > 0 {
+        // Place at first_code_line (or line 1 if only blank lines precede it)
+        if first_code_line > 1 {
+            let prev_trimmed = (lines.get((first_code_line - 2).to(uint)) !? "").trim(" ").trim("\t").trim("\r")
+            first_code_is_blank = prev_trimmed.is_empty()
+        }
+        info.insert_line = first_code_is_blank ? first_code_line - 1 : first_code_line
+        info.trailing_blank = !first_code_is_blank
+        return info
+    }
+
+    info.insert_line = 1
+    info.trailing_blank = false
+    return info
+}
+
+fn ca_default_ns_alias(import_path: String) String {
+    let parts = import_path.split(".")
+    return parts.get(parts.length - 1) !? import_path
+}
+
+fn ca_parse_decl_line(line: String, require_plus: bool) ?Array[String] {
+    let trimmed = line.trim("\r")
+    if trimmed.is_empty() : return null
+    // Must be top-level (no leading indentation)
+    let first = trimmed.get(0)
+    if first == ' ' || first == '\t' || first == '-' || first == '/' || first == '#' || first == '@' : return null
+
+    let pos: uint = 0
+    if first == '+' {
+        pos = 1
+        while pos < trimmed.bytes && (trimmed.get(pos) == ' ' || trimmed.get(pos) == '\t') : pos++
+    } else if require_plus {
+        return null
+    }
+
+    let kw_start = pos
+    while pos < trimmed.bytes && trimmed.get(pos).is_alpha() : pos++
+    let kw = trimmed.range(kw_start, pos - kw_start)
+    if kw.is_empty() : return null
+
+    let is_type = kw == "class" || kw == "struct" || kw == "interface" || kw == "union"
+        || kw == "enum" || kw == "trait" || kw == "mode" || kw == "type"
+    let is_other = kw == "fn" || kw == "global" || kw == "shared" || kw == "value" || kw == "alias"
+    if !is_type && !is_other : return null
+
+    if pos >= trimmed.bytes || (trimmed.get(pos) != ' ' && trimmed.get(pos) != '\t') : return null
+    while pos < trimmed.bytes && (trimmed.get(pos) == ' ' || trimmed.get(pos) == '\t') : pos++
+
+    let name_start = pos
+    while pos < trimmed.bytes && lsp_word_byte(trimmed.get(pos)) : pos++
+    let name = trimmed.range(name_start, pos - name_start)
+    if name.is_empty() : return null
+
+    let is_global = trimmed.contains("$global")
+    return Array[String]{ name, is_type ? "1" : "0", is_global ? "1" : "0" }
+}
+
+fn ca_scan_file_for_decl(content: String, target: String, require_plus: bool, types_only: bool) ?DeclScanHit {
+    let lines = content.split("\n")
+    each lines as line {
+        let parsed = ca_parse_decl_line(line, require_plus) ?! continue
+        let name = parsed.get(0) !? ""
+        if name != target : continue
+        let is_type = (parsed.get(1) !? "0") == "1"
+        if types_only && !is_type : continue
+        let is_global = (parsed.get(2) !? "0") == "1"
+        return DeclScanHit { is_type: is_type, is_global: is_global }
+    }
+    return null
+}
+
+fn ca_index_public_decls(
+    content: String,
+    import_path: String,
+    ns_name: String,
+    seen_in_ns: Map[bool],
+    map: Map[Array[AutoImportEntry]]
+) {
+    let lines = content.split("\n")
+    each lines as line {
+        let parsed = ca_parse_decl_line(line, true) ?! continue
+        let name = parsed.get(0) !? ""
+        if name.is_empty() || seen_in_ns.has(name) : continue
+        seen_in_ns.set(name, true)
+        let list = map.get(name) !? <{
+            let created = Array[AutoImportEntry]{}
+            map.set(name, created)
+            return created
+        }
+        list.append(AutoImportEntry {
+            import_path: import_path
+            ns_name: ns_name
+            is_type: (parsed.get(1) !? "0") == "1"
+            is_global: (parsed.get(2) !? "0") == "1"
+        })
+    }
+}
+
+class MatchInsertSite {
+    line: u32
+    col: u32
+    arm_indent: String
+    close_indent: String
+    inline_close: bool
+    body: String
+}
+
+fn ca_match_insert_site(src: build.Source, offset: u32, len: u32) ?MatchInsertSite {
+    let content = src.content
+    let end = offset.to(uint) + len.to(uint)
+    if end > content.bytes : end = content.bytes
+    let start = offset.to(uint)
+    if start >= end : return null
+
+    // Find opening `{` and closing `}` of the match block
+    let open_brace: uint = u32.$max.to(uint)
+    let close_brace: uint = u32.$max.to(uint)
+    let i = start
+    while i < end {
+        let ch = content.get(i)
+        if ch == '{' && open_brace == u32.$max.to(uint) : open_brace = i
+        if ch == '}' : close_brace = i
+        i++
+    }
+    if open_brace == u32.$max.to(uint) || close_brace == u32.$max.to(uint) || close_brace <= open_brace : return null
+
+    // Find start of closing `}` line and its indentation
+    let close_line_start = close_brace
+    while close_line_start > 0 && content.get(close_line_start - 1) != '\n' : close_line_start--
+    let before_close = content.range(close_line_start, close_brace - close_line_start)
+    let inline_close = !before_close.trim(" ").trim("\t").is_empty()
+
+    let close_indent = ""
+    if !inline_close {
+        close_indent = before_close
+    } else {
+        let match_line_start = start
+        while match_line_start > 0 && content.get(match_line_start - 1) != '\n' : match_line_start--
+        let p = match_line_start
+        while p < start && (content.get(p) == ' ' || content.get(p) == '\t') : p++
+        close_indent = content.range(match_line_start, p - match_line_start)
+    }
+
+    // Detect arm indentation from an existing arm line inside `{ ... }`
+    let body = content.range(open_brace + 1, close_brace - open_brace - 1)
+    let arm_indent = close_indent + "    "
+    let body_lines = body.split("\n")
+    each body_lines as bline {
+        if !bline.contains("=>") : continue
+        let p: uint = 0
+        while p < bline.bytes && (bline.get(p) == ' ' || bline.get(p) == '\t') : p++
+        if p > 0 {
+            arm_indent = bline.range(0, p)
+            break
+        }
+    }
+
+    let ins_offset = inline_close ? close_brace.to(u32) : close_line_start.to(u32)
+    let lc = lsp_line_col_in(src, ins_offset)
+    return MatchInsertSite {
+        line: lc.line
+        col: lc.col
+        arm_indent: arm_indent
+        close_indent: close_indent
+        inline_close: inline_close
+        body: body
+    }
+}
+
+fn ca_add_match_arm_fixes(
+    b: build.Build,
+    src: build.Source,
+    path: String,
+    offset: u32,
+    len: u32,
+    items_str: String,
+    d: Diagnostic
+) {
+    let site = ca_match_insert_site(src, offset, len) ?! return
+    let raw_items = items_str.split(", ")
+    if raw_items.length == 0 : return
+
+    let is_named_union = false
+    each raw_items as it {
+        if it.starts_with(".") : is_named_union = true
+    }
+
+    let matched_union: ?build.Class = null
+    if is_named_union {
+        matched_union = ca_find_matching_union(b, src, raw_items, site.body)
+    }
+
+    let is_enum = !is_named_union && ca_is_enum_match(b, raw_items, site.body)
+
+    let out = ByteBuffer.new(128)
+    if site.inline_close : out.write_byte('\n')
+    each raw_items as raw {
+        let item = raw.trim(" ")
+        if item.is_empty() : continue
+        let pat = item
+        if item == "null" || item == "true" || item == "false" {
+            pat = item
+        } else if item.starts_with(".") {
+            let vname = item.range(1, item.bytes - 1)
+            let arity = ca_union_variant_arity(matched_union, vname)
+            if arity > 0 {
+                let slots = Array[String]{}
+                let k: uint = 0
+                while k < arity {
+                    slots.append("_")
+                    k++
+                }
+                pat = item + "(" + slots.join(", ") + ")"
+            }
+        } else if is_enum {
+            pat = "." + item
+        }
+        out.append_text(site.arm_indent)
+        out.append_text(pat)
+        out.append_text(" => panic(\"TODO\")\n")
+    }
+    if site.inline_close : out.append_text(site.close_indent)
+
+    d.fixes.append(DiagnosticFix {
+        title: "Add missing match arms"
+        path: path
+        line: site.line
+        col: site.col
+        end_line: site.line
+        end_col: site.col
+        replacement: out.to_string()
+        preferred: true
+    })
+
+    ca_add_default_match_fix(src, path, offset, len, false, d)
+}
+
+fn ca_add_default_match_fix(
+    src: build.Source,
+    path: String,
+    offset: u32,
+    len: u32,
+    preferred: bool,
+    d: Diagnostic
+) {
+    let site = ca_match_insert_site(src, offset, len) ?! return
+    let text = (site.inline_close ? "\n" : "") + site.arm_indent + "default => panic(\"TODO\")\n" + (site.inline_close ? site.close_indent : "")
+    d.fixes.append(DiagnosticFix {
+        title: "Add 'default' match arm"
+        path: path
+        line: site.line
+        col: site.col
+        end_line: site.line
+        end_col: site.col
+        replacement: text
+        preferred: preferred
+    })
+}
+
+fn ca_find_matching_union(b: build.Build, src: build.Source, missing_items: Array[String], body: String) ?build.Class {
+    let needed = Array[String]{}
+    each missing_items as it {
+        if it.starts_with(".") : needed.append(it.range(1, it.bytes - 1), true)
+    }
+    // Also collect `.variant` names already present in the match arms
+    let i: uint = 0
+    while i < body.bytes {
+        if body.get(i) == '.' && i + 1 < body.bytes && (body.get(i + 1).is_alpha() || body.get(i + 1) == '_') {
+            let prev_ok = i == 0 || !lsp_word_byte(body.get(i - 1))
+            if prev_ok {
+                let s = i + 1
+                let e = s
+                while e < body.bytes && lsp_word_byte(body.get(e)) : e++
+                needed.append(body.range(s, e - s), true)
+                i = e
+                continue
+            }
+        }
+        i++
+    }
+
+    let best: ?build.Class = null
+    let best_score = 0
+    let src_ns = src.ns
+    each b.lists.classes as c {
+        if !c.is_named_union : continue
+        let vars = c.union_variants ?! continue
+        let all_match = true
+        each needed as n {
+            let found = false
+            each vars as v {
+                if v.name == n {
+                    found = true
+                    break
+                }
+            }
+            if !found {
+                all_match = false
+                break
+            }
+        }
+        if !all_match : continue
+        let score = 1
+        if isset(src_ns) && c.ns == src_ns : score += 10
+        if c.exp.src == src : score += 20
+        if score > best_score {
+            best_score = score
+            best = c
+        }
+    }
+    return best
+}
+
+fn ca_union_variant_arity(c: ?build.Class, vname: String) uint {
+    let cls = c ?! return 0
+    let vars = cls.union_variants ?! return 0
+    each vars as v {
+        if v.name == vname : return v.payload_types.length
+    }
+    return 0
+}
+
+fn ca_is_enum_match(b: build.Build, raw_items: Array[String], body: String) bool {
+    // Check if existing arms in the match body use `.member =>`
+    let lines = body.split("\n")
+    each lines as line {
+        let t = line.trim(" ").trim("\t").trim("\r")
+        if t.starts_with(".") && t.contains("=>") : return true
+    }
+    // Check if all non-null missing items match an Enum in the build
+    let non_null = Array[String]{}
+    each raw_items as it {
+        let t = it.trim(" ")
+        if t != "null" && t != "true" && t != "false" && !t.is_empty() : non_null.append(t)
+    }
+    if non_null.length == 0 : return false
+    each b.lists.namespaces as ns {
+        each ns.scope.idfs() as idf {
+            if idf.type != build.IDF.enum : continue
+            let en = idf.enum ?! continue
+            let all_ok = true
+            each non_null as item {
+                let found = false
+                each en.items as ei {
+                    if ei.name == item {
+                        found = true
+                        break
+                    }
+                }
+                if !found {
+                    all_ok = false
+                    break
+                }
+            }
+            if all_ok : return true
+        }
+    }
+    return false
 }
 
 fn lsp_code_action(d: Diagnostic, fix: DiagnosticFix) json.Value {
     let action = json.new_object()
     action.set("title", json.from(fix.title))
     action.set("kind", json.from("quickfix"))
-    action.set("isPreferred", json.from(true))
+    action.set("isPreferred", json.from(fix.preferred))
 
     let related = json.new_array()
     let diagnostic = json.new_object()
@@ -42,15 +893,27 @@ fn lsp_code_action(d: Diagnostic, fix: DiagnosticFix) json.Value {
     related.append(diagnostic)
     action.set("diagnostics", related)
 
-    let text_edit = json.new_object()
-    text_edit.set("range", json_range(fix.line, fix.col, fix.end_line, fix.end_col))
-    text_edit.set("newText", json.from(fix.replacement))
-    let edits = json.new_array()
-    edits.append(text_edit)
+    let by_uri = Map[json.Value]{}
+    lsp_append_fix_edit(by_uri, fix)
+    each fix.extra_edits as extra : lsp_append_fix_edit(by_uri, extra)
+
     let changes = json.new_object()
-    changes.set(lsp_uri_from_path(fix.path), edits)
+    each by_uri as edits, uri : changes.set(uri, edits)
     let edit = json.new_object()
     edit.set("changes", changes)
     action.set("edit", edit)
     return action
+}
+
+fn lsp_append_fix_edit(by_uri: Map[json.Value], fix: DiagnosticFix) {
+    let uri = lsp_uri_from_path(fix.path)
+    let edits = by_uri.get(uri) !? <{
+        let created = json.new_array()
+        by_uri.set(uri, created)
+        return created
+    }
+    let text_edit = json.new_object()
+    text_edit.set("range", json_range(fix.line, fix.col, fix.end_line, fix.end_col))
+    text_edit.set("newText", json.from(fix.replacement))
+    edits.append(text_edit)
 }

@@ -12,7 +12,6 @@ value H3_STREAM_SEND_HIGH_WATER (65_536)
 value H3_SERVE_POOL_MAX (16)
 
 global h3_resp_headers: Array[HpackField] (.new(8))
-global h3_resp_trailers: Array[HpackField] (.new(4))
 global h3_qpack_buf: ByteBuffer (.new(256))
 global h3_buf_pool: Array[ByteBuffer] (.{})
 
@@ -62,6 +61,7 @@ class H3ServerStream {
     expected_length: ?uint (null)
     got_headers: bool (false)
     got_trailers: bool (false)
+    expect_continue: bool (false)
     read_done: bool (false)
     dispatched: bool (false)
     send_buf: ByteBuffer (h3_take_buf(512))
@@ -112,7 +112,7 @@ class H3ServerConn {
     has_peer_qpack_dec: bool (false)
     uni_streams: Array[H3UniStream] (.new(4))
     streams: Array[H3ServerStream] (.new(8))
-    max_stream_id: u64 (0)
+    next_goaway_id: u64 (0)
     active_handlers: uint (0)
     last_activity_ms: uint (0)
     peer_cert_loaded: bool (false)
@@ -135,20 +135,20 @@ class H3ServerConn {
             ssl: ssl,
             last_activity_ms: time.mono_ms()
         }
-        let ctrl = net.SSL_new_stream(ssl, net.SSL_STREAM_FLAG_UNI | net.SSL_STREAM_FLAG_NO_BLOCK)
-        if isset(ctrl) {
-            conn.ctrl_out = ctrl
-            let hdr_limit = worker.server.max_request_header_size
-            h3_write_control_settings(conn.ctrl_out_buf, hdr_limit)
-            conn.flush_ctrl_out()
-        }
+        h3_write_control_settings(conn.ctrl_out_buf, worker.server.max_request_header_size)
+        conn.flush_ctrl_out()
         return conn
     }
 
     fn flush_ctrl_out() {
-        let ctrl = this.ctrl_out ?! return
-        if this.ctrl_out_pos >= this.ctrl_out_buf.length : return
         @unsafe
+        let ctrl = this.ctrl_out
+        if !isset(ctrl) {
+            ctrl = net.SSL_new_stream(this.ssl, net.SSL_STREAM_FLAG_UNI | net.SSL_STREAM_FLAG_NO_BLOCK)
+            if !isset(ctrl) : return
+            this.ctrl_out = ctrl
+        }
+        if this.ctrl_out_pos >= this.ctrl_out_buf.length : return
         while this.ctrl_out_pos < this.ctrl_out_buf.length {
             let rem = this.ctrl_out_buf.length - this.ctrl_out_pos
             let written: uint = 0
@@ -166,8 +166,7 @@ class H3ServerConn {
         if this.goaway_sent || this.closed : return
         this.goaway_sent = true
         this.draining = true
-        let next_id = this.max_stream_id == 0 ? 0 : this.max_stream_id + 4
-        h3_write_goaway(this.ctrl_out_buf, next_id)
+        h3_write_goaway(this.ctrl_out_buf, this.next_goaway_id)
         this.flush_ctrl_out()
     }
 
@@ -200,13 +199,13 @@ class H3ServerConn {
             let stype = net.SSL_get_stream_type(s)
             if stype == net.SSL_STREAM_TYPE_BIDI {
                 let sid = net.SSL_get_stream_id(s)
-                if sid > this.max_stream_id : this.max_stream_id = sid
                 if this.draining {
                     let args = net.SslStreamResetArgs { quic_error_code: H3_ERR_REQUEST_REJECTED }
                     net.SSL_stream_reset(s, @ref(args), size_of(net.SslStreamResetArgs))
                     net.SSL_free(s)
                     continue
                 }
+                if sid + 4 > this.next_goaway_id : this.next_goaway_id = sid + 4
                 this.streams.append(H3ServerStream { conn: this, ssl: s })
             } else if stype == net.SSL_STREAM_TYPE_READ {
                 this.uni_streams.append(H3UniStream { ssl: s })
@@ -355,6 +354,7 @@ class H3ServerConn {
     }
 
     fn parse_settings(payload: local &[u8]) bool {
+        let seen = HashMap[u64, bool].new()
         let pos: uint = 0
         while pos < payload.length {
             let ok1, id, p1 = h3_varint_try_read(payload, pos)
@@ -367,10 +367,11 @@ class H3ServerConn {
                 this.close_with_error(H3_ERR_FRAME_ERROR)
                 return false
             }
-            if h3_is_forbidden_setting(id) {
+            if h3_is_forbidden_setting(id) || seen.has(id) {
                 this.close_with_error(H3_ERR_SETTINGS_ERROR)
                 return false
             }
+            seen.set(id, true)
             pos = p2
         }
         return true
@@ -558,20 +559,7 @@ class H3ServerConn {
                         else : this.close_with_error(H3_ERR_QPACK_DECOMPRESSION_FAILED)
                         return
                     }
-                    if !st.got_headers {
-                        st.got_headers = true
-                        if !h3_validate_request_headers(fields, st) {
-                            st.reset(H3_ERR_MESSAGE_ERROR)
-                            return
-                        }
-                        st.req_fields = fields
-                    } else {
-                        st.got_trailers = true
-                        if !h3_validate_trailers(fields) {
-                            st.reset(H3_ERR_MESSAGE_ERROR)
-                            return
-                        }
-                    }
+                    this.apply_request_headers(st, fields, body_limit)
                 } else {
                     let hbuf = existing_hbuf ?? <{
                         let b = ByteBuffer.new(take < 256 ? 256 : take)
@@ -587,29 +575,16 @@ class H3ServerConn {
                             return
                         }
                         hbuf.clear()
-                        if !st.got_headers {
-                            st.got_headers = true
-                            if !h3_validate_request_headers(fields, st) {
-                                st.reset(H3_ERR_MESSAGE_ERROR)
-                                return
-                            }
-                            st.req_fields = fields
-                        } else {
-                            st.got_trailers = true
-                            if !h3_validate_trailers(fields) {
-                                st.reset(H3_ERR_MESSAGE_ERROR)
-                                return
-                            }
-                        }
+                        this.apply_request_headers(st, fields, body_limit)
                     }
                 }
             } else if st.frame_type == H3_FRAME_DATA {
-                if st.req_body_len + take > body_limit {
+                if st.req_body_len > body_limit || take > body_limit - st.req_body_len {
                     st.reset(H3_ERR_MESSAGE_ERROR)
                     return
                 }
                 let expected = st.expected_length
-                if isset(expected) && st.req_body_len + take > expected {
+                if isset(expected) && (st.req_body_len > expected || take > expected - st.req_body_len) {
                     st.reset(H3_ERR_MESSAGE_ERROR)
                     return
                 }
@@ -632,6 +607,35 @@ class H3ServerConn {
         } else if st.recv_pos > 4096 {
             st.recv_buf.clear_range(0, st.recv_pos)
             st.recv_pos = 0
+        }
+    }
+
+    fn apply_request_headers(st: H3ServerStream, fields: Array[HpackField], body_limit: uint) {
+        if !st.got_headers {
+            st.got_headers = true
+            if !h3_validate_request_headers(fields, st) {
+                st.reset(H3_ERR_MESSAGE_ERROR)
+                return
+            }
+            let expected = st.expected_length
+            if isset(expected) && expected > body_limit {
+                st.reset(H3_ERR_MESSAGE_ERROR)
+                return
+            }
+            st.req_fields = fields
+            if st.expect_continue {
+                h3_write_frame_header(st.send_buf, H3_FRAME_HEADERS, 4)
+                st.send_buf.write_byte(0x00)
+                st.send_buf.write_byte(0x00)
+                st.send_buf.write_byte(0xff)
+                st.send_buf.write_byte(0x00)
+            }
+        } else {
+            st.got_trailers = true
+            if !h3_validate_trailers(fields) {
+                st.reset(H3_ERR_MESSAGE_ERROR)
+                return
+            }
         }
     }
 
@@ -851,16 +855,17 @@ class H3ServerConn {
             }
         }
         let trailer_headers = response.trailer_list
-        let trailers = h3_resp_trailers
-        trailers.clear()
+        let trailers: ?Array[HpackField] = null
         if isset(trailer_headers) {
+            let list = Array[HpackField].new(trailer_headers.length)
             each trailer_headers as value, name {
                 if response_header_is_framing(name) : continue
                 let field = HpackField { name: name.lower(), value: value, never_index: true }
-                if h2_regular_field(field) : trailers.append(field)
+                if h2_regular_field(field) : list.append(field)
             }
+            if list.length > 0 : trailers = list
         }
-        let has_trailers = trailers.length > 0
+        let has_trailers = isset(trailers)
         if status != 304 || !isset(plan) {
             if response_header_value_is_safe(content_type) : headers.append(.{ name: "content-type", value: content_type })
             if status != 204 && !open_body && !has_trailers : headers.append(.{ name: "content-length", value: h2_uint_str(size) })
@@ -932,7 +937,7 @@ class H3ServerConn {
                 }
             }
         }
-        if has_trailers && !st.cancelled && !this.closed {
+        if isset(trailers) && !st.cancelled && !this.closed {
             qbuf.clear()
             qpack_encode(trailers, qbuf)
             h3_write_frame_header(st.send_buf, H3_FRAME_HEADERS, qbuf.length.to(u64))
@@ -946,13 +951,15 @@ fn h3_validate_request_headers(fields: Array[HpackField], st: H3ServerStream) bo
     let method = ""
     let scheme = ""
     let path = ""
+    let authority = ""
     let has_authority = false
+    let host: ?String = null
     let content_length: ?uint = null
     each fields as f {
         let name = f.name
         if name.bytes == 0 : return false
         if name[0] == ':' {
-            if saw_regular : return false
+            if saw_regular || !response_header_value_is_safe(f.value) : return false
             if name == ":method" {
                 if method.bytes > 0 || f.value.bytes == 0 : return false
                 method = f.value
@@ -965,6 +972,7 @@ fn h3_validate_request_headers(fields: Array[HpackField], st: H3ServerStream) bo
             } else if name == ":authority" {
                 if has_authority : return false
                 has_authority = true
+                authority = f.value
             } else {
                 return false
             }
@@ -972,17 +980,34 @@ fn h3_validate_request_headers(fields: Array[HpackField], st: H3ServerStream) bo
         }
         saw_regular = true
         if !h2_regular_field(f) : return false
-        if name == "connection" || name == "keep-alive" || name == "proxy-connection" || name == "transfer-encoding" || name == "upgrade" : return false
-        if name == "te" && f.value != "trailers" : return false
+        if name == "host" {
+            if isset(host) : return false
+            host = f.value
+        }
+        if name == "expect" && f.value.equals_ignore_ascii_case("100-continue") : st.expect_continue = true
         if name == "content-length" {
-            let parsed = f.value.to_uint() ! return false
+            if f.value.bytes == 0 : return false
+            let parsed: uint = 0
+            each f.value as byte {
+                if byte < '0' || byte > '9' : return false
+                if parsed > uint.$max / 10 : return false
+                parsed *= 10
+                parsed = parsed.checked_add((byte - '0').to(uint)) ! return false
+            }
             let prev = content_length
             if isset(prev) && prev != parsed : return false
             content_length = parsed
         }
     }
-    if method.bytes == 0 : return false
-    if method != "CONNECT" && (scheme.bytes == 0 || path.bytes == 0) : return false
+    if method.bytes == 0 || !response_header_name_is_safe(method) : return false
+    if isset(host) && authority.bytes > 0 && host != authority : return false
+    if method == "CONNECT" {
+        if authority.bytes == 0 || scheme.bytes > 0 || path.bytes > 0 : return false
+    } else {
+        if scheme != "http" && scheme != "https" : return false
+        if (!path.starts_with("/") && !(method == "OPTIONS" && path == "*")) || path.contains("#") : return false
+        if authority.bytes == 0 && (!isset(host) || host == "") : return false
+    }
     st.expected_length = content_length
     return true
 }

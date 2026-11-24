@@ -5,9 +5,14 @@
 
 ```
 - Release 0.9.3
-+ Cleanup (compiler & stdlib): removed dead private code, unused fields/helpers/FFI constants, and unused `tagged-union.valk` across the compiler and standard library with zero public API breaking changes
++ Cleanup (compiler & stdlib): removed dead private code, unused fields/helpers/FFI constants, and unused `tagged-union.valk` across the compiler and standard library with zero public API breaking changes; replaced 0.8.8 bootstrap workarounds in `gc` (`SharedStopLine $align(64)`) and `json` (`[const PRETTY: bool]`)
 + Safety (compiler & stdlib): rewrote non-FFI `@unsafe` code in safe Valk across the compiler (`parser`, `hash`) and standard library (`core`, `compress`, `http`, `net`, `fs`, `io`, `crypto`, `time`, `json`) without performance loss
 + Docs: updated outdated inline and `///` API documentation comments across the compiler and standard library and regenerated `docs/api.md` and `docs/api-full.md`
++ Tooling (`--watch`): switched `valk build --watch` from mtime polling to `fs.Watcher` (`inotify`/`kqueue`) with build-window race checking, event debouncing, and polling fallback
++ LSP: added `workspace/symbol` search across workspace packages with cached declaration indexing, quick-fix code actions (auto-import missing symbols/namespaces, add `local` to borrow parameters, generate missing `match` arms, typo suggestions), and incremental/cached diagnostics (up to 11.8x faster `didSave` and >1000x faster cached `workspace/symbol` on large workspaces)
++ HTTP/3: added automatic `Alt-Svc` header advertisement on TCP HTTP/1.1 & HTTP/2 responses (`Server.alt_svc`), `curl --http3-only` + `h2load` interop test suite, RFC 9114 `GOAWAY`/`Expect: 100-continue`/coroutine-safe trailer fixes, and faster `H3Client` event loop (4.6x sequential / +35% multiplexed throughput)
++ Standard library (`template`): added multi-level layouts/blocks/inheritance (`@extend`, `@block`, `@yield` defaults, `@super()`, `Engine.loader`), compile-time HTML/attribute/URL/JS/CSS context-aware auto-escaping (`Engine.auto_escape`, `RenderOptions.auto_escape`, `| raw`), and exact 1-based line/column parse & render errors (`ParseError.column`)
++ Hardening (fuzzing): fuzz-tested the compiler frontend (`--lint`, `--all-errors`, `--fmt`, `--ir`) and all untrusted-input stdlib parsers (`http`, `h2`, `h3`, WebSocket, `url`, `json`, `compress`, `regex`, `markdown`, `template`), fixing 35+ crash/stack-overflow/DoS/overflow edge cases and adding deterministic fuzz & regression suites
 
 + Release 0.9.2
 + HTTP/3: added HTTP/3 over QUIC server and client support (`Server.http3`, `Client.http3`, `Options.http3`) backed by bundled OpenSSL 3.5 QUIC, with per-worker `SO_REUSEPORT` listeners, static file caching, compression, streaming, trailers, mTLS, and pooled multiplexed client connections
@@ -714,7 +719,7 @@
 + use "x" as X { a, b as B, c }
 + Allocate stack/heap arrays : @array[u8 x 3]{ 'a', 'b', 'c' }
 + Copy on assign if not pointer or number
-~ template engine
++ template engine
 + Release 0.0.7
 
 + Update HTTP client options

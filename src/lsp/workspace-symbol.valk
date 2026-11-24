@@ -1,0 +1,472 @@
+
+use build
+use helper
+use valk.json
+use valk.fs
+use valk.gc
+
+value ws_symbol_limit (200)
+
+class WorkspaceSymbolEntry {
+    name: String
+    name_lower: String
+    kind: int
+    container: String
+    container_lower: String
+    uri: String
+    line: u32
+    col: u32
+    end_line: u32
+    end_col: u32
+    is_workspace: bool
+}
+
+class WorkspaceSymbolGroup {
+    entries: Array[WorkspaceSymbolEntry] (.{})
+    loaded: Map[uint] (Map[uint]{})
+    buffer_versions: Map[uint] (Map[uint]{})
+    watched_dirs: Map[uint] (Map[uint]{})
+}
+
+class WorkspaceSymbolMatch {
+    entry: WorkspaceSymbolEntry
+    score: int
+}
+
+extend Lsp {
+    fn workspace_symbol() {
+        let query = (this.data.get("params").get("query").string_value() !? "").trim().lower()
+        let roots = this.workspace_symbol_roots()
+
+        let indexed = false
+        each roots as root {
+            let group = this.workspace_symbols.get(root) !? null
+            if !isset(group) || this.ws_group_is_stale(group) {
+                group = this.index_workspace_root(root)
+                this.workspace_symbols.set(root, group)
+                indexed = true
+            }
+        }
+        if indexed : gc.collect()
+
+        // Drop cached groups that are no longer part of the workspace
+        let stale_keys = Array[String]{}
+        each this.workspace_symbols as _, key {
+            if !roots.contains(key) : stale_keys.append(key)
+        }
+        each stale_keys as key : this.workspace_symbols.remove(key)
+
+        let list = json.new_array()
+        let seen = Map[bool]{}
+
+        if query.is_empty() {
+            let count: uint = 0
+            each roots as root {
+                let group = this.workspace_symbols.get(root) ! continue
+                each group.entries as entry {
+                    if !entry.is_workspace : continue
+                    let key = entry.uri + ":" + entry.line + ":" + entry.col + ":" + entry.name
+                    if seen.has(key) : continue
+                    seen.set(key, true)
+                    list.append(ws_entry_to_json(entry))
+                    count++
+                    if count >= ws_symbol_limit : break
+                }
+                if count >= ws_symbol_limit : break
+            }
+            this.success(list)
+            return
+        }
+
+        let matches = Array[WorkspaceSymbolMatch]{}
+        each roots as root {
+            let group = this.workspace_symbols.get(root) ! continue
+            each group.entries as entry {
+                let score = ws_match_score(entry, query)
+                if score <= 0 : continue
+                let key = entry.uri + ":" + entry.line + ":" + entry.col + ":" + entry.name
+                if seen.has(key) : continue
+                seen.set(key, true)
+                matches.append(WorkspaceSymbolMatch { entry: entry, score: score })
+            }
+        }
+
+        // Higher score first; tie-break by shorter name, then alphabetical
+        matches.sort(fn(a: WorkspaceSymbolMatch, b: WorkspaceSymbolMatch) bool {
+            if a.score != b.score : return a.score < b.score
+            if a.entry.name.bytes != b.entry.name.bytes : return a.entry.name.bytes > b.entry.name.bytes
+            return a.entry.name_lower > b.entry.name_lower
+        })
+
+        let count: uint = 0
+        each matches as m {
+            list.append(ws_entry_to_json(m.entry))
+            count++
+            if count >= ws_symbol_limit : break
+        }
+        this.success(list)
+    }
+
+    fn workspace_symbol_roots() Array[String] {
+        let roots = Array[String]{}
+        each this.file_content as _, path {
+            if !fs.exists(path) : continue
+            let pkg_dir = this.find_pkg_dir_for_path(path)
+            if isset(pkg_dir) : roots.append(pkg_dir, true)
+            else : roots.append(path, true)
+        }
+        let root = this.root
+        if !root.is_empty() && fs.is_dir(root) {
+            if fs.exists(helper.add(root, "valk.json")) {
+                roots.append(root, true)
+            } else {
+                let subdirs = fs.files_in(root, false, false, true, true) !? Array[String]{}
+                let found_pkg = false
+                each subdirs as sub {
+                    if ws_skip_dir(sub) : continue
+                    let full = helper.add(root, sub)
+                    if fs.exists(helper.add(full, "valk.json")) {
+                        roots.append(full, true)
+                        found_pkg = true
+                    }
+                }
+                if !found_pkg && roots.length == 0 : roots.append(root, true)
+            }
+        }
+        return roots
+    }
+
+    fn ws_group_is_stale(group: WorkspaceSymbolGroup) bool {
+        each group.loaded as mtime, path {
+            if this.file_content.has(path) {
+                let ver = this.file_versions.get(path) !? 0
+                if group.buffer_versions.has(path) {
+                    if (group.buffer_versions.get(path) !? 0) != ver : return true
+                } else {
+                    if (fs.modified_time(path) !? 0) != mtime : return true
+                    let buf = this.file_content.get(path) !? ""
+                    let disk = fs.read(path) !? ""
+                    if buf != disk : return true
+                    group.buffer_versions.set(path, ver)
+                }
+                continue
+            }
+            if (fs.modified_time(path) !? 0) != mtime : return true
+        }
+        each group.watched_dirs as mtime, dir {
+            if (fs.modified_time(dir) !? 0) != mtime : return true
+        }
+        return false
+    }
+
+    fn index_workspace_root(root: String) WorkspaceSymbolGroup {
+        let group = WorkspaceSymbolGroup{}
+        let b = build.Build.init_from_args(Array[String]{ root }) ! return group
+        this.attach_to_build(b)
+        b.options.mode = build.BUILDTYPE.doc
+        b.options.keep_going = true
+        b.options.no_warn = true
+        b.run() ! {}
+
+        each b.cache.loaded_files as _, path {
+            group.loaded.set(path, fs.modified_time(path) !? 0)
+            if this.file_content.has(path) {
+                group.buffer_versions.set(path, this.file_versions.get(path) !? 0)
+            }
+        }
+
+        let main_pkg = b.main_pkg
+        if isset(main_pkg) {
+            let srcdir = main_pkg.srcdir
+            if isset(srcdir) && fs.is_dir(srcdir) {
+                group.watched_dirs.set(srcdir, fs.modified_time(srcdir) !? 0)
+            }
+        }
+
+        let seen = Map[bool]{}
+        each b.lists.namespaces as ns {
+            let is_ws = isset(main_pkg) && ns.pkg == main_pkg
+            let is_std = ns.pkg.name == "valk"
+            if !is_ws && !is_std : continue
+            if is_ws {
+                let ndir = ns.dir
+                if isset(ndir) && fs.is_dir(ndir) {
+                    group.watched_dirs.set(ndir, fs.modified_time(ndir) !? 0)
+                }
+            }
+            let ns_container = ns.name == "main" ? "" : ns.name
+            each ns.scope.idfs() as idf, name {
+                ws_collect_idf(group.entries, seen, main_pkg, idf, name, ns_container, is_ws)
+            }
+        }
+        each b.scope.idfs() as idf, name {
+            ws_collect_idf(group.entries, seen, main_pkg, idf, name, "", false)
+        }
+        return group
+    }
+}
+
+fn ws_skip_dir(name: String) bool {
+    return name == "vendor" || name == ".git" || name == "node_modules"
+        || name == "dist" || name == "debug" || name == "toolchains" || name == "target"
+}
+
+fn ws_exp_is_workspace(main_pkg: ?build.Pkg, exp: build.Exp, fallback: bool) bool {
+    let mp = main_pkg ?! return fallback
+    let at = build.message_resolve(exp.src, exp.i)
+    let ns = at.src.ns ?! return fallback
+    return ns.pkg == mp
+}
+
+fn ws_add_entry(
+    out: Array[WorkspaceSymbolEntry],
+    seen: Map[bool],
+    exp: build.Exp,
+    name: String,
+    kind: int,
+    container: String,
+    is_workspace: bool,
+    starts_with_name: ?String (null)
+) {
+    if name.is_empty() : return
+    let start = build.message_resolve(exp.src, exp.i)
+    let path = start.src.path ?! return
+    let before = starts_with_name
+    if isset(before) && start.i >= before.bytes.to(u32) {
+        let from_i = start.i - before.bytes.to(u32)
+        if start.src.content.range(from_i.to(uint), before.bytes) == before {
+            start.i = from_i
+        }
+    }
+    let end = build.message_resolve(exp.src, exp.i + exp.len)
+    let from = lsp_line_col_in(start.src, start.i)
+    let to = lsp_line_col_in(end.src, end.i)
+    let key = path + ":" + from.line + ":" + from.col + ":" + name
+    if seen.has(key) : return
+    seen.set(key, true)
+    out.append(WorkspaceSymbolEntry {
+        name: name
+        name_lower: name.lower()
+        kind: kind
+        container: container
+        container_lower: container.lower()
+        uri: lsp_uri_from_path(path)
+        line: from.line
+        col: from.col
+        end_line: to.line
+        end_col: to.col
+        is_workspace: is_workspace
+    })
+}
+
+fn ws_collect_idf(
+    out: Array[WorkspaceSymbolEntry],
+    seen: Map[bool],
+    main_pkg: ?build.Pkg,
+    idf: build.Idf,
+    name: String,
+    ns_container: String,
+    is_ws: bool
+) {
+    let aexp = idf.alias_exp
+    if isset(aexp) {
+        let ws = ws_exp_is_workspace(main_pkg, aexp, is_ws)
+        let kind = idf.type == build.IDF.value_expr ? sk_constant
+            : (idf.type == build.IDF.type ? sk_class : lsp_idf_symbol_kind(idf))
+        ws_add_entry(out, seen, aexp, name, kind, ns_container, ws)
+        return
+    }
+    if idf.type == build.IDF.value || idf.type == build.IDF.value_expr {
+        let vexp = idf.value_exp ?! return
+        let ws = ws_exp_is_workspace(main_pkg, vexp, is_ws)
+        ws_add_entry(out, seen, vexp, name, sk_constant, ns_container, ws)
+        return
+    }
+    if idf.type == build.IDF.func {
+        let func = idf.func ?! return
+        if func.name != name : return
+        let ws = ws_exp_is_workspace(main_pkg, func.exp, is_ws)
+        ws_add_entry(out, seen, func.exp, name, sk_function, ns_container, ws)
+        return
+    }
+    if idf.type == build.IDF.class {
+        let class = idf.class ?! return
+        if class.name != name : return
+        let ws = ws_exp_is_workspace(main_pkg, class.exp, is_ws)
+        ws_add_entry(out, seen, class.exp, name, class_symbol_kind(class), ns_container, ws)
+        ws_collect_class_members(out, seen, main_pkg, class, is_ws)
+        return
+    }
+    if idf.type == build.IDF.global {
+        let g = idf.global ?! return
+        if g.name != name : return
+        let ws = ws_exp_is_workspace(main_pkg, g.exp, is_ws)
+        ws_add_entry(out, seen, g.exp, name, sk_variable, ns_container, ws)
+        return
+    }
+    if idf.type == build.IDF.enum {
+        let en = idf.enum ?! return
+        if en.name != name : return
+        let ws = ws_exp_is_workspace(main_pkg, en.exp, is_ws)
+        ws_add_entry(out, seen, en.exp, name, sk_enum, ns_container, ws)
+        ws_collect_enum_members(out, seen, main_pkg, en, ws)
+        return
+    }
+    if idf.type == build.IDF.trait {
+        let t = idf.trait ?! return
+        if t.name != name : return
+        let ws = ws_exp_is_workspace(main_pkg, t.exp, is_ws)
+        ws_add_entry(out, seen, t.exp, name, sk_interface, ns_container, ws)
+        return
+    }
+}
+
+fn ws_collect_class_members(
+    out: Array[WorkspaceSymbolEntry],
+    seen: Map[bool],
+    main_pkg: ?build.Pkg,
+    class: build.Class,
+    is_ws: bool
+) {
+    let cname = class.name
+    each class.props as prop {
+        let pname = prop.name ?! continue
+        let ws = ws_exp_is_workspace(main_pkg, prop.exp, is_ws)
+        ws_add_entry(out, seen, prop.exp, pname, sk_field, cname, ws, pname)
+    }
+    let uvars = class.union_variants
+    if isset(uvars) {
+        each uvars as v {
+            let ws = ws_exp_is_workspace(main_pkg, v.exp, is_ws)
+            ws_add_entry(out, seen, v.exp, v.name, sk_enum_member, cname, ws)
+        }
+    }
+    each class.funcs as func, fname {
+        if func.name != fname : continue
+        let ws = ws_exp_is_workspace(main_pkg, func.exp, is_ws)
+        ws_add_entry(out, seen, func.exp, fname, sk_method, cname, ws)
+    }
+    each class.groups as group, gname {
+        let ws = ws_exp_is_workspace(main_pkg, group.exp, is_ws)
+        ws_add_entry(out, seen, group.exp, gname, sk_namespace, cname, ws)
+        let gcontainer = cname + "." + gname
+        each group.funcs as func, fname {
+            if func.name != fname : continue
+            let fws = ws_exp_is_workspace(main_pkg, func.exp, is_ws)
+            ws_add_entry(out, seen, func.exp, fname, sk_method, gcontainer, fws)
+        }
+    }
+}
+
+fn ws_collect_enum_members(
+    out: Array[WorkspaceSymbolEntry],
+    seen: Map[bool],
+    main_pkg: ?build.Pkg,
+    en: build.Enum,
+    is_ws: bool
+) {
+    let search_exp = en.body ?? en.exp
+    let at = build.message_resolve(search_exp.src, search_exp.i)
+    let path = at.src.path
+    if isset(path) {
+        let uri = lsp_uri_from_path(path)
+        let end_i = at.i + search_exp.len
+        each en.items as item {
+            let pos = build.lsp_find_word_range(at.src.content, item.name, at.i, end_i, false)
+            if pos == u32.$max : continue
+            let from = lsp_line_col_in(at.src, pos)
+            let to = lsp_line_col_in(at.src, pos + item.name.bytes.to(u32))
+            let key = path + ":" + from.line + ":" + from.col + ":" + item.name
+            if seen.has(key) : continue
+            seen.set(key, true)
+            out.append(WorkspaceSymbolEntry {
+                name: item.name
+                name_lower: item.name.lower()
+                kind: sk_enum_member
+                container: en.name
+                container_lower: en.name.lower()
+                uri: uri
+                line: from.line
+                col: from.col
+                end_line: to.line
+                end_col: to.col
+                is_workspace: is_ws
+            })
+        }
+    }
+    let methods = en.methods
+    if isset(methods) {
+        each methods.funcs as func, fname {
+            if func.name != fname : continue
+            let ws = ws_exp_is_workspace(main_pkg, func.exp, is_ws)
+            ws_add_entry(out, seen, func.exp, fname, sk_method, en.name, ws)
+        }
+    }
+}
+
+fn ws_match_score(entry: WorkspaceSymbolEntry, query: String) int {
+    let base = 0
+    if query.contains(".") && !entry.container_lower.is_empty() {
+        let full = entry.container_lower + "." + entry.name_lower
+        let full_orig = entry.container + "." + entry.name
+        base = ws_text_score(full_orig, full, query)
+    } else {
+        base = ws_text_score(entry.name, entry.name_lower, query)
+    }
+    if base <= 0 : return 0
+    return entry.is_workspace ? base + 1000 : base
+}
+
+fn ws_is_boundary(orig: String, idx: uint) bool {
+    if idx == 0 : return true
+    let prev = orig.get(idx - 1)
+    let cur = orig.get(idx)
+    if prev == '_' || prev == '.' : return true
+    if cur >= 'A' && cur <= 'Z' && prev >= 'a' && prev <= 'z' : return true
+    return false
+}
+
+fn ws_text_score(orig: String, lower: String, query: String) int {
+    let qlen = query.bytes
+    let nlen = lower.bytes
+    if qlen == 0 || qlen > nlen : return 0
+
+    if lower == query : return 500
+    if lower.starts_with(query) : return 400
+
+    let idx = lower.index_of(query) !? u32.$max.to(uint)
+    if idx != u32.$max.to(uint) {
+        let score = 300
+        if ws_is_boundary(orig, idx) : score += 40
+        return score
+    }
+
+    // Subsequence fuzzy match (e.g. "lsc" -> "LspLineCol", "bdiag" -> "build_diagnostics")
+    let qi: uint = 0
+    let ni: uint = 0
+    let score = 100
+    let prev_match: uint = u32.$max.to(uint)
+    while qi < qlen && ni < nlen {
+        if lower.get(ni) == query.get(qi) {
+            if ws_is_boundary(orig, ni) : score += 15
+            if prev_match != u32.$max.to(uint) && ni == prev_match + 1 : score += 10
+            prev_match = ni
+            qi++
+        }
+        ni++
+    }
+    if qi < qlen : return 0
+    return score
+}
+
+fn ws_entry_to_json(entry: WorkspaceSymbolEntry) json.Value {
+    let info = json.new_object()
+    info.set("name", json.from(entry.name))
+    info.set("kind", json.from(entry.kind))
+    let loc = json.new_object()
+    loc.set("uri", json.from(entry.uri))
+    loc.set("range", json_range(entry.line, entry.col, entry.end_line, entry.end_col))
+    info.set("location", loc)
+    if !entry.container.is_empty() : info.set("containerName", json.from(entry.container))
+    return info
+}

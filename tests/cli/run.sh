@@ -1869,5 +1869,79 @@ for needle in "COVERAGE" "11/14" "3/4" "78.6%" "uncovered: 3, 12-13"; do
     fi
 done
 
+echo "> --watch rebuilds on file edits and newly created files via fs.Watcher"
+watch_dir="$workdir/watch-pkg"
+mkdir -p "$watch_dir/src"
+cat > "$watch_dir/valk.json" <<'EOF'
+{ "namespaces": { "main": "src" } }
+EOF
+cat > "$watch_dir/src/main.valk" <<'EOF'
+fn main() {
+    println("watch-v1")
+}
+EOF
+watch_log="$workdir/watch.log"
+"$VALK" build "$watch_dir" --watch --run --no-warn -o "$watch_dir/app" > "$watch_log" 2>&1 &
+watch_pid=$!
+cleanup_watch() {
+    kill "$watch_pid" 2>/dev/null || true
+    wait "$watch_pid" 2>/dev/null || true
+}
+# Wait for initial run
+watch_ok=0
+for _ in $(seq 1 100); do
+    if grep -q "watch-v1" "$watch_log" 2>/dev/null; then
+        watch_ok=1
+        break
+    fi
+    sleep 0.05
+done
+if [ "$watch_ok" -ne 1 ]; then
+    cleanup_watch
+    echo "# --watch did not complete initial build/run:"
+    cat "$watch_log"
+    exit 1
+fi
+# Edit existing file
+cat > "$watch_dir/src/main.valk" <<'EOF'
+fn main() {
+    println("watch-v2")
+}
+EOF
+watch_ok=0
+for _ in $(seq 1 100); do
+    if grep -q "watch-v2" "$watch_log" 2>/dev/null; then
+        watch_ok=1
+        break
+    fi
+    sleep 0.05
+done
+if [ "$watch_ok" -ne 1 ]; then
+    cleanup_watch
+    echo "# --watch did not rebuild after file edit:"
+    cat "$watch_log"
+    exit 1
+fi
+# Add a new .valk file in the watched namespace directory
+cat > "$watch_dir/src/extra.valk" <<'EOF'
+fn watch_helper() int {
+    return 7
+}
+EOF
+watch_ok=0
+for _ in $(seq 1 100); do
+    if grep -q "New file:" "$watch_log" 2>/dev/null && grep -q "extra.valk" "$watch_log" 2>/dev/null; then
+        watch_ok=1
+        break
+    fi
+    sleep 0.05
+done
+cleanup_watch
+if [ "$watch_ok" -ne 1 ]; then
+    echo "# --watch did not detect newly created .valk file:"
+    cat "$watch_log"
+    exit 1
+fi
+
 echo "# CLI tests passed"
-echo "# Test count: 93"
+echo "# Test count: 94"

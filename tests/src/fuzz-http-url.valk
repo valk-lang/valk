@@ -1,0 +1,517 @@
+@ignore_access
+
+use valk.http
+use valk.url
+use valk.net
+use valk.sync
+use valk.compress
+
+class FuzzNetRng {
+    state: u64
+
+    static fn new(seed: u64) SELF {
+        return SELF { state: seed == 0 ? 0x9e3779b97f4a7c15 : seed }
+    }
+
+    fn next() u64 {
+        let x = this.state
+        x = x ^ (x >> 12)
+        x = x ^ (x << 25)
+        x = x ^ (x >> 27)
+        this.state = x
+        return x * 0x2545f4914f6cdd1d
+    }
+
+    fn range(n: uint) uint {
+        if n == 0 : return 0
+        return (this.next() % n.to(u64)).to(uint)
+    }
+
+    fn byte() u8 {
+        return (this.next() & 0xff).to(u8)
+    }
+
+    fn random_bytes(max_len: uint) String {
+        let len = this.range(max_len + 1)
+        let buf = ByteBuffer.new(len)
+        let i: uint = 0
+        while i < len {
+            buf.write_byte(this.byte())
+            i++
+        }
+        return buf.into_string()
+    }
+
+    fn mutate(seed_str: String, max_ops: uint (4)) String {
+        let buf = ByteBuffer.new(seed_str.bytes + 16)
+        buf.write(seed_str)
+        let ops = 1 + this.range(max_ops)
+        let op_i: uint = 0
+        while op_i < ops {
+            op_i++
+            let kind = this.range(7)
+            let len = buf.length
+            if kind == 0 && len > 0 {
+                let at = this.range(len)
+                let bit = (1 << this.range(8)).to(u8)
+                buf[at] = buf[at] ^ bit
+            } else if kind == 1 && len > 0 {
+                let at = this.range(len)
+                let special: [u8 x 24] = { 0, 1, 9, 10, 13, 32, 37, 43, 47, 58, 59, 61, 63, 64, 91, 92, 93, 126, 127, 128, 192, 224, 254, 255 }
+                let pick = this.range(2) == 0 ? special[this.range(24)] : this.byte()
+                buf[at] = pick
+            } else if kind == 2 && len > 0 {
+                let cut = this.range(len)
+                buf.truncate(cut)
+            } else if kind == 3 && len < 1024 {
+                let add = 1 + this.range(16)
+                let j: uint = 0
+                while j < add {
+                    buf.write_byte(this.byte())
+                    j++
+                }
+            } else if kind == 4 && len > 1 {
+                let start = this.range(len)
+                let count = 1 + this.range(len - start)
+                if count > 16 : count = 16
+                buf.clear_range(start, count)
+            } else if kind == 5 && len > 0 && len < 512 {
+                let start = this.range(len)
+                let count = 1 + this.range(len - start)
+                if count > 32 : count = 32
+                let copy = buf.view(start, count).to_string()
+                buf.write(copy)
+            } else if kind == 6 && len < 512 {
+                let tokens = Array[String]{
+                    "\r\n", "\r\n\r\n", "\n", "\r", "\x00", "\%", "\%00", "\%ZZ",
+                    ": ", "; ", "0\r\n\r\n", "ffffffffffffffff\r\n", "://", "../",
+                    "[::1]:", "65536", "+1", "-1", "bytes=0-", "q=0.0", "chunked"
+                }
+                buf.write(tokens[this.range(tokens.length)])
+            }
+        }
+        return buf.into_string()
+    }
+}
+
+fn fuzz_net_hex(text: String) String {
+    let out = ByteBuffer.new(text.bytes / 2)
+    let i: uint = 0
+    while i + 1 < text.bytes {
+        let hi = text[i]
+        let lo = text[i + 1]
+        let a = hi <= '9' ? hi - '0' : (hi >= 'a' ? hi - 'a' + 10 : hi - 'A' + 10)
+        let b = lo <= '9' ? lo - '0' : (lo >= 'a' ? lo - 'a' + 10 : lo - 'A' + 10)
+        out.write_byte((a << 4) | b)
+        i += 2
+    }
+    return out.into_string()
+}
+
+fn fuzz_net_ws_sender(srv: atomic net.TcpServer, frames: Array[String]) {
+    let i: uint = 0
+    while i < frames.length {
+        let con = srv.accept(2000 * TIME_SCALE) ! break
+        con.set_timeouts(500 * TIME_SCALE, 500 * TIME_SCALE)
+        con.write(frames[i]) ! {}
+        con.close() ! {}
+        i++
+    }
+    srv.close() ! {}
+}
+
+test "Fuzz HTTP/1.1: regressions for trailer limit, Context.reset, content_type_param, CookieJar Max-Age" {
+    // 1. Chunked trailer header limit must not underflow when header_size >= max_header_size
+    let tbuf = ByteBuffer.new(256)
+    let tctx = http.Context.new(tbuf)
+    tbuf.write("POST /t HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n")
+    http.parse_http(tbuf, tctx, false, 8192, 1024) ! {}
+    tbuf.write("X-Trailer: hello\r\n\r\n")
+    let got_431 = false
+    http.parse_http(tbuf, tctx, false, 10, 1024) ! { got_431 = E == .http431 }
+    assert(got_431)
+
+    // 2. Context.reset clears header_start and body_start before reuse
+    let rbuf = ByteBuffer.new(512)
+    let rctx = http.Context.new(rbuf)
+    rbuf.write("GET / HTTP/1.1\r\nHost: example.com\r\nX-Pad: " + "A".repeat(250) + "\r\n\r\n")
+    http.parse_http(rbuf, rctx, false, 8192, 1024) !!
+    assert(rctx.body_start > 250)
+    rctx.reset()
+    assert(rctx.header_start == 0 && rctx.body_start == 0)
+    rbuf.clear()
+    rctx.parsed_index = 0
+    rbuf.write("POST /c HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n")
+    http.parse_http(rbuf, rctx, false, 8192, 1024) !!
+    assert(rctx.done && rctx.body == "x")
+
+    // 3. content_type_param handles many quoted non-matching parameters without quadratic allocations
+    let ctb = ByteBuffer.new(32_768)
+    ctb.write("multipart/form-data")
+    each 0 .. 2000 : ctb.write("; a=\"x\"")
+    ctb.write("; boundary=\"final-bnd\"")
+    assert((http.content_type_param(ctb.into_string(), "boundary") ?? "") == "final-bnd")
+
+    // 4. CookieJar Max-Age near int.$max does not overflow signed int into negative
+    let jar = http.CookieJar {}
+    let cookie = http.Cookie.parse("big=val; Max-Age=9223372036854775807; Path=/") !!
+    jar.set("https://example.com/", cookie)
+    assert(jar.length == 1)
+}
+
+test "Fuzz HTTP/1.1: PRNG sweep across parser, cookies, dates, multipart, ranges, accept-encoding, router" {
+    let rng = FuzzNetRng.new(0x1111222233334444)
+    let req_seeds = Array[String]{
+        "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        "POST /api?a=1&b=2\%203 HTTP/1.1\r\nHost: [::1]:8080\r\nContent-Length: 7\r\nContent-Type: application/x-www-form-urlencoded\r\nCookie: a=1; b=\"c=d\"\r\n\r\nx=1&y=2",
+        "POST /up HTTP/1.1\r\nHost: 127.0.0.1:80\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\nConnection: keep-alive, close\r\n\r\n4;foo=bar\r\nWiki\r\n0\r\nX-End: 1\r\n\r\n",
+        "OPTIONS * HTTP/1.0\r\nConnection: keep-alive\r\n\r\n",
+        "POST /m HTTP/1.1\r\nHost: localhost\r\nContent-Type: multipart/form-data; boundary=\"abc\"\r\nContent-Length: 60\r\n\r\n--abc\r\nContent-Disposition: form-data; name=\"f\"\r\n\r\nval\r\n--abc--\r\n"
+    }
+    let resp_seeds = Array[String]{
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        "HTTP/1.0 204 No Content\r\n\r\n",
+        "HTTP/1.1 100 Continue\r\n\r\n"
+    }
+    let meta = http.file_meta(10_000, 1_700_000_000_000_000_000)
+    let router = http.Router[int].new()
+    router.add("GET", "/users/@id/posts/@post", 1)
+    router.add("GET", "/static/*", 2)
+
+    each 0 .. 1500 as i {
+        let is_resp = (i & 1) == 1
+        let raw = rng.range(4) == 0
+            ? rng.random_bytes(192)
+            : rng.mutate(is_resp ? resp_seeds[rng.range(resp_seeds.length)] : req_seeds[rng.range(req_seeds.length)], 5)
+        let b = ByteBuffer.new(raw.bytes)
+        b.write(raw)
+        let ctx = http.Context.new(b)
+        let ok = true
+        http.parse_http(b, ctx, is_resp, 1024, 1024) ! { ok = false }
+        if ok && ctx.done {
+            let _ = ctx.headers()
+            let _ = ctx.header("host") !? ""
+            let _ = ctx.query()
+            let _ = ctx.query_grouped()
+            let _ = ctx.query_param("a") !? ""
+            let _ = ctx.cookies()
+            let _ = ctx.form()
+            let _ = ctx.files()
+            let _ = ctx.body
+        }
+        // Incremental split delivery
+        if i % 5 == 0 && raw.bytes > 0 {
+            let b2 = ByteBuffer.new(raw.bytes)
+            let ctx2 = http.Context.new(b2)
+            let pos: uint = 0
+            while pos < raw.bytes {
+                let step = 1 + rng.range(12)
+                if step > raw.bytes - pos : step = raw.bytes - pos
+                b2.write(raw.view(pos, step))
+                pos += step
+                http.parse_http(b2, ctx2, is_resp, 1024, 1024) ! {
+                    if E == .incomplete : continue
+                    break
+                }
+                break
+            }
+        }
+        let _ = http.Cookie.parse(raw) !? null
+        let cmap = Map[String].new()
+        http.parse_cookie_header(raw, cmap)
+        let _ = http.parse_date(raw) !? null
+        let _ = http.content_media_type(raw)
+        let _ = http.content_type_param(raw, "boundary")
+        let _ = http.file_plan(meta, "text/plain", true, raw, raw, raw, raw, raw)
+        let _ = http.request_accepts_gzip(raw)
+        let _ = http.request_accepts_zstd(raw)
+        let _ = http.request_accepts_br(raw)
+        let _ = http.parse_proxy(raw) !? null
+        let _ = http.proxy_bypassed("example.com", raw)
+        let found = router.find("GET", raw) !? null
+        if isset(found) : let _ = found.params(raw)
+    }
+    assert(true)
+}
+
+test "Fuzz WebSocket: regressions, helper PRNG sweep, and adversarial frame decoding" {
+    // Regression: websocket_window_bits rejects leading '+'
+    assert(http.websocket_window_bits("+8") == 0)
+    assert(http.websocket_window_bits("+9") == 0)
+    assert(http.websocket_window_bits("8") == 8)
+    assert(http.websocket_window_bits("15") == 15)
+
+    let rng = FuzzNetRng.new(0x5555666677778888)
+    each 0 .. 1500 {
+        let s = rng.random_bytes(96)
+        let _ = http.websocket_utf8_is_valid(s)
+        let mb = ByteBuffer.new(s.bytes)
+        mb.write(s)
+        http.websocket_mask(mb.view(0, mb.length), rng.byte(), rng.byte(), rng.byte(), rng.byte())
+        let _ = http.websocket_deflate_params(s)
+        let _ = http.websocket_window_bits(s)
+        let _ = http.websocket_close_code_is_valid((rng.next() & 0xffff).to(u16))
+        let out = ByteBuffer.new(64)
+        let inb = ByteBuffer.new(s.bytes + 4)
+        inb.write(s)
+        inb.write("\x00\x00\xff\xff")
+        compress.inflate_message(inb, out, 2048) ! {}
+    }
+
+    // Adversarial + mutated frames over loopback TCP
+    let adv = Array[String]{
+        "", "\x81", "\x81\x7e", "\x81\x7f\x00\x00\x00",
+        "\x81\x7f\x80\x00\x00\x00\x00\x00\x00\x01a",
+        "\x81\x7f\xff\xff\xff\xff\xff\xff\xff\xff",
+        "\x81\x7f\x7f\xff\xff\xff\xff\xff\xff\xff",
+        "\x81\x85\x01\x02\x03\x04hello",
+        "\xc1\x01a", "\xa1\x01a", "\x91\x01a",
+        "\x08\x00", "\x09\x00", "\x0a\x00",
+        "\x89\x7e\x00\x7e" + "a".repeat(126),
+        "\x83\x00", "\x8b\x00", "\x80\x01a", "\x01\x01a\x81\x01b",
+        "\x88\x00", "\x88\x01\x03", "\x88\x02\x03\xed", "\x88\x04\x03\xe8\xff\xfe",
+        "\x81\x02\xff\xfe", "\x81\x03\xed\xa0\x80",
+        "\x01\x02he\x89\x02pi\x80\x03llo",
+        "\x82\x7e\x00\x05hello",
+        "\x82\x7e\x08\x00" + "x".repeat(2048),
+        "\xc1\x05\xff\xfe\xfd\xfc\xfb"
+    }
+    let frames = Array[String].new(adv.length + 32)
+    each adv as f : frames.append(f)
+    each 0 .. 32 {
+        let base = adv[rng.range(adv.length)]
+        frames.append(rng.range(3) == 0 ? rng.random_bytes(32) : rng.mutate(base, 4))
+    }
+
+    let srv = net.tcp_server("127.0.0.1", 0) !!
+    let port = (srv.local_address() !!).port
+    let sender = co fuzz_net_ws_sender(srv, frames)
+    each frames as _, k {
+        let con = net.tcp_client("127.0.0.1", port, 2000 * TIME_SCALE) ! break
+        con.set_timeouts(500 * TIME_SCALE, 500 * TIME_SCALE)
+        let ws = http.WebSocket {
+            con: con,
+            input: ByteBuffer.new(256),
+            is_client: (k & 1) == 0,
+            deflate_bits: (k % 5 == 0) ? 15 : 0,
+            max_message_size: 1024
+        }
+        if (k & 2) == 0 {
+            let _ = ws.read() !? null
+        } else {
+            let sink = ByteBuffer.new(64)
+            let _ = ws.read_into(sink) !? http.WebSocketMessageType.binary
+        }
+        ws.finish()
+    }
+    await sender
+    assert(true)
+}
+
+test "Fuzz HTTP2 & HPACK: regressions for Huffman allocation DoS, client window overflow, :status order, PUSH_PROMISE" {
+    // 1. HPACK Huffman caps reserve to limit and shrinks on error
+    http.hpack_huff_buf.shrink_capacity(256)
+    let big_huff = "0".repeat(200_000)
+    let got_limit = false
+    http.hpack_huffman_slice(big_huff, 32) ! { got_limit = E == .limit }
+    assert(got_limit)
+    assert(http.hpack_huff_buf.size <= 1024)
+
+    // 2. H2ClientConnection rejects connection WINDOW_UPDATE overflow, PUSH_PROMISE, and :status after regular header
+    let h2c = http.H2ClientConnection { con: @undefined }
+    let w = sync.Waker.new() !!
+    let st = http.H2ClientStream { id: 1, waker: w, send_window: 65_535 }
+    h2c.streams.set(1, st)
+    let wu_rejected = false
+    h2c.handle_frame(http.H2Frame { kind: http.H2_WINDOW_UPDATE, stream: 0, payload: http.h2_number(0x7fffffff) }) ! { wu_rejected = true }
+    assert(wu_rejected)
+    let pp_rejected = false
+    h2c.handle_frame(http.H2Frame { kind: http.H2_PUSH_PROMISE, flags: 4, stream: 1, payload: http.h2_number(2) + fuzz_net_hex("82") }) ! { pp_rejected = true }
+    assert(pp_rejected)
+    let bad_resp = Array[http.HpackField]{ .{ name: "x-a", value: "1" }, .{ name: ":status", value: "200" } }
+    h2c.handle_frame(http.H2Frame { kind: http.H2_HEADERS, flags: 5, stream: 1, payload: http.hpack_encode(bad_resp) !! }) ! {}
+    assert(!st.headers_done && st.done && !h2c.streams.has(1))
+
+    // 3. H2ClientConnection rejects SETTINGS_INITIAL_WINDOW_SIZE overflow
+    let h2c2 = http.H2ClientConnection { con: @undefined }
+    let w2 = sync.Waker.new() !!
+    let st2 = http.H2ClientStream { id: 1, waker: w2, send_window: 0x7fffffff }
+    h2c2.streams.set(1, st2)
+    let spayload = ByteBuffer.new(6)
+    spayload.write_u16_be(4)
+    spayload.write_u32_be(65_536)
+    let settings_overflow = false
+    h2c2.handle_frame(http.H2Frame { kind: http.H2_SETTINGS, payload: spayload.into_string() }) ! { settings_overflow = true }
+    assert(settings_overflow)
+}
+
+test "Fuzz HTTP2 & HPACK: PRNG sweep across HPACK, Huffman, frames, settings, and H2Session" {
+    let rng = FuzzNetRng.new(0x9999aaaabbbbcccc)
+    let seeds = Array[String]{
+        fuzz_net_hex("828684410f7777772e6578616d706c652e636f6d"),
+        fuzz_net_hex("828684418cf1e3c2e5f23a6ba0ab90f4ff"),
+        fuzz_net_hex("20828684400a637573746f6d2d6b65790c637573746f6d2d76616c7565"),
+        fuzz_net_hex("3fe11f82")
+    }
+    each 0 .. 2500 as i {
+        let raw = rng.range(3) == 0 ? rng.random_bytes(160) : rng.mutate(seeds[rng.range(seeds.length)], 5)
+        let _, _ = http.hpack_slice_int(raw, 0, 1 + rng.range(8)) !? (0, 0)
+        let _ = http.hpack_huffman_slice(raw, rng.range(512)) !? ""
+        let dec = http.HpackDecoder { max_header_size: 2048, max_block_size: 2048 }
+        if rng.range(5) == 0 : dec.set_limit(rng.range(256))
+        let _ = dec.decode(raw) !? Array[http.HpackField]{}
+
+        let reader = ByteReader.new(raw)
+        while reader.remaining().length > 0 {
+            let frame = http.h2_read_frame(reader, 16_384) ! break
+            let _ = frame.fragment() !? ""
+        }
+        let settings = http.H2Settings {}
+        settings.apply_raw(rng.byte(), (rng.next() & 0x7fffffff).to(u32), raw, (i & 1) == 0) ! {}
+
+        if i % 5 == 0 {
+            let sess = http.H2Session { max_body_size: 2048, max_buffered_body: 2048 }
+            sess.start()
+            sess.receive(http.H2Frame { kind: 4 }) ! {}
+            let steps = 1 + rng.range(8)
+            each 0 .. steps {
+                let kind = rng.range(11).to(u8)
+                let sid: u32 = rng.range(4) == 0 ? 0 : (1 + rng.range(5)).to(u32)
+                let _ = sess.receive(http.H2Frame { kind: kind, flags: rng.byte(), stream: sid, payload: rng.random_bytes(48) }) ! break
+            }
+        }
+    }
+    assert(true)
+}
+
+test "Fuzz HTTP/3 & QPACK: regressions and PRNG sweep across varint, QPACK, frames, and validation" {
+    // 1. QPACK rejects S=1 (negative base) and non-zero Delta Base when RIC=0
+    let bad_s = false
+    http.qpack_decode(fuzz_net_hex("0080d1"), 4096) ! { bad_s = E == .compression }
+    assert(bad_s)
+    let bad_db = false
+    http.qpack_decode(fuzz_net_hex("0005d1"), 4096) ! { bad_db = E == .compression }
+    assert(bad_db)
+
+    // 2. h3_validate_request_headers rejects +5 content-length, CRLF, bad method/scheme/fragment
+    let dst = http.H3ServerStream { conn: @undefined, ssl: @undefined }
+    assert(!http.h3_validate_request_headers(Array[http.HpackField]{
+        .{ name: ":method", value: "POST" }, .{ name: ":scheme", value: "https" },
+        .{ name: ":path", value: "/ok" }, .{ name: ":authority", value: "example.com" },
+        .{ name: "content-length", value: "+5" }
+    }, dst))
+    assert(!http.h3_validate_request_headers(Array[http.HpackField]{
+        .{ name: ":method", value: "GET" }, .{ name: ":scheme", value: "https" },
+        .{ name: ":path", value: "/ok\r\nX: 1" }, .{ name: ":authority", value: "example.com" }
+    }, dst))
+    assert(!http.h3_validate_request_headers(Array[http.HpackField]{
+        .{ name: ":method", value: "G E T" }, .{ name: ":scheme", value: "https" },
+        .{ name: ":path", value: "/" }, .{ name: ":authority", value: "example.com" }
+    }, dst))
+    assert(!http.h3_validate_request_headers(Array[http.HpackField]{
+        .{ name: ":method", value: "GET" }, .{ name: ":scheme", value: "javascript" },
+        .{ name: ":path", value: "/" }, .{ name: ":authority", value: "example.com" }
+    }, dst))
+    assert(!http.h3_validate_request_headers(Array[http.HpackField]{
+        .{ name: ":method", value: "GET" }, .{ name: ":scheme", value: "https" },
+        .{ name: ":path", value: "/a#frag" }, .{ name: ":authority", value: "example.com" }
+    }, dst))
+
+    // 3. H3ClientConnection rejects +200 status, DATA on control stream, and duplicate SETTINGS IDs
+    let h3c = http.H3ClientConnection { quic: @undefined }
+    let h3st = http.H3ClientStream {}
+    let qbuf = ByteBuffer.new(64)
+    http.qpack_encode(Array[http.HpackField]{ .{ name: ":status", value: "+200" } }, qbuf)
+    http.h3_write_frame_header(h3st.recv_buf, http.H3_FRAME_HEADERS, qbuf.length.to(u64))
+    h3st.recv_buf.write(qbuf.view(0, qbuf.length))
+    h3c.parse_response_frames(h3st)
+    assert(h3st.done && !h3st.headers_done)
+
+    let uni = http.H3UniStream { ssl: @undefined }
+    uni.buf.write(fuzz_net_hex("0004000000"))
+    assert(!h3c.process_uni_data(uni))
+
+    let h3c2 = http.H3ClientConnection { quic: @undefined }
+    let uni2 = http.H3UniStream { ssl: @undefined }
+    uni2.buf.write(fuzz_net_hex("00040406010602"))
+    assert(!h3c2.process_uni_data(uni2))
+
+    // 4. PRNG sweep
+    let rng = FuzzNetRng.new(0xddddeeeeffff0001)
+    let q_seeds = Array[String]{
+        fuzz_net_hex("0000d1d7c150096c6f63616c686f7374"),
+        fuzz_net_hex("00002c8825a849e95ba97d7f8925a849e95bb8e8b4bf"),
+        fuzz_net_hex("01040000d95f00000568656c6c6f")
+    }
+    let dummy_h3 = http.H3ClientConnection { quic: @undefined }
+    each 0 .. 2500 as i {
+        let raw = rng.range(3) == 0 ? rng.random_bytes(160) : rng.mutate(q_seeds[rng.range(q_seeds.length)], 5)
+        let ok, val, _ = http.h3_varint_try_read(raw, 0)
+        if ok {
+            let vb = ByteBuffer.new(8)
+            http.h3_varint_write(vb, val)
+            let ok2, val2, _ = http.h3_varint_try_read(vb.view(0, vb.length), 0)
+            assert(ok2 && val2 == val)
+        }
+        let decoded = http.qpack_decode(raw, rng.range(1024)) !? null
+        if isset(decoded) {
+            let re = ByteBuffer.new(64)
+            http.qpack_encode(decoded, re)
+            let decoded2 = http.qpack_decode(re.view(0, re.length), 0) !!
+            assert(decoded2.length == decoded.length)
+            let _ = http.h3_validate_request_headers(decoded, dst)
+            let _ = http.h3_validate_trailers(decoded)
+        }
+        if i % 3 == 0 {
+            let st = http.H3ClientStream { max_header_size: 1024, max_body_size: 1024 }
+            st.recv_buf.write(raw)
+            dummy_h3.parse_response_frames(st)
+        }
+        if i % 5 == 0 {
+            let u = http.H3UniStream { ssl: @undefined }
+            u.buf.write(raw)
+            let c = http.H3ClientConnection { quic: @undefined }
+            let _ = c.process_uni_data(u)
+        }
+    }
+}
+
+test "Fuzz URL: port overflow regression and PRNG sweep" {
+    // Regression: overflowing port stays in host instead of being silently stripped to null
+    let u_ovf = url.parse("http://example.com:99999999999999999999999999999/x")
+    assert(!isset(u_ovf.port))
+    assert(u_ovf.host == "example.com:99999999999999999999999999999")
+    assert(!http.request_host_is_safe(u_ovf.host))
+
+    let u_v6_ovf = url.parse("http://[::1]:99999999999999999999999999999/x")
+    assert(!isset(u_v6_ovf.port))
+    assert(u_v6_ovf.host == "[::1]:99999999999999999999999999999")
+    assert(!http.request_host_is_safe(u_v6_ovf.host))
+
+    let rng = FuzzNetRng.new(0xfeedfacecafebeef)
+    let seeds = Array[String]{
+        "https://user:pass@example.com:8080/a/b/../c?k=v\%201&k=2#frag",
+        "http://[2001:db8::1]:443/path\%2Fseg?a+b=c+d",
+        "//other.host/../../x/./y",
+        "http://evil.com\\@good.com:65536/a?b#c"
+    }
+    let base = url.parse("https://example.com:8443/a/b/c?x=1#top")
+    each 0 .. 3000 as i {
+        let s = rng.range(3) == 0 ? rng.random_bytes(160) : rng.mutate(seeds[rng.range(seeds.length)], 5)
+        let u = url.parse(s)
+        let _ = u.to_string()
+        let _ = base.resolve(s)
+        let _ = url.decode(s)
+        let _ = url.decode_path(s)
+        let _ = url.remove_dot_segments(u.path)
+        let qm = url.parse_query(u.query)
+        let _ = url.build_query(qm)
+        let qg = url.parse_query_grouped(s)
+        let _ = url.build_query_grouped(qg)
+        if i % 5 == 0 {
+            assert(url.decode(url.encode(s)) == s)
+            assert(url.decode_path(url.encode(s, url.Component.path)) == s)
+        }
+    }
+}
