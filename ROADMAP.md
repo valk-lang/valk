@@ -5,6 +5,9 @@
 
 ```
 - Release 0.9.3
++ Cleanup (compiler & stdlib): removed dead private code, unused fields/helpers/FFI constants, and unused `tagged-union.valk` across the compiler and standard library with zero public API breaking changes
++ Safety (compiler & stdlib): rewrote non-FFI `@unsafe` code in safe Valk across the compiler (`parser`, `hash`) and standard library (`core`, `compress`, `http`, `net`, `fs`, `io`, `crypto`, `time`, `json`) without performance loss
++ Docs: updated outdated inline and `///` API documentation comments across the compiler and standard library and regenerated `docs/api.md` and `docs/api-full.md`
 
 + Release 0.9.2
 + HTTP/3: added HTTP/3 over QUIC server and client support (`Server.http3`, `Client.http3`, `Options.http3`) backed by bundled OpenSSL 3.5 QUIC, with per-worker `SO_REUSEPORT` listeners, static file caching, compression, streaming, trailers, mTLS, and pooled multiplexed client connections
