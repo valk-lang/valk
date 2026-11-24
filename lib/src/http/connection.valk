@@ -95,6 +95,7 @@ class Connection {
 
         let tls_context = server.tls_context
         if isset(tls_context) {
+            if worker.connections > park_min_connections : this.netcon.ssl_release_buffers = true
             this.netcon.ssl_accept(tls_context, server.header_timeout_ms) ! {
                 this.finish()
                 return
@@ -109,7 +110,7 @@ class Connection {
 
         this.peer_address = this.netcon.peer_address() !? net.SocketAddress {}
         let ssl = this.netcon.ssl
-        let is_h2 = server.http2 && (isset(ssl) ? ssl.selected_alpn() == "h2" : !isset(tls_context))
+        let is_h2 = server.http2 && isset(ssl) && ssl.selected_alpn() == "h2"
         if is_h2 {
             let connection = H2Connection.new(this) ! {
                 this.finish()
@@ -175,6 +176,25 @@ class Connection {
                 this.active = true
                 res.send_bytes(this.netcon) ! {}
                 break
+            }
+            if server.http2 && !isset(this.netcon.ssl) && !this.served && input.length > 0 && input[0] == 'P' {
+                let preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+                let count = input.length < preface.bytes ? input.length : preface.bytes
+                let match_preface = count == preface.bytes
+                    ? input.view(0, count).equals(preface)
+                    : input.view(0, count).equals(preface.range(0, count))
+                if match_preface {
+                    if input.length < preface.bytes {
+                        let bytes = this.read_more(input, context, res) ! break
+                        if bytes == 0 : break
+                        continue
+                    }
+                    let connection = H2Connection.new(this) ! break
+                    this.h2 = connection
+                    connection.run(input)
+                    this.h2 = null
+                    break
+                }
             }
             parse_http(input, context, false, server.max_request_header_size, server.max_request_body_size) ! {
                 // Check if we need more data
@@ -351,12 +371,15 @@ class Connection {
         this.finish()
     }
 
-    // Whether the wait for the next request can happen without a coroutine: a plain
-    // connection on a worker with an epoll set, while the server runs
+    // Whether the wait for the next request can happen without a coroutine: a connection
+    // on a worker with an epoll set (or direct ring), while the server runs
     fn can_park() bool {
         #if OS == "linux"
-        return this.last_gap_ms >= PARK_GAP_MS && !isset(this.netcon.ssl) && this.worker.server.stopping == 0 && this.worker.parking
-            && this.worker.connections > park_min_connections
+        if this.last_gap_ms < PARK_GAP_MS || this.worker.server.stopping != 0 || !this.worker.parking
+            || this.worker.connections <= park_min_connections : return false
+        let ssl = this.netcon.ssl
+        if isset(ssl) && ssl.has_pending() : return false
+        return true
         #else
         return false
         #end
@@ -365,6 +388,11 @@ class Connection {
     // Parks the connection in the worker's epoll set; the coroutine then returns. False when
     // the set refused the descriptor, so the caller reads with the coroutine instead
     fn park() bool {
+        let ssl = this.netcon.ssl
+        if isset(ssl) {
+            ssl.enable_release_buffers()
+            if !ssl.free_buffers() : return false
+        }
         let worker = this.worker
         let now = time.mono_ms()
         worker.now = now

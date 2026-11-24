@@ -1,0 +1,395 @@
+use ext
+use io
+use core
+use time
+
+fn h3_alpn_select(ssl: OSSL, out: *ptr, length: *u8, input: ptr, size: u32, arg: ?ptr) i32 $entrance {
+    let offset: uint = 0
+    while offset < size {
+        let count = @ptrv(input, u8, offset).to(uint)
+        offset++
+        if count == 0 || count > size - offset : return 2
+        if count == 2 && @ptrv(input, u8, offset) == 'h' && @ptrv(input, u8, offset + 1) == '3' {
+            @ptrv(out, ptr, 0) = input.@offset(offset)
+            @ptrv(length, u8, 0) = 2
+            return 0
+        }
+        offset += count
+    }
+    return 2
+}
+
+fn quic_set_fd_nonblocking(fd: Fd) !NetError {
+    #if OS == "win"
+    @unsafe
+    let one: u32 = 1
+    if ext.ioctlsocket(fd, ext.FIONBIO, @ref(one).@cast(ptr)) != 0 : throw .io(.os)
+    #end
+}
+
+fn quic_event_timeout_ms(ssl: OSSL, max_ms: uint) uint {
+    @unsafe
+    let tv: ext.libc_timeval = @undefined
+    let is_infinite: i32 = 0
+    if SSL_get_event_timeout(ssl, @ref(tv), @ref(is_infinite)) != 1 : return max_ms
+    if is_infinite != 0 : return max_ms
+    let sec = tv.tv_sec.to(int)
+    let usec = tv.tv_usec.to(int)
+    if sec < 0 || (sec == 0 && usec <= 0) : return 0
+    let ms = sec.to(uint) * 1000 + ((usec.to(uint) + 999) / 1000)
+    return ms < max_ms ? ms : max_ms
+}
+
+// Waits for UDP socket readiness or `timeout_ms` without blocking other coroutines.
+fn quic_await_fd(fd: Fd, want_read: bool, want_write: bool, timeout_ms: uint) bool {
+    #if OS == "win"
+    if timeout_ms == 0 : return false
+    let deadline = time.deadline_ms(timeout_ms)
+    while true {
+        let pfd = ext.libc_pollfd {
+            fd: fd,
+            events: (want_read ? ext.POLLIN.to(i16) : 0) | (want_write ? ext.POLLOUT.to(i16) : 0),
+            revents: 0
+        }
+        let n = ext.poll(@ref(pfd), 1, 0)
+        if n != 0 : return n > 0
+        let now = time.mono_ms()
+        if now >= deadline : return false
+        let rem = deadline - now
+        time.sleep_ms(rem < 2 ? rem : 2)
+    }
+    #else
+    let ev = io.await_fd(fd, want_read, want_write, timeout_ms)
+    return !ev.is_timeout()
+    #end
+}
+
+fn quic_peer_cert(conn: OSSL) ?X509 {
+    @unsafe
+    let cert = SSL_get0_peer_certificate(conn)
+    if isset(cert) : return cert
+    let session = SSL_get_session(conn) ?! return null
+    return SSL_SESSION_get0_peer(session)
+}
+
+fn quic_peer_subject(conn: OSSL) String {
+    @unsafe
+    let cert = quic_peer_cert(conn) ?! return ""
+    let bio = BIO_new(BIO_s_mem()) ?! return ""
+    let written = X509_NAME_print_ex(bio, X509_get_subject_name(cert), 0, XN_FLAG_RFC2253)
+    if written <= 0 {
+        BIO_free(bio)
+        return ""
+    }
+    let data: ptr = @undefined
+    let length = BIO_ctrl(bio, BIO_CTRL_INFO, 0, @ref(data))
+    let text = length > 0 ? String.copy_from_ptr(data, length.to(uint)) : ""
+    BIO_free(bio)
+    return text
+}
+
+fn quic_peer_sha256(conn: OSSL) String {
+    @unsafe
+    let cert = quic_peer_cert(conn) ?! return ""
+    let digest: [u8 x 32] = { 0... }
+    let digest_length: u32 = 0
+    if X509_digest(cert, EVP_sha256(), @ref(digest).@cast(*u8), @ref(digest_length)) != 1
+        || digest_length != 32 : return ""
+    let output: [u8 x 64] = { 0... }
+    let i: uint = 0
+    while i < 32 {
+        let offset = i * 2
+        let length = digest[i].to_base_to_ptr(16, &output[offset], true)
+        if length == 1 {
+            output[offset + 1] = output[offset]
+            output[offset] = '0'
+        }
+        i++
+    }
+    return String.copy_from_ptr(@ref(output), 64)
+}
+
+class QuicServerContext {
+    ctx: SSL_CTX
+
+    static fn new(
+        certificate_file: String,
+        private_key_file: String,
+        cipher_suites: ?String (null)
+    ) atomic SELF !NetError {
+        @unsafe
+        let ctx = SSL_CTX_new(OSSL_QUIC_server_method())
+        if SSL_CTX_use_certificate_file(ctx, certificate_file.data_cstring, SSL_FILETYPE_PEM) != 1
+            || SSL_CTX_use_PrivateKey_file(ctx, private_key_file.data_cstring, SSL_FILETYPE_PEM) != 1
+            || SSL_CTX_check_private_key(ctx) != 1 {
+            SSL_CTX_free(ctx)
+            ERR_clear_error()
+            throw .ssl
+        }
+        if isset(cipher_suites) && SSL_CTX_set_ciphersuites(ctx, cipher_suites.data_cstring) != 1 {
+            SSL_CTX_free(ctx)
+            ERR_clear_error()
+            throw .ssl
+        }
+        SSL_CTX_set_alpn_select_cb(ctx, h3_alpn_select, null)
+        ERR_clear_error()
+        return SELF { ctx: ctx }
+    }
+
+    fn set_client_ca(ca_file: String, required: bool (true)) !NetError {
+        @unsafe
+        if SSL_CTX_load_verify_locations(this.ctx, ca_file.data_cstring, null) != 1 {
+            ERR_clear_error()
+            throw .ssl
+        }
+        let names = SSL_load_client_CA_file(ca_file.data_cstring)
+        if !isset(names) {
+            ERR_clear_error()
+            throw .ssl
+        }
+        SSL_CTX_set_client_CA_list(this.ctx, names)
+        SSL_CTX_set_verify(this.ctx, required ? SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT : SSL_VERIFY_PEER, null)
+    }
+
+    fn gc_free() {
+        @unsafe
+        SSL_CTX_free(this.ctx)
+    }
+}
+
+class QuicListener {
+    context: atomic QuicServerContext
+    fd: Fd
+    listener: OSSL
+    closed: bool (false)
+
+    static fn new(context: atomic QuicServerContext, host: String, port: u16, timeout_ms: uint (5000), reuse_port: bool (false)) atomic SELF !NetError {
+        @unsafe
+        let addrinfo = resolve_host(host, port, timeout_ms, true) !>
+        let fd = create_socket(true, false, addrinfo.is_ipv6()) !>
+        quic_set_fd_nonblocking(fd) ! {
+            close_fd_cleanup(fd, __FILE__, __LINE__)
+            throw E
+        }
+        bind_fd(fd, addrinfo, true, false, reuse_port) ! {
+            close_fd_cleanup(fd, __FILE__, __LINE__)
+            throw E
+        }
+        // Best-effort larger UDP buffers reduce datagram drops under bursty HTTP/3 load
+        let buf_sz: i32 = 4 * 1024 * 1024
+        ext.setsockopt(fd, ext.SOL_SOCKET, ext.SO_RCVBUF, @ref(buf_sz), size_of(i32))
+        ext.setsockopt(fd, ext.SOL_SOCKET, ext.SO_SNDBUF, @ref(buf_sz), size_of(i32))
+        let listener = SSL_new_listener(context.ctx, 0) ?! {
+            close_fd_cleanup(fd, __FILE__, __LINE__)
+            ERR_clear_error()
+            throw .ssl
+        }
+        let bio = BIO_new_dgram(fd.to(i32), BIO_NOCLOSE) ?! {
+            SSL_free(listener)
+            close_fd_cleanup(fd, __FILE__, __LINE__)
+            ERR_clear_error()
+            throw .ssl
+        }
+        SSL_set_bio(listener, bio, bio)
+        if SSL_set_blocking_mode(listener, 0) != 1 || SSL_listen(listener) != 1 {
+            SSL_free(listener)
+            close_fd_cleanup(fd, __FILE__, __LINE__)
+            ERR_clear_error()
+            throw .ssl
+        }
+        ERR_clear_error()
+        return SELF {
+            context: context,
+            fd: fd,
+            listener: listener
+        }
+    }
+
+    fn local_port() u16 !NetError {
+        if this.closed : throw .io(.closed)
+        let addr = local_address_of(this.fd) !>
+        return addr.port
+    }
+
+    fn handle_events() {
+        @unsafe
+        if !this.closed : SSL_handle_events(this.listener)
+    }
+
+    fn event_timeout_ms(max_ms: uint) uint {
+        @unsafe
+        if this.closed : return 0
+        return quic_event_timeout_ms(this.listener, max_ms)
+    }
+
+    fn read_desired() bool {
+        @unsafe
+        return !this.closed && SSL_net_read_desired(this.listener) != 0
+    }
+
+    fn write_desired() bool {
+        @unsafe
+        return !this.closed && SSL_net_write_desired(this.listener) != 0
+    }
+
+    fn accept_connection() ?OSSL {
+        @unsafe
+        if this.closed : return null
+        return SSL_accept_connection(this.listener, SSL_ACCEPT_CONNECTION_NO_BLOCK)
+    }
+
+    fn close() {
+        @unsafe
+        if this.closed : return
+        this.closed = true
+        SSL_free(this.listener)
+        close_fd(this.fd) ! core.cleanup_warning("Failed to close QUIC listener", __FILE__, __LINE__)
+    }
+
+    fn gc_free() {
+        @unsafe
+        if this.closed : return
+        this.closed = true
+        SSL_free(this.listener)
+        close_fd_cleanup(this.fd, __FILE__, __LINE__)
+    }
+}
+
+class QuicClient {
+    ssl: Ssl
+    fd: Fd
+    closed: bool (false)
+
+    static fn connect(host: String, port: u16, ssl: Ssl, timeout_ms: uint (5000)) SELF !NetError {
+        @unsafe
+        let deadline = timeout_ms > 0 ? time.deadline_ms(timeout_ms) : 0
+        let addrinfo = resolve_host(host, port, timeout_ms, true) !>
+        let peer_addr = SocketAddress.from_sockaddr(addrinfo.sock_addr().@cast(ptr), addrinfo.addr_len().to(uint)) !>
+        let fd = create_socket(true, false, addrinfo.is_ipv6()) !>
+        quic_set_fd_nonblocking(fd) ! {
+            close_fd_cleanup(fd, __FILE__, __LINE__)
+            throw E
+        }
+        #if OS == "win"
+        if !bind_any(fd, addrinfo.is_ipv6(), 0) {
+            close_fd_cleanup(fd, __FILE__, __LINE__)
+            throw .init
+        }
+        #end
+        if ext.connect(fd, addrinfo.sock_addr(), addrinfo.addr_len()) != 0 {
+            close_fd_cleanup(fd, __FILE__, __LINE__)
+            throw .connect
+        }
+        let bio_addr = peer_addr.to_bio_addr() ?! {
+            close_fd_cleanup(fd, __FILE__, __LINE__)
+            throw .ssl
+        }
+        let peer_ok = SSL_set1_initial_peer_addr(ssl.ssl, bio_addr) == 1
+        BIO_ADDR_free(bio_addr)
+        if !peer_ok {
+            close_fd_cleanup(fd, __FILE__, __LINE__)
+            ERR_clear_error()
+            throw .ssl
+        }
+        let bio = BIO_new_dgram(fd.to(i32), BIO_NOCLOSE) ?! {
+            close_fd_cleanup(fd, __FILE__, __LINE__)
+            ERR_clear_error()
+            throw .ssl
+        }
+        SSL_set_bio(ssl.ssl, bio, bio)
+        if SSL_set_blocking_mode(ssl.ssl, 0) != 1
+            || SSL_set_default_stream_mode(ssl.ssl, SSL_DEFAULT_STREAM_MODE_NONE) != 1
+            || SSL_set_incoming_stream_policy(ssl.ssl, SSL_INCOMING_STREAM_POLICY_ACCEPT, 0) != 1 {
+            close_fd_cleanup(fd, __FILE__, __LINE__)
+            ERR_clear_error()
+            throw .ssl
+        }
+        ssl.set_quic_connected(fd, false)
+
+        // Drive non-blocking QUIC handshake
+        while true {
+            ERR_clear_error()
+            let r = SSL_connect(ssl.ssl)
+            if r == 1 : break
+            let err = SSL_get_error(ssl.ssl, r)
+            if err != ERROR.WANT_READ && err != ERROR.WANT_WRITE {
+                ssl.update_error()
+                close_fd_cleanup(fd, __FILE__, __LINE__)
+                throw .ssl
+            }
+            let wait_ms: uint = 100
+            if deadline > 0 {
+                let now = time.mono_ms()
+                if now >= deadline {
+                    close_fd_cleanup(fd, __FILE__, __LINE__)
+                    throw .io(.timeout)
+                }
+                let rem = deadline - now
+                if rem < wait_ms : wait_ms = rem
+            }
+            let ev_ms = quic_event_timeout_ms(ssl.ssl, wait_ms)
+            if ev_ms > 0 {
+                let want_r = SSL_net_read_desired(ssl.ssl) != 0 || err == ERROR.WANT_READ
+                let want_w = SSL_net_write_desired(ssl.ssl) != 0 || err == ERROR.WANT_WRITE
+                quic_await_fd(fd, want_r, want_w, ev_ms)
+            }
+            SSL_handle_events(ssl.ssl)
+        }
+        ssl.set_quic_connected(fd, true)
+        return SELF {
+            ssl: ssl,
+            fd: fd
+        }
+    }
+
+    fn handle_events() {
+        @unsafe
+        if !this.closed : SSL_handle_events(this.ssl.ssl)
+    }
+
+    fn event_timeout_ms(max_ms: uint) uint {
+        @unsafe
+        if this.closed : return 0
+        return quic_event_timeout_ms(this.ssl.ssl, max_ms)
+    }
+
+    fn read_desired() bool {
+        @unsafe
+        return !this.closed && SSL_net_read_desired(this.ssl.ssl) != 0
+    }
+
+    fn write_desired() bool {
+        @unsafe
+        return !this.closed && SSL_net_write_desired(this.ssl.ssl) != 0
+    }
+
+    fn new_stream(uni: bool) ?OSSL {
+        @unsafe
+        if this.closed : return null
+        let flags: u64 = SSL_STREAM_FLAG_NO_BLOCK
+        if uni : flags = flags | SSL_STREAM_FLAG_UNI
+        return SSL_new_stream(this.ssl.ssl, flags)
+    }
+
+    fn accept_stream() ?OSSL {
+        @unsafe
+        if this.closed : return null
+        return SSL_accept_stream(this.ssl.ssl, SSL_ACCEPT_STREAM_NO_BLOCK)
+    }
+
+    fn close() {
+        @unsafe
+        if this.closed : return
+        this.closed = true
+        SSL_shutdown_ex(this.ssl.ssl, SSL_SHUTDOWN_FLAG_RAPID | SSL_SHUTDOWN_FLAG_NO_BLOCK, null, 0)
+        SSL_handle_events(this.ssl.ssl)
+        this.ssl.set_quic_connected(this.fd, false)
+        close_fd(this.fd) ! core.cleanup_warning("Failed to close QUIC client", __FILE__, __LINE__)
+    }
+
+    fn gc_free() {
+        if this.closed : return
+        this.closed = true
+        close_fd_cleanup(this.fd, __FILE__, __LINE__)
+    }
+}

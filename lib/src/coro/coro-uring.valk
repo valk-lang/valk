@@ -5,6 +5,7 @@
 use ext
 use io
 use gc
+use time
 
 fn side_event(payload: uint, res: i32, flags: u32, ring: uint) {
     // The extra rings have completions: read again, the scheduler reaps them
@@ -19,26 +20,7 @@ extend Coro {
     timeout_ts: io.kernel_timespec (@undefined)
 
     fn sleep(ns: uint) {
-        if io.use_epoll_backend() {
-            this.sleep_epoll(ns)
-            return
-        }
-        // The timeout is armed through a signed timespec, so a longer sleep is
-        // chained out of the longest chunks that still fit it
-        let limit = int.$max.to(uint)
-        while true {
-            let part = ns > limit ? limit : ns
-            let sqe = io.sqe(this) ! panic(io.uring_error == 0 ? "Failed to schedule coroutine sleep" : io.uring_failure(io.uring_error))
-            let nsec = part.to(int)
-            this.timeout_ts = {
-                tv_sec: nsec / 1_000_000_000
-                tv_nsec: (nsec % 1_000_000_000)
-            }
-            io.io_uring_prep_timeout(sqe, &this.timeout_ts, 0, 0)
-            this.yield()
-            if part == ns : break
-            ns -= part
-        }
+        this.sleep_epoll(ns)
     }
 
     // Drain io_uring completions, blocking when no coroutines are runnable.
@@ -53,29 +35,41 @@ extend Coro {
         if io.uring_unsubmitted > 0 && run_coros.length > 0 : io.uring_submit(ring)
         if io.extra_rings.length > 0 : io.submit_extra_rings()
         expire_parks()
+        if timers.length > 0 : run_timers(time.mono_ns())
         while true {
             let cqe: ?*ext.io_uring_cqe = null
             if run_coros.length == 0 {
                 // Completions of the extra rings first: they only ring the doorbell once per read
                 if io.extra_rings.length > 0 && reap_extra_rings() > 0 : continue
-                // A park deadline bounds the wait
-                let wait_ms = park_wait_ms()
+                // The nearest deadline, of a timer or a park, bounds the wait
+                let wait_ns: uint = uint.$max
+                if timers.length > 0 {
+                    let now = time.mono_ns()
+                    wait_ns = timer_wait_ns(now)
+                    if wait_ns == 0 {
+                        run_timers(now)
+                        continue
+                    }
+                }
+                let park_ms = park_wait_ms()
+                if park_ms != uint.$max && park_ms < wait_ns / 1_000_000 : wait_ns = park_ms * 1_000_000
                 gc.unlock()
-                if wait_ms == uint.$max && io.uring_unsubmitted > 0 {
+                if wait_ns == uint.$max && io.uring_unsubmitted > 0 {
                     // The doorbell read may have been queued again in this loop
                     let submitted = ext.io_uring_submit_and_wait(ring, 1)
                     if submitted == 0 - ext.EINTR || submitted == 0 - ext.EBUSY : submitted = 0
                     io.uring_record_submitted(ring, submitted)
                     io.io_uring_peek_cqe(ring, @ref(cqe))
-                } else if wait_ms == uint.$max {
+                } else if wait_ns == uint.$max {
                     io.io_uring_wait_cqe(ring, @ref(cqe))
                 } else {
                     if io.uring_unsubmitted > 0 : io.uring_submit(ring)
-                    let ts = io.kernel_timespec { tv_sec: (wait_ms / 1000).to(i64), tv_nsec: ((wait_ms % 1000) * 1_000_000).to(i64) }
+                    let ts = io.kernel_timespec { tv_sec: (wait_ns / 1_000_000_000).to(i64), tv_nsec: (wait_ns % 1_000_000_000).to(i64) }
                     let err = ext.io_uring_wait_cqe_timeout(ring, @ref(cqe), @ref(ts))
                     if err < 0 && err != 0 - ext.ETIME && err != 0 - ext.EINTR : panic("Failed to wait for an io_uring completion")
                 }
                 gc.lock()
+                if timers.length > 0 : run_timers(time.mono_ns())
             } else {
                 io.io_uring_peek_cqe(ring, @ref(cqe))
             }

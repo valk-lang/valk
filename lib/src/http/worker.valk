@@ -31,9 +31,9 @@ value BATCH_RATE_WINDOW_MS (100)
 // save little and hold every request they gather
 value BATCH_EXPECTED (4)
 // Serving coroutines kept per worker: each drains the ready queue, then waits on its waker for
-// the next batch. When all are busy, up to SERVE_EXTRA temporary ones per batch help out
-value SERVE_POOL_MAX (256)
-value SERVE_EXTRA (8)
+// the next batch. When all are busy, temporary ones help out up to SERVE_ACTIVE_MAX
+value SERVE_POOL_MAX (1024)
+value SERVE_ACTIVE_MAX (4096)
 value H2_SERVE_POOL_MAX (32)
 value SPARE_CONNECTIONS (64)
 // How often a worker checks whether it went idle. It is idle when it allocated less than
@@ -87,7 +87,7 @@ fn worker(server: atomic ServerWorkerData, worker_id: uint (0)) {
     #if URING
     // Plain connections live in this thread's io_uring table when it has one: they do not count
     // against the process's descriptor limit, and wait for their next request on a poll there
-    if !io.use_epoll_backend() && server.direct && !isset(server.tls_context) && !server.http2 && io.uring_files() > 0 : worker.side = coro.side_channel()
+    if !io.use_epoll_backend() && server.direct && !isset(server.tls_context) && io.uring_files() > 0 : worker.side = coro.side_channel()
     worker.direct = isset(worker.side)
     if worker.direct {
         #if TEST
@@ -240,6 +240,7 @@ class Worker {
     // Wakers of the serving coroutines that wait for work, and how many serving coroutines exist
     idle_servers: Array[sync.Waker] (.{})
     servers: uint (0)
+    overflow_servers: uint (0)
     // HTTP/2 connections with ready streams and the pool of coroutines serving them
     h2_ready: Deque[H2Connection] (.new())
     h2_idle_servers: Array[sync.Waker] (.{})
@@ -584,7 +585,7 @@ class Worker {
             }
             co this.watch_parked()
         }
-        if connection.input_signaled {
+        if connection.input_signaled || isset(connection.netcon.ssl) {
             connection.input_signaled = false
             let entry = ext.libc_pollfd { fd: fd, events: ext.POLLIN.to(i16), revents: 0 }
             if ext.poll(@ref(entry), 1, 0) != 0 : return false
@@ -782,8 +783,18 @@ class Worker {
             this.servers++
             co this.serve_loop(waker)
         }
-        if pending > SERVE_EXTRA : pending = SERVE_EXTRA
-        while pending-- > 0 : co this.serve_ready()
+        let active = this.servers + this.overflow_servers
+        let room = active < SERVE_ACTIVE_MAX ? SERVE_ACTIVE_MAX - active : 0
+        if pending > room : pending = room
+        while pending-- > 0 {
+            this.overflow_servers++
+            co this.serve_overflow()
+        }
+    }
+
+    fn serve_overflow() {
+        this.serve_ready()
+        this.overflow_servers--
     }
 
     // A serving coroutine: drains the ready queue, then waits for the watcher's wake
@@ -965,7 +976,7 @@ class Worker {
                 }
                 self_coro.on_yield_fn = null
                 self_coro.on_yield_arg = null
-                if conn.session.out_len() >= 16_384 {
+                if conn.session.out_len() >= H2_WRITE_BATCH {
                     if conn.ready_streams.length > 0 : this.h2_active_conn = conn
                     self_coro.on_yield_fn = worker_h2_on_yield
                     self_coro.on_yield_arg = this.@cast(ptr)

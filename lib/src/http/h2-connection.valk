@@ -12,6 +12,7 @@ global h2_test_end_reasons: Array[String] (.{})
 #end
 
 global h2_resp_headers: Array[HpackField] (.new(8))
+global h2_resp_trailers: Array[HpackField] (.new(4))
 global h2_chunk_pool: Array[ByteBuffer] (.{})
 global h2_small_ints: [String x 64] ({
     "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
@@ -151,7 +152,7 @@ class H2Connection {
                 break
             }
             out.clear()
-            if out.size > H2_WRITE_BATCH : out.shrink_capacity(8192)
+            if out.size > 262_144 : out.shrink_capacity(H2_WRITE_BATCH)
         }
         return !this.closed
     }
@@ -207,10 +208,11 @@ class H2Connection {
         return true
     }
 
-    fn run() {
+    fn run(initial: ?ByteBuffer (null)) {
         let socket = this.owner.netcon
         let settings = this.owner.worker.server
-        let input = ByteBuffer.new(4096)
+        let input = initial ?? ByteBuffer.new(4096)
+        let has_initial = isset(initial) && input.length > 0
         let preface = false
         let last_read = time.mono_ms()
         let header_started: uint = 0
@@ -268,48 +270,52 @@ class H2Connection {
                 this.end_reason = "drained"
                 break
             }
-            input.reserve(8192)
-            let fast_wait = preface && partial_since == 0 && header_started == 0 && this.session.receiving_streams == 0 && !this.session.draining
-            socket.read_timeout_ms = fast_wait ? 0 : 20
-            if fast_wait && this.handlers == 0 && settings.idle_timeout_ms > 0 {
-                this.owner.deadline_ms = last_read.checked_add(settings.idle_timeout_ms) !? uint.$max
+            if has_initial {
+                has_initial = false
             } else {
-                this.owner.deadline_ms = 0
-            }
-            this.waiting_idle_read = fast_wait
-            let use_ready = immediate_reads < 16
-            immediate_reads = use_ready ? immediate_reads + 1 : 0
-            let received = h2_socket_read(socket, input.view_spare(8192), use_ready) ! {
+                input.reserve(8192)
+                let fast_wait = preface && partial_since == 0 && header_started == 0 && this.session.receiving_streams == 0 && !this.session.draining
+                socket.read_timeout_ms = fast_wait ? 0 : 20
+                if fast_wait && this.handlers == 0 && settings.idle_timeout_ms > 0 {
+                    this.owner.deadline_ms = last_read.checked_add(settings.idle_timeout_ms) !? uint.$max
+                } else {
+                    this.owner.deadline_ms = 0
+                }
+                this.waiting_idle_read = fast_wait
+                let use_ready = immediate_reads < 16
+                immediate_reads = use_ready ? immediate_reads + 1 : 0
+                let received = h2_socket_read(socket, input.view_spare(8192), use_ready) ! {
+                    this.waiting_idle_read = false
+                    let idle_expired = this.owner.deadline_ms > 0 && time.mono_ms() >= this.owner.deadline_ms
+                    this.owner.deadline_ms = 0
+                    if this.closed : break
+                    if idle_expired {
+                        this.end_reason = "idle for " + (time.mono_ms() - last_read) + " ms"
+                        break
+                    }
+                    if E != .timeout {
+                        let ssl_detail = socket.ssl
+                        let kind = E == .closed ? "closed" : (E == .cancelled ? "cancelled" : "error")
+                        this.end_reason = "read failed (" + kind + ")" + (isset(ssl_detail) ? ": " + ssl_detail.get_error_message() : "")
+                        break
+                    }
+                    let limit = input.length > 0 || !preface ? settings.header_timeout_ms : settings.idle_timeout_ms
+                    if this.handlers == 0 && limit > 0 && time.mono_ms() - last_read >= limit {
+                        this.end_reason = "idle for " + (time.mono_ms() - last_read) + " ms"
+                        break
+                    }
+                    continue
+                }
                 this.waiting_idle_read = false
-                let idle_expired = this.owner.deadline_ms > 0 && time.mono_ms() >= this.owner.deadline_ms
                 this.owner.deadline_ms = 0
-                if this.closed : break
-                if idle_expired {
-                    this.end_reason = "idle for " + (time.mono_ms() - last_read) + " ms"
+                if received == 0 {
+                    this.end_reason = "peer closed"
                     break
                 }
-                if E != .timeout {
-                    let ssl_detail = socket.ssl
-                    let kind = E == .closed ? "closed" : (E == .cancelled ? "cancelled" : "error")
-                    this.end_reason = "read failed (" + kind + ")" + (isset(ssl_detail) ? ": " + ssl_detail.get_error_message() : "")
-                    break
-                }
-                let limit = input.length > 0 || !preface ? settings.header_timeout_ms : settings.idle_timeout_ms
-                if this.handlers == 0 && limit > 0 && time.mono_ms() - last_read >= limit {
-                    this.end_reason = "idle for " + (time.mono_ms() - last_read) + " ms"
-                    break
-                }
-                continue
+                last_read = time.mono_ms()
+                this.owner.worker.now = last_read
+                input.skip(received)
             }
-            this.waiting_idle_read = false
-            this.owner.deadline_ms = 0
-            if received == 0 {
-                this.end_reason = "peer closed"
-                break
-            }
-            last_read = time.mono_ms()
-            this.owner.worker.now = last_read
-            input.skip(received)
             if !preface {
                 let expected = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
                 let count = input.length < expected.bytes ? input.length : expected.bytes
@@ -659,9 +665,20 @@ class H2Connection {
                 h2_file_plan_fields(headers, plan)
             }
         }
+        let trailer_headers = response.trailer_list
+        let trailers = h2_resp_trailers
+        trailers.clear()
+        if isset(trailer_headers) {
+            each trailer_headers as value, name {
+                if response_header_is_framing(name) : continue
+                let field = HpackField { name: name.lower(), value: value, never_index: true }
+                if h2_regular_field(field) : trailers.append(field)
+            }
+        }
+        let has_trailers = trailers.length > 0
         if status != 304 || !isset(plan) {
             if response_header_value_is_safe(content_type) : headers.append(.{ name: "content-type", value: content_type })
-            if status != 204 && !open_body : headers.append(.{ name: "content-length", value: h2_uint_str(size) })
+            if status != 204 && !open_body && !has_trailers : headers.append(.{ name: "content-length", value: h2_uint_str(size) })
         }
         if isset(extra) {
             each extra as value, name {
@@ -679,17 +696,25 @@ class H2Connection {
             headers.append(.{ name: "content-disposition", value: disposition.into_string() })
         }
         let no_body = request.method == "HEAD" || status == 204 || status == 304 || (size == 0 && !open_body)
-        this.session.send_headers(stream, headers, no_body) !>
-        if no_body : return
+        this.session.send_headers(stream, headers, no_body && !has_trailers) !>
+        if no_body {
+            if has_trailers : this.session.send_trailers(stream, trailers) !>
+            return
+        }
         if open_body && isset(source) {
             if !this.flush() : return
             let chunk_buf = h2_take_chunk_buf()
             defer h2_give_chunk_buf(chunk_buf)
             while !stream.cancelled && !this.closed {
                 let read = read_body_piece(source, chunk_buf.view_spare(16_384)) ! throw .protocol
-                if !this.send_all_data_slice(stream, chunk_buf.view_spare(16_384).view(0, read), read == 0) !> : return
+                if read == 0 {
+                    if has_trailers : this.session.send_trailers(stream, trailers) !>
+                    else if !this.send_all_data_slice(stream, chunk_buf.view_spare(16_384).view(0, 0), true) !> : return
+                    if !this.flush() : return
+                    return
+                }
+                if !this.send_all_data_slice(stream, chunk_buf.view_spare(16_384).view(0, read), false) !> : return
                 if !this.flush() : return
-                if read == 0 : return
             }
             return
         }
@@ -703,12 +728,14 @@ class H2Connection {
                 if amount > 16_384 : amount = 16_384
                 let read = source.read(chunk_buf.view_spare(amount)) ! throw .protocol
                 if read == 0 || read > amount : throw .protocol
-                if !this.send_all_data_slice(stream, chunk_buf.view_spare(amount).view(0, read), offset + read == size) !> : return
+                if !this.send_all_data_slice(stream, chunk_buf.view_spare(amount).view(0, read), !has_trailers && offset + read == size) !> : return
                 offset += read
             }
+            if has_trailers && !stream.cancelled && !this.closed : this.session.send_trailers(stream, trailers) !>
             return
         }
-        this.send_all_data_slice(stream, body.view(0, size), true) !>
+        if !this.send_all_data_slice(stream, body.view(0, size), !has_trailers) !> : return
+        if has_trailers : this.session.send_trailers(stream, trailers) !>
     }
 
     fn wake_window_waiters() {

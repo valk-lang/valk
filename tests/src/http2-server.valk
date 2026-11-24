@@ -835,3 +835,101 @@ test "HTTP2 client: h2c requests, large flow control, headers, gzip, redirect, o
     server.request_shutdown(1000)
     await running !!
 }
+
+test "HTTP2: response trailers and mixed HTTP/1.1 + h2c on the same plaintext port" {
+    let handler: atomic fn(http.Request)(http.Response) = fn(req: http.Request) http.Response {
+        if req.path == "/grpc" {
+            let res = http.Response.new("payload", 200, "application/grpc")
+            res.set_trailer("grpc-status", "0")
+            res.add_trailer("grpc-message", "ok")
+            return res
+        }
+        if req.path == "/trailers-only" {
+            let res = http.Response.new("", 200, "application/grpc")
+            res.set_trailer("grpc-status", "12")
+            return res
+        }
+        return http.Response.text("h1:" + req.path)
+    }
+
+    let server = http.Server.new("127.0.0.1", 19193, handler)
+    server.http2 = true
+    let running = co server.start(1)
+    time.sleep_ms(20)
+
+    // Plain HTTP/1.1 still works on the same server.http2 plaintext port
+    let h1_res = http.get("http://127.0.0.1:19193/plain") !!
+    assert(h1_res.status == 200 && h1_res.body == "h1:/plain")
+
+    // Raw h2c prior-knowledge verifies HEADERS + DATA (no END_STREAM) + trailing HEADERS (END_STREAM)
+    let socket = net.tcp_client("127.0.0.1", 19193) !!
+    socket.read_timeout_ms = 2000
+    socket.write("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") !!
+    socket.write(http.H2Frame { kind: 4 }.encode() !!) !!
+    let encoder = http.HpackEncoder {}
+    let req1 = encoder.encode(.{
+        http.HpackField { name: ":method", value: "POST" },
+        http.HpackField { name: ":scheme", value: "http" },
+        http.HpackField { name: ":path", value: "/grpc" },
+        http.HpackField { name: ":authority", value: "127.0.0.1:19193" }
+    }, 65_536) !!
+    socket.write(http.H2Frame { kind: 1, flags: 5, stream: 1, payload: req1 }.encode() !!) !!
+    let req3 = encoder.encode(.{
+        http.HpackField { name: ":method", value: "POST" },
+        http.HpackField { name: ":scheme", value: "http" },
+        http.HpackField { name: ":path", value: "/trailers-only" },
+        http.HpackField { name: ":authority", value: "127.0.0.1:19193" }
+    }, 65_536) !!
+    socket.write(http.H2Frame { kind: 1, flags: 5, stream: 3, payload: req3 }.encode() !!) !!
+
+    let input = ByteBuffer.new()
+    let decoder = http.HpackDecoder {}
+    let s1_headers = false
+    let s1_data = ""
+    let s1_trailer_status = ""
+    let s1_trailer_msg = ""
+    let s1_done = false
+    let s3_trailer_status = ""
+    let s3_done = false
+    while !s1_done || !s3_done {
+        let frame = h2_tls_frame(socket, input, "trailers response")
+        if frame.kind == 4 && (frame.flags & 1) == 0 {
+            socket.write(http.H2Frame { kind: 4, flags: 1 }.encode() !!) !!
+            continue
+        }
+        if frame.stream == 1 {
+            if frame.kind == 1 {
+                let fields = decoder.decode(frame.payload) !!
+                if !s1_headers {
+                    s1_headers = true
+                    assert((frame.flags & 1) == 0)
+                } else {
+                    assert((frame.flags & 1) != 0)
+                    each fields as f {
+                        if f.name == "grpc-status" : s1_trailer_status = f.value
+                        if f.name == "grpc-message" : s1_trailer_msg = f.value
+                    }
+                    s1_done = true
+                }
+            } else if frame.kind == 0 {
+                assert((frame.flags & 1) == 0)
+                s1_data += frame.payload
+            }
+        } else if frame.stream == 3 && frame.kind == 1 {
+            let fields = decoder.decode(frame.payload) !!
+            if (frame.flags & 1) != 0 {
+                each fields as f {
+                    if f.name == "grpc-status" : s3_trailer_status = f.value
+                }
+                s3_done = true
+            }
+        }
+    }
+    assert(s1_headers && s1_data == "payload")
+    assert(s1_trailer_status == "0" && s1_trailer_msg == "ok")
+    assert(s3_trailer_status == "12")
+
+    socket.close() !!
+    server.request_shutdown(1000)
+    await running !!
+}

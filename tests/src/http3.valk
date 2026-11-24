@@ -1,0 +1,314 @@
+@ignore_access
+use valk.http
+use valk.fs
+use valk.time
+
+fn h3_test_handler(req: http.Request) http.Response {
+    if req.path == "/hello" {
+        let res = http.Response.text("hello-h3:" + req.query_string)
+        res.set_header("X-Req-Hdr", req.header("x-test") !? "none")
+        return res
+    }
+    if req.path == "/echo" {
+        return http.Response.text(req.method + ":" + req.body)
+    }
+    if req.path == "/large" {
+        let buf = ByteBuffer.new(262_144)
+        each 0 .. 4096 : buf.write("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        return http.Response.text(buf.into_string())
+    }
+    if req.path == "/stream" {
+        let pieces = Array[String].new(100)
+        let chunk = "stream-chunk-0123456789-abcdef-0123456789-abcdef-0123456789-abcd".repeat(16)
+        each 0 .. 100 : pieces.append(chunk)
+        return http.Response.stream(PieceReader { pieces: pieces }, content_type: "text/plain")
+    }
+    if req.path == "/compress" {
+        let buf = ByteBuffer.new(4096)
+        each 0 .. 128 : buf.write("compressible-http3-payload-text-")
+        return http.Response.text(buf.into_string())
+    }
+    if req.path == "/trailers" {
+        let res = http.Response.text("with-trailers")
+        res.set_trailer("X-Checksum", "abc123")
+        return res
+    }
+    if req.path == "/redirect" {
+        return http.Response.redirect("/hello?from=redirect", 302)
+    }
+    if req.path == "/set-cookie" {
+        let res = http.Response.text("cookie-set")
+        res.set_header("Set-Cookie", "sid=h3token; Path=/")
+        return res
+    }
+    if req.path == "/check-cookie" {
+        return http.Response.text("cookie=" + (req.header("cookie") !? "none"))
+    }
+    if req.path == "/slow" {
+        time.sleep_ms(30)
+        return http.Response.text("slow:" + req.query_string)
+    }
+    if req.path == "/mtls" {
+        return http.Response.text(req.client_subject + "|" + req.client_certificate_sha256)
+    }
+    return http.Response.text("not-found", 404)
+}
+
+fn h3_run_server(srv: http.Server) {
+    srv.start(1) ! {}
+}
+
+fn h3_start_test_server(port: u16, compress: bool (false), with_h2: bool (false)) http.Server {
+    let srv = http.Server.new("127.0.0.1", port, h3_test_handler)
+    srv.tls(tls_cert_path(), tls_key_path()) !!
+    srv.http3 = true
+    srv.http2 = with_h2
+    srv.compress = compress
+    co h3_run_server(srv)
+    time.sleep_ms(120)
+    return srv
+}
+
+test "HTTP/3: varint and QPACK static/Huffman codec" {
+    // QUIC varints across all 4 encodings (1, 2, 4, 8 bytes)
+    let samples = Array[u64]{ 0, 1, 63, 64, 16_383, 16_384, 1_073_741_823, 1_073_741_824, 4_611_686_018_427_387_903 }
+    let buf = ByteBuffer.new(64)
+    each samples as v {
+        buf.clear()
+        http.h3_varint_write(buf, v)
+        assert(buf.length == http.h3_varint_size(v))
+        let ok, decoded, next = http.h3_varint_try_read(buf.view(0, buf.length), 0)
+        assert(ok && decoded == v && next == buf.length)
+        // Truncated buffer returns ok=false
+        if buf.length > 1 {
+            let ok2, _, _ = http.h3_varint_try_read(buf.view(0, buf.length - 1), 0)
+            assert(!ok2)
+        }
+    }
+
+    // QPACK round-trip with static exact, static name-ref, and literal headers
+    let fields = Array[http.HpackField]{
+        .{ name: ":method", value: "GET" },
+        .{ name: ":scheme", value: "https" },
+        .{ name: ":authority", value: "example.com" },
+        .{ name: ":path", value: "/api/v1?x=1" },
+        .{ name: "content-type", value: "application/json" },
+        .{ name: "x-custom-hdr", value: "hello world" }
+    }
+    let enc = ByteBuffer.new(128)
+    http.qpack_encode(fields, enc)
+    let dec = http.qpack_decode(enc.view(0, enc.length), 8192) !!
+    assert(dec.length == fields.length)
+    each fields as f, i {
+        assert(dec[i].name == f.name && dec[i].value == f.value)
+    }
+
+    // QPACK decode of Huffman-encoded literal name + value (RFC 9204 §4.5.6)
+    // Prefix: 0x00 0x00
+    // Literal name with H=1, len=2 ("a" -> 0x1f? use Huffman "www" = 0xf1e3? Actually use RFC 7541 example: "www.example.com" = f1 e3 c2 e5 f2 3a 6b a0 ab 90 f4 ff (12 bytes))
+    // Static name ref index 0 (:authority) with H=1 value: 0x50 (01 0 1 0000), 0x8c (H=1, len=12), bytes...
+    let huff = ByteBuffer.new(32)
+    huff.write_byte(0x00)
+    huff.write_byte(0x00)
+    huff.write_byte(0x50)
+    huff.write_byte(0x8c)
+    let raw_huff = [u8]{ 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff }
+    huff.write(raw_huff)
+    let hdec = http.qpack_decode(huff.view(0, huff.length), 8192) !!
+    assert(hdec.length == 1 && hdec[0].name == ":authority" && hdec[0].value == "www.example.com")
+
+    // Reject non-zero Required Insert Count when dynamic table capacity is 0
+    let bad_ric = [u8]{ 0x01, 0x00, 0xd1 }
+    let ric_failed = false
+    http.qpack_decode(bad_ric, 8192) ! { ric_failed = true }
+    assert(ric_failed)
+}
+
+test "HTTP/3: server validation requires TLS and regular handler" {
+    let no_tls = http.Server.new("127.0.0.1", 0, h3_test_handler)
+    no_tls.http3 = true
+    let failed_tls = false
+    no_tls.start(1) ! { failed_tls = true }
+    assert(failed_tls)
+
+    let fast = http.Server.new("127.0.0.1", 0)
+    fast.tls(tls_cert_path(), tls_key_path()) !!
+    fast.http3 = true
+    fast.fast(fn(ctx: http.Context, res: http.ResponseWriter) { res.send("hi") })
+    let failed_fast = false
+    fast.start(1) ! { failed_fast = true }
+    assert(failed_fast)
+}
+
+test "HTTP/3: GET, POST, HEAD, headers, trailers, large body, streaming, compression" {
+    let port: u16 = 29443
+    let srv = h3_start_test_server(port, true, true)
+    defer srv.shutdown(2000)
+
+    let client = http.Client.new()
+    client.http3 = true
+    defer client.close()
+
+    let base = "https://127.0.0.1:" + port
+
+    // GET + custom header + query string
+    let opts = http.Options { verify_tls_cert: false }
+    opts.set_header("X-Test", "abc")
+    let r1 = client.get(base + "/hello?k=v", opts) !!
+    assert(r1.status == 200)
+    assert(r1.body == "hello-h3:k=v")
+    assert((r1.headers.get("x-req-hdr") !? "") == "abc")
+
+    // POST + body
+    let r2 = client.post(base + "/echo", "hello-body-123", http.Options { verify_tls_cert: false }) !!
+    assert(r2.status == 200 && r2.body == "POST:hello-body-123")
+
+    // HEAD returns headers without body
+    let r3 = client.head(base + "/large", http.Options { verify_tls_cert: false, decompress: false }) !!
+    assert(r3.status == 200 && r3.body.bytes == 0)
+    assert((r3.headers.get("content-length") !? "") == "262144")
+
+    // Large 256 KiB response body
+    let r4 = client.get(base + "/large", http.Options { verify_tls_cert: false }) !!
+    assert(r4.status == 200 && r4.body.bytes == 262_144)
+
+    // Streaming response into Options.output writer (>100 KiB exercises backpressure)
+    let sink = ByteBuffer.new(102_400)
+    let stream_opts = http.Options { verify_tls_cert: false, output: sink }
+    let r5 = client.get(base + "/stream", stream_opts) !!
+    assert(r5.status == 200 && r5.body.bytes == 0 && sink.length == 102_400)
+
+    // Compression (auto-decompressed by client, and raw when decompress=false)
+    let r6 = client.get(base + "/compress", http.Options { verify_tls_cert: false, decompress: true }) !!
+    assert(r6.status == 200 && r6.body.bytes == 4096 && r6.body.starts_with("compressible-http3-payload-text-"))
+    let raw_opts = http.Options { verify_tls_cert: false, decompress: false }
+    raw_opts.set_header("Accept-Encoding", "gzip")
+    let r7 = client.get(base + "/compress", raw_opts) !!
+    assert(r7.status == 200 && (r7.headers.get("content-encoding") !? "") == "gzip" && r7.body.bytes < 512)
+
+    // Response with trailing HEADERS frame
+    let r8 = client.get(base + "/trailers", http.Options { verify_tls_cert: false }) !!
+    assert(r8.status == 200 && r8.body == "with-trailers")
+
+    // Redirects and cookies across HTTP/3 requests
+    let r9 = client.get(base + "/redirect", http.Options { verify_tls_cert: false }) !!
+    assert(r9.status == 200 && r9.body == "hello-h3:from=redirect")
+    let r10 = client.get(base + "/set-cookie", http.Options { verify_tls_cert: false }) !!
+    assert(r10.status == 200)
+    let r11 = client.get(base + "/check-cookie", http.Options { verify_tls_cert: false }) !!
+    assert(r11.status == 200 && r11.body.contains("sid=h3token"))
+
+    // Same server simultaneously handles HTTP/2 on TCP and HTTP/3 on UDP
+    let h2_res = http.get(base + "/hello?proto=h2", http.Options { verify_tls_cert: false, http2: true }) !!
+    assert(h2_res.status == 200 && h2_res.body == "hello-h3:proto=h2")
+}
+
+fn h3_concurrent_req(client: http.Client, url: String) String {
+    let res = client.get(url, http.Options { verify_tls_cert: false }) ! return "ERR"
+    return res.body
+}
+
+test "HTTP/3: multiplexed concurrent streams on one pooled connection" {
+    let port: u16 = 29444
+    let srv = h3_start_test_server(port)
+    defer srv.shutdown(2000)
+
+    let client = http.Client.new()
+    client.http3 = true
+    defer client.close()
+
+    let base = "https://127.0.0.1:" + port
+    // Warm up one connection
+    let warm = client.get(base + "/hello?warm", http.Options { verify_tls_cert: false }) !!
+    assert(warm.body == "hello-h3:warm")
+
+    let tasks = Array[co(String)]{}
+    each 0 .. 12 as i {
+        tasks.append(co h3_concurrent_req(client, base + "/slow?n=" + i))
+    }
+    each tasks as task, i {
+        let got = await task
+        assert(got == "slow:n=" + i)
+    }
+}
+
+test "HTTP/3: TLS verification, certificate pinning, and mutual TLS" {
+    let port: u16 = 29445
+    let srv = http.Server.new("127.0.0.1", port, h3_test_handler)
+    srv.tls(tls_cert_path(), tls_key_path()) !!
+    srv.tls_client_ca(tls_cert_path(), false) !!
+    srv.http3 = true
+    co h3_run_server(srv)
+    time.sleep_ms(120)
+    defer srv.shutdown(2000)
+
+    let base = "https://127.0.0.1:" + port
+
+    // Default verify rejects self-signed server cert
+    let rejected = false
+    http.get(base + "/hello", http.Options { http3: true, timeout_ms: 2000 }) ! { rejected = true }
+    assert(rejected)
+
+    // Matching SHA-256 certificate pin succeeds; wrong pin fails
+    let pinned = http.get(base + "/hello?pin", http.Options {
+        http3: true,
+        verify_tls_cert: false,
+        certificate_sha256: tls_cert_sha256()
+    }) !!
+    assert(pinned.status == 200 && pinned.body == "hello-h3:pin")
+
+    let bad_pin = false
+    http.get(base + "/hello", http.Options {
+        http3: true,
+        verify_tls_cert: false,
+        certificate_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    }) ! { bad_pin = true }
+    assert(bad_pin)
+
+    // Mutual TLS with CA verification and client certificate
+    let mtls_res = http.get(base + "/mtls", http.Options {
+        http3: true,
+        ca_cert_path: tls_cert_path(),
+        client_certificate_file: tls_asset("tls-client-cert.pem"),
+        client_key_file: tls_asset("tls-client-key.pem")
+    }) !!
+    assert(mtls_res.status == 200 && mtls_res.body.starts_with("CN=alice,O=Example\\, Inc.|b4580d34"))
+}
+
+test "HTTP/3: static files with ETag, 304, and 206 Range" {
+    let dir = fs.create_temp_dir("valk-h3-static-") !!
+    let filepath = fs.add(dir, "sample.txt")
+    fs.write(filepath, "0123456789abcdefghijklmnopqrstuvwxyz") !!
+    defer fs.delete_all(dir) ! {}
+
+    let port: u16 = 29446
+    let srv = http.Server.new("127.0.0.1", port, h3_test_handler)
+    srv.tls(tls_cert_path(), tls_key_path()) !!
+    srv.http3 = true
+    srv.add_static_dir(dir, "", "/static") !!
+    co h3_run_server(srv)
+    time.sleep_ms(120)
+    defer srv.shutdown(2000)
+
+    let client = http.Client.new()
+    client.http3 = true
+    defer client.close()
+
+    let url = "https://127.0.0.1:" + port + "/static/sample.txt"
+    let r1 = client.get(url, http.Options { verify_tls_cert: false }) !!
+    assert(r1.status == 200 && r1.body == "0123456789abcdefghijklmnopqrstuvwxyz")
+    let etag = r1.headers.get("etag") !? ""
+    assert(etag.bytes > 0)
+
+    // Conditional 304
+    let cond = http.Options { verify_tls_cert: false }
+    cond.set_header("If-None-Match", etag)
+    let r2 = client.get(url, cond) !!
+    assert(r2.status == 304 && r2.body.bytes == 0)
+
+    // Partial 206 Range
+    let rng = http.Options { verify_tls_cert: false }
+    rng.set_header("Range", "bytes=10-19")
+    let r3 = client.get(url, rng) !!
+    assert(r3.status == 206 && r3.body == "abcdefghij")
+}

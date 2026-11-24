@@ -107,7 +107,7 @@ use html
                 default => throw E
             }
         }
-        let renderer = Renderer { engine: this, options: options, root: json.from(data) }
+        let renderer = Renderer { engine: this, options: options, root: datum_from(data) }
         return renderer.render_to(compiled, Array[String]{ name }, out, name) !>
     }
 
@@ -126,7 +126,7 @@ use html
     /// Throws `ParseError` as `render_content` does, and `.write` when `out` fails.
     + fn render_content_into(content: String, data: $T, out: io.Writer, options: ?RenderOptions (null)) uint !ParseError {
         let compiled = Compiler { content: content }.compile() !>
-        let renderer = Renderer { engine: this, options: options, root: json.from(data) }
+        let renderer = Renderer { engine: this, options: options, root: datum_from(data) }
         return renderer.render_to(compiled, Array[String]{}, out, "") !>
     }
 
@@ -149,13 +149,31 @@ use html
 // Variables set by a loop or `@set`; the chain ends at the render's root data
 class Frame {
     parent: ?Frame (null)
-    vars: Map[json.Value] (.{})
+    vars: ?Map[Datum] (null)
+    slot_name: String ("")
+    slot_value: Datum (null)
+
+    fn set_var(name: String, value: Datum) {
+        let saved = datum_snapshot(value)
+        if this.slot_name == name {
+            this.slot_value = saved
+            return
+        }
+        let m = this.vars
+        if !isset(m) {
+            let created = Map[Datum]{}
+            this.vars = created
+            created.set(name, saved)
+            return
+        }
+        m.set(name, saved)
+    }
 }
 
 class Renderer {
     engine: Engine
     options: ?RenderOptions
-    root: json.Value
+    root: Datum
 
     // Renders `template` into `out`: straight into a `ByteBuffer`, through a page buffer for
     // any other writer. Returns the bytes written.
@@ -178,7 +196,7 @@ class Renderer {
     // whitespace like an include or the page itself. `templates` names the templates
     // being rendered, for cycle detection, and `depth` how many includes and extends are
     // above this one.
-    fn render_template(template: Template, frame: Frame, templates: Array[String], depth: uint, chain: Map[ByteBuffer], root: json.Value, out: ByteBuffer) !ParseError {
+    fn render_template(template: Template, frame: Frame, templates: Array[String], depth: uint, chain: Map[ByteBuffer], root: Datum, out: ByteBuffer) !ParseError {
         let start = out.length
         let state = RenderState { template: template, templates: templates, depth: depth, chain: chain, root: root }
         this.render_nodes(template.nodes, frame, state, out) !>
@@ -209,35 +227,94 @@ class Renderer {
                 out.write(node.text)
             } else if node.type == NODE_OUTPUT {
                 let expr = node.expr ?! continue
-                let value = this.eval(expr, frame, state) !>
+                let value = this.eval_datum(expr, frame, state) !>
                 let options = this.options
                 let escape: ?Escape = null
                 if !node.raw : escape = isset(options) ? options.escape : this.engine.escape
-                // A number's text is built on the stack; everything else is a string already
-                let digits: [u8 x 65] = @undefined
-                let scratch: local mut &[u8] = &digits
-                let text: local &[u8] = ""
+                let default_html = isset(escape) && escape == html_escape
+                // Strings and numbers fast-path straight to `out` without converting through `json.Value`
                 match value {
-                    int as number => text = scratch.view(0, number.to_base_in(scratch, 10))
-                    float as number => text = scratch.view(0, number.to_shortest_string_in(scratch))
-                    default => text = value_text(value)
-                }
-                if isset(escape) {
-                    escape(text, out) ! throw .write(state.template.name ?? "?", "The escape function failed")
-                } else {
-                    out.write(text)
+                    String as text => {
+                        if default_html {
+                            html.escape_into(text, out) ! throw .write(state.template.name ?? "?", "The escape function failed")
+                        } else if isset(escape) {
+                            escape(text, out) ! throw .write(state.template.name ?? "?", "The escape function failed")
+                        } else {
+                            out.write(text)
+                        }
+                    }
+                    int as number => {
+                        if !isset(escape) || default_html {
+                            out.write_int_ascii(number)
+                        } else {
+                            let digits: [u8 x 65] = @undefined
+                            let scratch: local mut &[u8] = &digits
+                            let text = scratch.view(0, number.to_base_in(scratch, 10))
+                            escape(text, out) ! throw .write(state.template.name ?? "?", "The escape function failed")
+                        }
+                    }
+                    float as number => {
+                        let digits: [u8 x 65] = @undefined
+                        let scratch: local mut &[u8] = &digits
+                        let text = scratch.view(0, number.to_shortest_string_in(scratch))
+                        if !isset(escape) || default_html : out.write(text)
+                        else : escape(text, out) ! throw .write(state.template.name ?? "?", "The escape function failed")
+                    }
+                    default => {
+                        let text = value_text(datum_to_json(value))
+                        if default_html {
+                            html.escape_into(text, out) ! throw .write(state.template.name ?? "?", "The escape function failed")
+                        } else if isset(escape) {
+                            escape(text, out) ! throw .write(state.template.name ?? "?", "The escape function failed")
+                        } else {
+                            out.write(text)
+                        }
+                    }
                 }
             } else if node.type == NODE_IF {
                 each node.branches as arm {
                     let cond = arm.cond
-                    if !isset(cond) || value_truthy(this.eval(cond, frame, state) !>) {
+                    if !isset(cond) || datum_truthy(this.eval_datum(cond, frame, state) !>) {
                         this.render_nodes(arm.nodes, frame, state, out) !>
                         break
                     }
                 }
             } else if node.type == NODE_EACH {
                 let expr = node.expr ?! continue
-                let list = this.eval(expr, frame, state) !>
+                let list_datum = this.eval_datum(expr, frame, state) !>
+                match list_datum {
+                    ListView as lv => {
+                        let count = lv.list_len()
+                        if count == 0 {
+                            let empty = node.empty_body
+                            if isset(empty) : this.render_nodes(empty, frame, state, out) !>
+                            continue
+                        }
+                        let inner = Frame { parent: frame, slot_name: node.vname }
+                        let kname = node.kname
+                        let iname = node.iname
+                        let cursor = lv.make_cursor()
+                        if isset(cursor) {
+                            inner.slot_value = cursor.as_datum()
+                            each 0 .. count as index {
+                                cursor.set_index(index)
+                                if isset(kname) : inner.set_var(kname, index.to(int))
+                                if isset(iname) : inner.set_var(iname, index.to(int))
+                                this.render_nodes(node.body, inner, state, out) !>
+                            }
+                        } else {
+                            each 0 .. count as index {
+                                inner.slot_value = lv.list_get(index)
+                                if isset(kname) : inner.set_var(kname, index.to(int))
+                                if isset(iname) : inner.set_var(iname, index.to(int))
+                                this.render_nodes(node.body, inner, state, out) !>
+                            }
+                        }
+                        continue
+                    }
+                    default => {}
+                }
+                let list = datum_to_json(list_datum)
                 let items: ?Array[json.Value] = null
                 let keys: ?Array[String] = null
                 match list {
@@ -254,16 +331,16 @@ class Renderer {
                     if isset(empty) : this.render_nodes(empty, frame, state, out) !>
                     continue
                 }
-                let inner = Frame { parent: frame }
+                let inner = Frame { parent: frame, slot_name: node.vname }
                 each items as item, index {
-                    inner.vars.set(node.vname, item)
+                    inner.slot_value = datum_from_json(item)
                     let kname = node.kname
                     if isset(kname) {
-                        if isset(keys) : inner.vars.set(kname, json.from(keys.get(index) !? ""))
-                        else : inner.vars.set(kname, json.from(index))
+                        if isset(keys) : inner.set_var(kname, keys.get(index) !? "")
+                        else : inner.set_var(kname, index.to(int))
                     }
                     let iname = node.iname
-                    if isset(iname) : inner.vars.set(iname, json.from(index))
+                    if isset(iname) : inner.set_var(iname, index.to(int))
                     this.render_nodes(node.body, inner, state, out) !>
                 }
             } else if node.type == NODE_INCLUDE {
@@ -273,7 +350,7 @@ class Renderer {
                 let expr = node.expr
                 if isset(expr) {
                     // `@include("x", value)`: the partial sees only that value
-                    include_root = this.eval(expr, frame, state) !>
+                    include_root = datum_snapshot(this.eval_datum(expr, frame, state) !>)
                     include_frame = Frame {}
                 }
                 this.enter(state.templates, node.name, state.depth, state) !>
@@ -294,17 +371,24 @@ class Renderer {
                 out.write(content)
             } else if node.type == NODE_SET {
                 let expr = node.expr ?! continue
-                frame.vars.set(node.name, this.eval(expr, frame, state) !>)
+                frame.set_var(node.name, this.eval_datum(expr, frame, state) !>)
             }
         }
     }
 
     // ---- Expressions ---------------------------------------------------------------
 
+    fn eval_datum(expr: Expr, frame: Frame, state: RenderState) Datum !ParseError {
+        if expr.type == EXPR_VAR || expr.type == EXPR_MEMBER || expr.type == EXPR_INDEX {
+            return this.lookup(expr, frame, state, false) !>
+        }
+        return datum_from_json(this.eval(expr, frame, state) !>)
+    }
+
     fn eval(expr: Expr, frame: Frame, state: RenderState) json.Value !ParseError {
         if expr.type == EXPR_LITERAL : return expr.value
         if expr.type == EXPR_VAR || expr.type == EXPR_MEMBER || expr.type == EXPR_INDEX {
-            return this.lookup(expr, frame, state, false) !>
+            return datum_to_json(this.lookup(expr, frame, state, false) !>)
         }
         if expr.type == EXPR_NOT {
             let inner = expr.left ?! return null
@@ -360,7 +444,7 @@ class Renderer {
                     default => throw E
                 }
             }
-            return json.from(!found.is_null)
+            return json.from(!datum_is_null(found))
         }
         if expr.type == EXPR_LEN {
             let inner = expr.left ?! return null
@@ -370,7 +454,7 @@ class Renderer {
                     default => throw E
                 }
             }
-            return json.from(value_size(found))
+            return json.from(datum_size(found))
         }
         if expr.type == EXPR_FILTER {
             let inner = expr.left ?! return null
@@ -419,62 +503,90 @@ class Renderer {
 
     // Resolves a variable path. With `probe` a missing step throws `.missing` instead of
     // failing the render, which `@isset` and `@len` turn into their answer.
-    fn lookup(expr: Expr, frame: Frame, state: RenderState, probe: bool) json.Value !ParseError {
+    fn lookup(expr: Expr, frame: Frame, state: RenderState, probe: bool) Datum !ParseError {
         if expr.type == EXPR_VAR {
             let name = expr.name
             let f: ?Frame = frame
             while isset(f) {
-                f.vars.get(name) -> value : return value
+                if f.slot_name.bytes > 0 && f.slot_name == name : return f.slot_value
+                let vars = f.vars
+                if isset(vars) {
+                    vars.get(name) -> value : return value
+                }
                 f = f.parent
             }
-            let root = state.root
-            if !root.has(name) {
-                if probe : throw .missing(state.template.name ?? "?", "Data not found", expr.line)
-                this.fail("Data not found: '" + name + "'", expr.line, state)
+            match state.root {
+                ObjectView as o => {
+                    let field = o.get_field(name)
+                    if isset(field) : return field
+                }
+                Map[json.Value] as obj => {
+                    obj.get(name) -> value : return datum_from_json(value)
+                }
+                default => {}
             }
-            return root.get(name)
+            if probe : throw .missing(state.template.name ?? "?", "Data not found", expr.line)
+            this.fail("Data not found: '" + name + "'", expr.line, state)
         }
         if expr.type == EXPR_MEMBER {
             let left = expr.left ?! return null
             let owner = this.lookup_or_eval(left, frame, state, probe) !>
-            if !owner.has(expr.name) {
-                if probe : throw .missing(state.template.name ?? "?", "Data not found", expr.line)
-                this.fail("Property not found: '" + expr.name + "'", expr.line, state)
+            match owner {
+                ObjectView as o => {
+                    let field = o.get_field(expr.name)
+                    if isset(field) : return field
+                }
+                Map[json.Value] as obj => {
+                    obj.get(expr.name) -> value : return datum_from_json(value)
+                }
+                default => {}
             }
-            return owner.get(expr.name)
+            if probe : throw .missing(state.template.name ?? "?", "Data not found", expr.line)
+            this.fail("Property not found: '" + expr.name + "'", expr.line, state)
         }
         if expr.type == EXPR_INDEX {
             let left = expr.left ?! return null
             let key_expr = expr.right ?! return null
             let owner = this.lookup_or_eval(left, frame, state, probe) !>
             let key = this.eval(key_expr, frame, state) !>
-            let found = false
-            let value: json.Value = null
             match key {
                 int as index => {
                     if index >= 0 {
-                        found = owner.has(index.to(uint))
-                        value = owner.get(index.to(uint))
+                        let idx = index.to(uint)
+                        match owner {
+                            ListView as lv => {
+                                if idx < lv.list_len() : return lv.list_get(idx)
+                            }
+                            Array[json.Value] as arr => {
+                                arr.get(idx) -> value : return datum_from_json(value)
+                            }
+                            default => {}
+                        }
                     }
                 }
                 String as name => {
-                    found = owner.has(name)
-                    value = owner.get(name)
+                    match owner {
+                        ObjectView as o => {
+                            let field = o.get_field(name)
+                            if isset(field) : return field
+                        }
+                        Map[json.Value] as obj => {
+                            obj.get(name) -> value : return datum_from_json(value)
+                        }
+                        default => {}
+                    }
                 }
                 default => {}
             }
-            if !found {
-                if probe : throw .missing(state.template.name ?? "?", "Data not found", expr.line)
-                this.fail("Indexed value not found", expr.line, state)
-            }
-            return value
+            if probe : throw .missing(state.template.name ?? "?", "Data not found", expr.line)
+            this.fail("Indexed value not found", expr.line, state)
         }
-        return this.eval(expr, frame, state) !>
+        return datum_from_json(this.eval(expr, frame, state) !>)
     }
 
-    fn lookup_or_eval(expr: Expr, frame: Frame, state: RenderState, probe: bool) json.Value !ParseError {
+    fn lookup_or_eval(expr: Expr, frame: Frame, state: RenderState, probe: bool) Datum !ParseError {
         if expr.type == EXPR_VAR || expr.type == EXPR_MEMBER || expr.type == EXPR_INDEX : return this.lookup(expr, frame, state, probe) !>
-        return this.eval(expr, frame, state) !>
+        return datum_from_json(this.eval(expr, frame, state) !>)
     }
 
     // ---- Engine -----------------------------------------------------------------
@@ -523,7 +635,7 @@ class RenderState {
     depth: uint
     // The blocks of the chain being rendered: the most derived template fills it first
     chain: Map[ByteBuffer]
-    root: json.Value
+    root: Datum
     // Where `@extend` split this template's own output
     extend_offset: uint (0)
 }

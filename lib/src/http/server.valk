@@ -91,7 +91,9 @@ fn static_file_in(dir: atomic ServerStaticDir, path: String, request_path: Strin
         if path.bytes > dir.prefix.bytes && path[dir.prefix.bytes] != '/' : return null
         path = path.bytes == dir.prefix.bytes ? "/" : path.range(dir.prefix.bytes, path.bytes - dir.prefix.bytes)
     }
-    let full = fs.resolve(fs.add(dir.path, path))
+    let full = (path.contains("//") || path.contains("/."))
+        ? fs.resolve(fs.add(dir.path, path))
+        : (path.starts_with("/") ? dir.path + path : dir.path + "/" + path)
     if !full.starts_with(dir.path) : return null
     let info = fs.stat(full) ! return null
     if info.kind == fs.FileKind.file : return StaticMatch { path: full, info: info, redirect: false }
@@ -115,10 +117,29 @@ class ServerSocketLink {
     next: ?atomic ServerSocketLink
 }
 
+class ServerQuicLink {
+    listener: atomic net.QuicListener
+    next: ?atomic ServerQuicLink
+}
+
 fn start_extra_worker(server: atomic ServerWorkerData, wid: uint) bool {
     let run: atomic fn()() = fn() { worker(server, wid) }
     thread.Thread[void].start(run) ! return false
     return true
+}
+
+fn start_h3_worker(server: atomic ServerWorkerData, listener: atomic net.QuicListener) bool {
+    let run: atomic fn()() = fn() { h3_worker(server, listener) }
+    thread.Thread[void].start(run) ! return false
+    return true
+}
+
+fn close_quic_listeners(list: ?atomic ServerQuicLink) {
+    let link = list
+    while isset(link) {
+        link.listener.close()
+        link = link.next
+    }
 }
 
 fn close_extra_sockets(list: ?atomic ServerSocketLink) {
@@ -287,6 +308,11 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
     handler: atomic fn(Request)(Response) (handler_default)
     - middlewares: Array[atomic fn(Request, atomic fn(Request)(Response))(Response)] (.{})
     fast_handler: ?atomic fn(Context, ResponseWriter)()
+    - tls_cert_file: String ("")
+    - tls_key_file: String ("")
+    - tls_cipher_suites: ?String (null)
+    - tls_client_ca_file: ?String (null)
+    - tls_client_ca_required: bool (true)
     -+ static_dirs: Array[String] (.{})
     -+ static_indexes: Array[String] (.{})
     -+ static_prefixes: Array[String] (.{})
@@ -325,10 +351,16 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
     /// How long in-flight requests may take after a stop signal, in milliseconds.
     + stop_on_signal_timeout_ms: uint (5000)
     /// Enables HTTP/2: negotiated through ALPN with HTTP/1.1 as fallback when `tls` is
-    /// configured, or cleartext HTTP/2 (`h2c` prior knowledge) without `tls`.
+    /// configured, or cleartext HTTP/2 (`h2c` prior knowledge) with HTTP/1.1 as fallback
+    /// without `tls`.
     ///
     /// Requires the regular handler; `start` fails with `init` when a `fast` handler is set.
     + http2: bool (false)
+    /// Enables HTTP/3 over QUIC (UDP) on the same port alongside the TCP listener.
+    ///
+    /// Requires `tls` and the regular handler; `start` fails with `init` without `tls` or
+    /// when a `fast` handler is set.
+    + http3: bool (false)
     /// Compresses responses with gzip for clients that accept it: text, HTML, CSS,
     /// JavaScript, JSON, XML and SVG of at least 1 KiB, and such files up to 1 MiB.
     ///
@@ -441,6 +473,9 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
             cipher_list,
             cipher_suites
         ) !>
+        this.tls_cert_file = certificate_file
+        this.tls_key_file = private_key_file
+        this.tls_cipher_suites = cipher_suites
     }
 
     /// Asks every client for a certificate that leads to a CA in the PEM file `ca_file`
@@ -453,6 +488,8 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
     + fn tls_client_ca(ca_file: String, required: bool (true)) !HttpError {
         let context = this.tls_context ?! throw .net(.init)
         context.set_client_ca(ca_file, required) !>
+        this.tls_client_ca_file = ca_file
+        this.tls_client_ca_required = required
     }
 
     /// Stops accepting connections and gives in-flight requests `timeout_ms` to finish.
@@ -512,7 +549,15 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
                 net.SSL_CTX_set_alpn_select_cb(context.ctx, h2_alpn_select, null)
             }
         }
+        if this.http3 {
+            if isset(this.fast_handler) || !isset(this.tls_context) : throw .net(.init)
+        }
         let socket = net.tcp_server(this.host, this.port, 5000, this.reuse_port) !>
+        let bound_port = this.port
+        if bound_port == 0 {
+            let local_addr = socket.local_address() !? net.SocketAddress {}
+            bound_port = local_addr.port
+        }
         let done: atomic core.Mutex = .new() ! {
             socket.close() ! core.cleanup_warning("Failed to close HTTP listener", __FILE__, __LINE__)
             throw .net(.init)
@@ -535,19 +580,53 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
         }
 
         if this.show_info {
-            println("[+] Running http server on port " + this.port)
+            println("[+] Running http server on port " + bound_port)
             println("[+] Worker count: " + count)
         }
 
         let extra_sockets: ?atomic ServerSocketLink = null
         #if OS == "linux" || OS == "macos"
-        if this.reuse_port && this.port > 0 && count > 1 {
+        if this.reuse_port && bound_port > 0 && count > 1 {
             each 0 .. (count - 1) as _ {
-                let extra = net.tcp_server(this.host, this.port, 5000, true) ! break
+                let extra = net.tcp_server(this.host, bound_port, 5000, true) ! break
                 extra_sockets = .{ socket: extra, next: extra_sockets }
             }
         }
         #end
+
+        let h3_listeners: ?atomic ServerQuicLink = null
+        let h3_count: uint = 0
+        if this.http3 {
+            let quic_ctx = net.QuicServerContext.new(this.tls_cert_file, this.tls_key_file, this.tls_cipher_suites) ! {
+                socket.close() ! core.cleanup_warning("Failed to close HTTP listener", __FILE__, __LINE__)
+                close_extra_sockets(extra_sockets)
+                throw E
+            }
+            let ca = this.tls_client_ca_file
+            if isset(ca) {
+                quic_ctx.set_client_ca(ca, this.tls_client_ca_required) ! {
+                    socket.close() ! core.cleanup_warning("Failed to close HTTP listener", __FILE__, __LINE__)
+                    close_extra_sockets(extra_sockets)
+                    throw E
+                }
+            }
+            let first_ql = net.QuicListener.new(quic_ctx, this.host, bound_port, 5000, this.reuse_port) ! {
+                socket.close() ! core.cleanup_warning("Failed to close HTTP listener", __FILE__, __LINE__)
+                close_extra_sockets(extra_sockets)
+                throw E
+            }
+            h3_listeners = .{ listener: first_ql, next: null }
+            h3_count = 1
+            #if OS == "linux" || OS == "macos"
+            if this.reuse_port && bound_port > 0 && count > 1 {
+                each 0 .. (count - 1) as _ {
+                    let extra_ql = net.QuicListener.new(quic_ctx, this.host, bound_port, 5000, true) ! break
+                    h3_listeners = .{ listener: extra_ql, next: h3_listeners }
+                    h3_count++
+                }
+            }
+            #end
+        }
 
         let static_dirs: ?atomic ServerStaticDir = null
         each this.static_dirs as path, i {
@@ -586,7 +665,7 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
             websocket_compression_level: this.websocket_compression_level
             websocket_compression_min_size: this.websocket_compression_min_size
             stop: sync.CancelToken.new() !? null
-            workers: count
+            workers: count + h3_count
             worker_count: count.to(uint)
             acceptors: count.to(uint)
             done: done
@@ -597,17 +676,20 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
             signal.on(signal.Signal.interrupt, stop) ! {
                 socket.close() ! core.cleanup_warning("Failed to close HTTP listener", __FILE__, __LINE__)
                 close_extra_sockets(extra_sockets)
+                close_quic_listeners(h3_listeners)
                 throw .net(.init)
             }
             signal.on(signal.Signal.terminate, stop) ! {
                 socket.close() ! core.cleanup_warning("Failed to close HTTP listener", __FILE__, __LINE__)
                 close_extra_sockets(extra_sockets)
+                close_quic_listeners(h3_listeners)
                 throw .net(.init)
             }
             #if OS != "win"
             signal.on(signal.Signal.hangup, stop) ! {
                 socket.close() ! core.cleanup_warning("Failed to close HTTP listener", __FILE__, __LINE__)
                 close_extra_sockets(extra_sockets)
+                close_quic_listeners(h3_listeners)
                 throw .net(.init)
             }
             #end
@@ -617,7 +699,7 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
 
         // Worker 0 is this thread; the others get a thread each
         let failed = false
-        let remaining = server.workers - 1
+        let remaining = count - 1
         let next_worker_id: uint = 1
         while remaining > 0 && !failed {
             if !start_extra_worker(server, next_worker_id) {
@@ -627,9 +709,20 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
                 next_worker_id++
             }
         }
+        let h3_remaining = h3_count
+        let h3_link = h3_listeners
+        while isset(h3_link) && !failed {
+            if !start_h3_worker(server, h3_link.listener) {
+                failed = true
+                close_quic_listeners(h3_link)
+            } else {
+                h3_remaining--
+                h3_link = h3_link.next
+            }
+        }
         if failed {
             // Workers that never started are not waited for; the rest drain
-            server.workers -= remaining
+            server.workers -= (remaining + h3_remaining)
             server.acceptors -= remaining
             server.request_shutdown(0)
         }

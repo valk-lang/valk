@@ -1,0 +1,1253 @@
+use net
+use ext
+use coro
+use sync
+use time
+use fs
+use io
+use compress
+
+value H3_READ_CHUNK (16_384)
+value H3_STREAM_SEND_HIGH_WATER (65_536)
+value H3_SERVE_POOL_MAX (16)
+
+global h3_resp_headers: Array[HpackField] (.new(8))
+global h3_resp_trailers: Array[HpackField] (.new(4))
+global h3_qpack_buf: ByteBuffer (.new(256))
+global h3_buf_pool: Array[ByteBuffer] (.{})
+
+fn h3_take_buf(min_cap: uint) ByteBuffer {
+    let buf = h3_buf_pool.pop_last() !? ByteBuffer.new(min_cap)
+    buf.clear()
+    return buf
+}
+
+fn h3_give_buf(buf: ByteBuffer) {
+    buf.clear()
+    if buf.size > 65_536 : buf.shrink_capacity(4096)
+    if h3_buf_pool.length < 128 : h3_buf_pool.append(buf)
+}
+
+class H3UniStream {
+    ssl: net.OSSL
+    buf: ByteBuffer (.new(64))
+    stream_type: u64 (0)
+    type_known: bool (false)
+    got_settings: bool (false)
+    frame_in_progress: bool (false)
+    frame_type: u64 (0)
+    frame_len: u64 (0)
+    closed: bool (false)
+
+    fn free_ssl() {
+        @unsafe
+        if this.closed : return
+        this.closed = true
+        net.SSL_free(this.ssl)
+    }
+}
+
+class H3ServerStream {
+    conn: H3ServerConn
+    ssl: net.OSSL
+    id: u64
+    recv_buf: ByteBuffer (h3_take_buf(256))
+    recv_pos: uint (0)
+    frame_in_progress: bool (false)
+    frame_type: u64 (0)
+    frame_remaining: u64 (0)
+    headers_buf: ?ByteBuffer (null)
+    req_fields: ?Array[HpackField] (null)
+    req_body: ?ByteBuffer (null)
+    req_body_len: uint (0)
+    expected_length: ?uint (null)
+    got_headers: bool (false)
+    got_trailers: bool (false)
+    read_done: bool (false)
+    dispatched: bool (false)
+    send_buf: ByteBuffer (h3_take_buf(512))
+    send_pos: uint (0)
+    send_body: String ("")
+    send_body_pos: uint (0)
+    send_fin: bool (false)
+    send_concluded: bool (false)
+    write_waker: sync.Waker (.{})
+    cancelled: bool (false)
+    reset_code: ?u64 (null)
+    closed: bool (false)
+
+    fn queue_send(data: local &[u8]) {
+        this.send_buf.write(data)
+    }
+
+    fn pending_send() uint $inline {
+        return (this.send_buf.length - this.send_pos) + (this.send_body.bytes - this.send_body_pos)
+    }
+
+    fn reset(code: u64) {
+        if this.closed : return
+        this.cancelled = true
+        this.reset_code = code
+        @unsafe
+        let args = net.SslStreamResetArgs { quic_error_code: code }
+        net.SSL_stream_reset(this.ssl, @ref(args), size_of(net.SslStreamResetArgs))
+        this.write_waker.wake()
+    }
+
+    fn free_ssl() {
+        @unsafe
+        if this.closed : return
+        this.closed = true
+        this.cancelled = true
+        this.send_body = ""
+        this.send_body_pos = 0
+        this.write_waker.wake()
+        net.SSL_free(this.ssl)
+        h3_give_buf(this.recv_buf)
+        h3_give_buf(this.send_buf)
+    }
+}
+
+class H3ServerConn {
+    worker: H3Worker
+    ssl: net.OSSL
+    ctrl_out: ?net.OSSL (null)
+    ctrl_out_buf: ByteBuffer (.new(32))
+    ctrl_out_pos: uint (0)
+    has_peer_control: bool (false)
+    has_peer_qpack_enc: bool (false)
+    has_peer_qpack_dec: bool (false)
+    uni_streams: Array[H3UniStream] (.new(4))
+    streams: Array[H3ServerStream] (.new(8))
+    max_stream_id: u64 (0)
+    active_handlers: uint (0)
+    last_activity_ms: uint (0)
+    peer_cert_loaded: bool (false)
+    client_subject: String ("")
+    client_sha256: String ("")
+    draining: bool (false)
+    goaway_sent: bool (false)
+    closed: bool (false)
+
+    static fn accept(worker: H3Worker, ssl: net.OSSL) ?SELF {
+        @unsafe
+        if net.SSL_set_blocking_mode(ssl, 0) != 1
+            || net.SSL_set_default_stream_mode(ssl, net.SSL_DEFAULT_STREAM_MODE_NONE) != 1
+            || net.SSL_set_incoming_stream_policy(ssl, net.SSL_INCOMING_STREAM_POLICY_ACCEPT, 0) != 1 {
+            net.SSL_free(ssl)
+            return null
+        }
+        let conn = SELF {
+            worker: worker,
+            ssl: ssl,
+            last_activity_ms: time.mono_ms()
+        }
+        let ctrl = net.SSL_new_stream(ssl, net.SSL_STREAM_FLAG_UNI | net.SSL_STREAM_FLAG_NO_BLOCK)
+        if isset(ctrl) {
+            conn.ctrl_out = ctrl
+            let hdr_limit = worker.server.max_request_header_size
+            h3_write_control_settings(conn.ctrl_out_buf, hdr_limit)
+            conn.flush_ctrl_out()
+        }
+        return conn
+    }
+
+    fn flush_ctrl_out() {
+        let ctrl = this.ctrl_out ?! return
+        if this.ctrl_out_pos >= this.ctrl_out_buf.length : return
+        @unsafe
+        while this.ctrl_out_pos < this.ctrl_out_buf.length {
+            let rem = this.ctrl_out_buf.length - this.ctrl_out_pos
+            let written: uint = 0
+            let ok = net.SSL_write_ex(ctrl, this.ctrl_out_buf.data.@offset(this.ctrl_out_pos), rem, @ref(written).@cast(ptr))
+            if ok != 1 || written == 0 : break
+            this.ctrl_out_pos += written
+        }
+        if this.ctrl_out_pos == this.ctrl_out_buf.length {
+            this.ctrl_out_buf.clear()
+            this.ctrl_out_pos = 0
+        }
+    }
+
+    fn send_goaway() {
+        if this.goaway_sent || this.closed : return
+        this.goaway_sent = true
+        this.draining = true
+        let next_id = this.max_stream_id == 0 ? 0 : this.max_stream_id + 4
+        h3_write_goaway(this.ctrl_out_buf, next_id)
+        this.flush_ctrl_out()
+    }
+
+    fn close_with_error(code: u64) {
+        if this.closed : return
+        this.closed = true
+        each this.streams as st : st.free_ssl()
+        this.streams.clear()
+        each this.uni_streams as u : u.free_ssl()
+        this.uni_streams.clear()
+        @unsafe
+        let ctrl = this.ctrl_out
+        if isset(ctrl) {
+            this.ctrl_out = null
+            net.SSL_free(ctrl)
+        }
+        let args = net.SslShutdownExArgs { quic_error_code: code, quic_reason: null }
+        net.SSL_shutdown_ex(this.ssl, net.SSL_SHUTDOWN_FLAG_RAPID | net.SSL_SHUTDOWN_FLAG_NO_BLOCK, @ref(args), size_of(net.SslShutdownExArgs))
+        net.SSL_free(this.ssl)
+    }
+
+    fn accept_streams(now: uint) bool {
+        if this.closed : return false
+        let accepted = false
+        @unsafe
+        while true {
+            let s = net.SSL_accept_stream(this.ssl, net.SSL_ACCEPT_STREAM_NO_BLOCK) ?! break
+            accepted = true
+            this.last_activity_ms = now
+            let stype = net.SSL_get_stream_type(s)
+            if stype == net.SSL_STREAM_TYPE_BIDI {
+                let sid = net.SSL_get_stream_id(s)
+                if sid > this.max_stream_id : this.max_stream_id = sid
+                if this.draining {
+                    let args = net.SslStreamResetArgs { quic_error_code: H3_ERR_REQUEST_REJECTED }
+                    net.SSL_stream_reset(s, @ref(args), size_of(net.SslStreamResetArgs))
+                    net.SSL_free(s)
+                    continue
+                }
+                this.streams.append(H3ServerStream { conn: this, ssl: s, id: sid })
+            } else if stype == net.SSL_STREAM_TYPE_READ {
+                this.uni_streams.append(H3UniStream { ssl: s })
+            } else {
+                net.SSL_free(s)
+            }
+        }
+        return accepted
+    }
+
+    fn pump_uni_streams(now: uint) bool {
+        let progressed = false
+        let i: uint = 0
+        let scratch: [u8 x 2048] = @undefined
+        while i < this.uni_streams.length {
+            let u = this.uni_streams[i]
+            let remove = false
+            @unsafe
+            while !this.closed {
+                let nread: uint = 0
+                let ok = net.SSL_read_ex(u.ssl, @ref(scratch).@cast(ptr), 2048, @ref(nread).@cast(ptr))
+                if ok == 1 && nread > 0 {
+                    progressed = true
+                    this.last_activity_ms = now
+                    if !u.type_known || u.stream_type == H3_STREAM_CONTROL {
+                        let view: local &[u8] = &scratch
+                        u.buf.write(view.view(0, nread))
+                        if !this.process_uni_data(u) {
+                            remove = true
+                            break
+                        }
+                    }
+                    continue
+                }
+                let err = net.SSL_get_error(u.ssl, ok)
+                if err == net.ERROR.ZERO_RETURN {
+                    // Closing a critical unidirectional stream is a connection error (RFC 9114 §6.2.1)
+                    if u.type_known && (u.stream_type == H3_STREAM_CONTROL || u.stream_type == H3_STREAM_QPACK_ENCODER || u.stream_type == H3_STREAM_QPACK_DECODER) {
+                        this.close_with_error(H3_ERR_CLOSED_CRITICAL_STREAM)
+                        return true
+                    }
+                    remove = true
+                } else if err != net.ERROR.WANT_READ && err != net.ERROR.WANT_WRITE {
+                    remove = true
+                }
+                break
+            }
+            if this.closed : return true
+            if remove {
+                u.free_ssl()
+                this.uni_streams.remove(i)
+            } else {
+                i++
+            }
+        }
+        return progressed
+    }
+
+    fn process_uni_data(u: H3UniStream) bool {
+        let pos: uint = 0
+        let view = u.buf.view(0, u.buf.length)
+        if !u.type_known {
+            let ok, stype, next = h3_varint_try_read(view, pos)
+            if !ok : return true
+            pos = next
+            u.type_known = true
+            u.stream_type = stype
+            if stype == H3_STREAM_CONTROL {
+                if this.has_peer_control {
+                    this.close_with_error(H3_ERR_STREAM_CREATION_ERROR)
+                    return false
+                }
+                this.has_peer_control = true
+            } else if stype == H3_STREAM_QPACK_ENCODER {
+                if this.has_peer_qpack_enc {
+                    this.close_with_error(H3_ERR_STREAM_CREATION_ERROR)
+                    return false
+                }
+                this.has_peer_qpack_enc = true
+                u.buf.clear()
+                return true
+            } else if stype == H3_STREAM_QPACK_DECODER {
+                if this.has_peer_qpack_dec {
+                    this.close_with_error(H3_ERR_STREAM_CREATION_ERROR)
+                    return false
+                }
+                this.has_peer_qpack_dec = true
+                u.buf.clear()
+                return true
+            } else if stype == H3_STREAM_PUSH {
+                // Clients must not open push streams
+                this.close_with_error(H3_ERR_STREAM_CREATION_ERROR)
+                return false
+            } else {
+                // Unknown/GREASE uni stream: ignore
+                u.buf.clear()
+                return true
+            }
+        }
+        if u.stream_type != H3_STREAM_CONTROL {
+            u.buf.clear()
+            return true
+        }
+        // Control stream frame loop
+        while pos < view.length {
+            if !u.frame_in_progress {
+                let ok1, ftype, p1 = h3_varint_try_read(view, pos)
+                if !ok1 : break
+                let ok2, flen, p2 = h3_varint_try_read(view, p1)
+                if !ok2 : break
+                if !u.got_settings && ftype != H3_FRAME_SETTINGS {
+                    this.close_with_error(H3_ERR_MISSING_SETTINGS)
+                    return false
+                }
+                if ftype == H3_FRAME_DATA || ftype == H3_FRAME_HEADERS || ftype == H3_FRAME_PUSH_PROMISE {
+                    this.close_with_error(H3_ERR_FRAME_UNEXPECTED)
+                    return false
+                }
+                if flen > 65_536 {
+                    this.close_with_error(H3_ERR_EXCESSIVE_LOAD)
+                    return false
+                }
+                u.frame_in_progress = true
+                u.frame_type = ftype
+                u.frame_len = flen
+                pos = p2
+            }
+            let need = u.frame_len.to(uint)
+            if view.length - pos < need : break
+            let payload = view.view(pos, need)
+            pos += need
+            u.frame_in_progress = false
+            if u.frame_type == H3_FRAME_SETTINGS {
+                if u.got_settings {
+                    this.close_with_error(H3_ERR_FRAME_UNEXPECTED)
+                    return false
+                }
+                u.got_settings = true
+                if !this.parse_settings(payload) : return false
+            } else if u.frame_type == H3_FRAME_GOAWAY {
+                this.draining = true
+            }
+        }
+        if pos > 0 : u.buf.clear_range(0, pos)
+        return true
+    }
+
+    fn parse_settings(payload: local &[u8]) bool {
+        let pos: uint = 0
+        while pos < payload.length {
+            let ok1, id, p1 = h3_varint_try_read(payload, pos)
+            if !ok1 {
+                this.close_with_error(H3_ERR_FRAME_ERROR)
+                return false
+            }
+            let ok2, _, p2 = h3_varint_try_read(payload, p1)
+            if !ok2 {
+                this.close_with_error(H3_ERR_FRAME_ERROR)
+                return false
+            }
+            if h3_is_forbidden_setting(id) {
+                this.close_with_error(H3_ERR_SETTINGS_ERROR)
+                return false
+            }
+            pos = p2
+        }
+        return true
+    }
+
+    fn pump_reads(now: uint) (bool, bool) {
+        let progressed = false
+        let dispatched = false
+        let i: uint = 0
+        let scratch: [u8 x 16_384] = @undefined
+        while i < this.streams.length {
+            let st = this.streams[i]
+            if !st.read_done && !st.cancelled {
+                @unsafe
+                while !st.read_done && !st.cancelled && !this.closed {
+                    let nread: uint = 0
+                    let ok = net.SSL_read_ex(st.ssl, @ref(scratch).@cast(ptr), H3_READ_CHUNK, @ref(nread).@cast(ptr))
+                    if ok == 1 && nread > 0 {
+                        progressed = true
+                        this.last_activity_ms = now
+                        let view: local &[u8] = &scratch
+                        st.recv_buf.write(view.view(0, nread))
+                        this.parse_request_frames(st)
+                        continue
+                    }
+                    let err = net.SSL_get_error(st.ssl, ok)
+                    if err == net.ERROR.ZERO_RETURN {
+                        progressed = true
+                        st.read_done = true
+                        if this.finish_request_read(st) : dispatched = true
+                    } else if err != net.ERROR.WANT_READ && err != net.ERROR.WANT_WRITE {
+                        st.cancelled = true
+                        st.write_waker.wake()
+                    }
+                    break
+                }
+            }
+            if this.closed : return (true, dispatched)
+            i++
+        }
+        return (progressed, dispatched)
+    }
+
+    fn pump_writes(now: uint) bool {
+        let progressed = false
+        let i: uint = 0
+        while i < this.streams.length {
+            let st = this.streams[i]
+            if !st.cancelled && st.pending_send() > 0 {
+                @unsafe
+                while st.send_pos < st.send_buf.length && !st.cancelled {
+                    let rem = st.send_buf.length - st.send_pos
+                    let conclude = st.send_fin && st.send_body_pos >= st.send_body.bytes
+                    let flags: u64 = conclude ? net.SSL_WRITE_FLAG_CONCLUDE : 0
+                    let written: uint = 0
+                    let ok = net.SSL_write_ex2(st.ssl, st.send_buf.data.@offset(st.send_pos), rem, flags, @ref(written).@cast(ptr))
+                    if ok == 1 && written > 0 {
+                        progressed = true
+                        this.last_activity_ms = now
+                        st.send_pos += written
+                        if conclude && written == rem : st.send_concluded = true
+                        continue
+                    }
+                    let err = net.SSL_get_error(st.ssl, ok)
+                    if err != net.ERROR.WANT_WRITE && err != net.ERROR.WANT_READ {
+                        st.cancelled = true
+                        st.write_waker.wake()
+                    }
+                    break
+                }
+                if st.send_pos == st.send_buf.length && st.send_pos > 0 {
+                    st.send_buf.clear()
+                    st.send_pos = 0
+                }
+                if !st.cancelled && st.send_pos == st.send_buf.length && st.send_body_pos < st.send_body.bytes {
+                    @unsafe
+                    while st.send_body_pos < st.send_body.bytes && !st.cancelled {
+                        let rem = st.send_body.bytes - st.send_body_pos
+                        let conclude = st.send_fin
+                        let flags: u64 = conclude ? net.SSL_WRITE_FLAG_CONCLUDE : 0
+                        let written: uint = 0
+                        let ok = net.SSL_write_ex2(st.ssl, st.send_body.data.@offset(st.send_body_pos), rem, flags, @ref(written).@cast(ptr))
+                        if ok == 1 && written > 0 {
+                            progressed = true
+                            this.last_activity_ms = now
+                            st.send_body_pos += written
+                            if conclude && written == rem : st.send_concluded = true
+                            continue
+                        }
+                        let err = net.SSL_get_error(st.ssl, ok)
+                        if err != net.ERROR.WANT_WRITE && err != net.ERROR.WANT_READ {
+                            st.cancelled = true
+                            st.write_waker.wake()
+                        }
+                        break
+                    }
+                    if st.send_body_pos == st.send_body.bytes {
+                        st.send_body = ""
+                        st.send_body_pos = 0
+                    }
+                }
+                if st.pending_send() < H3_STREAM_SEND_HIGH_WATER {
+                    st.write_waker.wake()
+                }
+            }
+            let finished = false
+            if st.cancelled {
+                finished = !st.dispatched || st.send_fin
+            } else if st.send_fin && st.pending_send() == 0 {
+                if !st.send_concluded {
+                    @unsafe
+                    net.SSL_stream_conclude(st.ssl, 0)
+                    st.send_concluded = true
+                }
+                progressed = true
+                finished = true
+            }
+            if finished {
+                st.free_ssl()
+                this.streams.remove(i)
+            } else {
+                i++
+            }
+        }
+        return progressed
+    }
+
+    fn parse_request_frames(st: H3ServerStream) {
+        let server = this.worker.server
+        let header_limit = server.max_request_header_size == 0 ? uint.$max : server.max_request_header_size
+        let body_limit = server.max_request_body_size == 0 ? uint.$max : server.max_request_body_size
+        while !st.cancelled && !this.closed {
+            let avail = st.recv_buf.length - st.recv_pos
+            if avail == 0 : break
+            let view = st.recv_buf.view(st.recv_pos, avail)
+            if !st.frame_in_progress {
+                let ok1, ftype, p1 = h3_varint_try_read(view, 0)
+                if !ok1 : break
+                let ok2, flen, p2 = h3_varint_try_read(view, p1)
+                if !ok2 : break
+                st.recv_pos += p2
+                if ftype == H3_FRAME_SETTINGS || ftype == H3_FRAME_GOAWAY || ftype == H3_FRAME_CANCEL_PUSH || ftype == H3_FRAME_MAX_PUSH_ID || ftype == H3_FRAME_PUSH_PROMISE {
+                    this.close_with_error(H3_ERR_FRAME_UNEXPECTED)
+                    return
+                }
+                if ftype == H3_FRAME_HEADERS {
+                    if st.got_trailers {
+                        st.reset(H3_ERR_FRAME_UNEXPECTED)
+                        return
+                    }
+                    if flen > header_limit {
+                        st.reset(H3_ERR_MESSAGE_ERROR)
+                        return
+                    }
+                } else if ftype == H3_FRAME_DATA {
+                    if !st.got_headers || st.got_trailers {
+                        st.reset(H3_ERR_FRAME_UNEXPECTED)
+                        return
+                    }
+                }
+                st.frame_in_progress = true
+                st.frame_type = ftype
+                st.frame_remaining = flen
+                if flen == 0 {
+                    st.frame_in_progress = false
+                    if ftype == H3_FRAME_HEADERS {
+                        // Empty HEADERS frame is missing required QPACK prefix
+                        this.close_with_error(H3_ERR_QPACK_DECOMPRESSION_FAILED)
+                        return
+                    }
+                }
+                continue
+            }
+            let take = avail.to(u64) < st.frame_remaining ? avail : st.frame_remaining.to(uint)
+            let chunk = st.recv_buf.view(st.recv_pos, take)
+            st.recv_pos += take
+            st.frame_remaining -= take.to(u64)
+
+            if st.frame_type == H3_FRAME_HEADERS {
+                let existing_hbuf = st.headers_buf
+                if !isset(existing_hbuf) && st.frame_remaining == 0 {
+                    st.frame_in_progress = false
+                    let fields = qpack_decode(chunk, header_limit) ! {
+                        if E == .limit : st.reset(H3_ERR_MESSAGE_ERROR)
+                        else : this.close_with_error(H3_ERR_QPACK_DECOMPRESSION_FAILED)
+                        return
+                    }
+                    if !st.got_headers {
+                        st.got_headers = true
+                        if !h3_validate_request_headers(fields, st) {
+                            st.reset(H3_ERR_MESSAGE_ERROR)
+                            return
+                        }
+                        st.req_fields = fields
+                    } else {
+                        st.got_trailers = true
+                        if !h3_validate_trailers(fields) {
+                            st.reset(H3_ERR_MESSAGE_ERROR)
+                            return
+                        }
+                    }
+                } else {
+                    let hbuf = existing_hbuf ?? <{
+                        let b = ByteBuffer.new(take < 256 ? 256 : take)
+                        st.headers_buf = b
+                        return b
+                    }
+                    hbuf.write(chunk)
+                    if st.frame_remaining == 0 {
+                        st.frame_in_progress = false
+                        let fields = qpack_decode(hbuf.view(0, hbuf.length), header_limit) ! {
+                            if E == .limit : st.reset(H3_ERR_MESSAGE_ERROR)
+                            else : this.close_with_error(H3_ERR_QPACK_DECOMPRESSION_FAILED)
+                            return
+                        }
+                        hbuf.clear()
+                        if !st.got_headers {
+                            st.got_headers = true
+                            if !h3_validate_request_headers(fields, st) {
+                                st.reset(H3_ERR_MESSAGE_ERROR)
+                                return
+                            }
+                            st.req_fields = fields
+                        } else {
+                            st.got_trailers = true
+                            if !h3_validate_trailers(fields) {
+                                st.reset(H3_ERR_MESSAGE_ERROR)
+                                return
+                            }
+                        }
+                    }
+                }
+            } else if st.frame_type == H3_FRAME_DATA {
+                if st.req_body_len + take > body_limit {
+                    st.reset(H3_ERR_MESSAGE_ERROR)
+                    return
+                }
+                let expected = st.expected_length
+                if isset(expected) && st.req_body_len + take > expected {
+                    st.reset(H3_ERR_MESSAGE_ERROR)
+                    return
+                }
+                let bbuf = st.req_body ?? <{
+                    let b = ByteBuffer.new(take < 1024 ? 1024 : take)
+                    st.req_body = b
+                    return b
+                }
+                bbuf.write(chunk)
+                st.req_body_len += take
+                if st.frame_remaining == 0 : st.frame_in_progress = false
+            } else {
+                // Skip unknown/GREASE frame payload
+                if st.frame_remaining == 0 : st.frame_in_progress = false
+            }
+        }
+        if st.recv_pos == st.recv_buf.length {
+            st.recv_buf.clear()
+            st.recv_pos = 0
+        } else if st.recv_pos > 4096 {
+            st.recv_buf.clear_range(0, st.recv_pos)
+            st.recv_pos = 0
+        }
+    }
+
+    fn finish_request_read(st: H3ServerStream) bool {
+        if st.cancelled || st.dispatched : return false
+        if st.frame_in_progress || st.recv_buf.length > st.recv_pos {
+            st.reset(H3_ERR_FRAME_ERROR)
+            return false
+        }
+        if !st.got_headers {
+            st.reset(H3_ERR_REQUEST_INCOMPLETE)
+            return false
+        }
+        let expected = st.expected_length
+        if isset(expected) && st.req_body_len != expected {
+            st.reset(H3_ERR_MESSAGE_ERROR)
+            return false
+        }
+        if !this.peer_cert_loaded {
+            this.peer_cert_loaded = true
+            @unsafe
+            this.client_subject = net.quic_peer_subject(this.ssl)
+            this.client_sha256 = net.quic_peer_sha256(this.ssl)
+        }
+        st.dispatched = true
+        this.active_handlers++
+        this.worker.total_active_handlers++
+        this.worker.ready_streams.push_back(st)
+        return true
+    }
+
+    fn handle_stream(st: H3ServerStream) {
+        defer {
+            this.active_handlers--
+            this.worker.total_active_handlers--
+            st.send_fin = true
+            if !this.worker.in_dispatch : this.worker.wake()
+        }
+        let fields = st.req_fields ?! return
+        let method = ""
+        let target = ""
+        each fields as f {
+            if f.name == ":method" : method = f.value
+            else if f.name == ":path" : target = f.value
+        }
+        let path = target
+        let query = ""
+        target.index_of_byte('?') -> index: {
+            path = target.range(0, index)
+            query = target.range(index + 1, target.bytes - index - 1)
+        }
+        let rbody = st.req_body
+        let body = isset(rbody) ? rbody.into_string() : ""
+        st.req_body = null
+
+        let request = Request {
+            method: method,
+            path: path,
+            query_string: query,
+            body_data: body,
+            header_data: "",
+            h2_fields: fields,
+            peer_address: net.SocketAddress {},
+            client_subject: this.client_subject,
+            client_certificate_sha256: this.client_sha256
+        }
+        let response: ?Response = null
+        let static_info: ?fs.FileInfo = null
+        let server = this.worker.server
+        if method != "CONNECT" && isset(server.static_dirs) {
+            let found = static_file(server.static_dirs, path)
+            if isset(found) {
+                if found.redirect {
+                    response = Response.redirect(static_redirect_location(path, query), 301)
+                } else {
+                    response = Response.file(found.path)
+                    static_info = found.info
+                }
+            }
+        }
+        if !isset(response) : response = method == "CONNECT" ? Response.empty(501) : server.handler(request)
+        if !isset(response) || st.cancelled || this.closed : return
+        this.send_response(st, request, response, static_info) ! {
+            st.reset(H3_ERR_INTERNAL_ERROR)
+        }
+    }
+
+    fn file_plan_for(request: Request, status: u16, meta: FileMeta, content_type: String, extra: ?Headers, accept_encoding: String) ?FilePlan {
+        if status != 200 : return null
+        let get = request.method == "GET"
+        if !get && request.method != "HEAD" : return null
+        if isset(extra) && (extra.has("etag") || extra.has("last-modified") || extra.has("content-encoding")) : return null
+        let range = get ? request.header("range") !? "" : ""
+        return file_plan(meta, content_type, this.worker.server.compress, request.header("if-none-match") !? "",
+            request.header("if-modified-since") !? "", range, request.header("if-range") !? "", accept_encoding)
+    }
+
+    fn send_response(st: H3ServerStream, request: Request, response: Response, known_info: ?fs.FileInfo) !H2Error {
+        let source = response.stream_reader
+        let file: ?fs.FileStream = null
+        let body = response.body
+        let open_body = isset(source) && !isset(response.stream_size)
+        let size: uint = isset(source) ? response.stream_size ?? 0 : body.bytes
+        let events = response.event_reader
+        if isset(events) : events.stop = this.worker.server.stop
+        let content_type = response.content_type
+        let status = response.status
+        let extra = response.header_list
+        let plan: ?FilePlan = null
+        let path = response.filepath
+        let cached: ?CachedFile = null
+        let cached_body = false
+        if isset(path) {
+            let info = known_info
+            if !isset(info) : info = fs.stat(path) !? null
+            if isset(info) && info.kind != fs.FileKind.directory {
+                content_type = fs.mime_type(fs.extension(path))
+                if isset(extra) : content_type = extra.get("content-type") !? content_type
+                let accept_encoding = request.header("accept-encoding") !? ""
+                cached = cached_file(path, info)
+                plan = this.file_plan_for(request, status, isset(cached) ? cached.meta : file_meta(info.size, info.modified_time), content_type, extra, accept_encoding)
+                let in_memory = cached
+                if isset(in_memory) && !(isset(plan) && (plan.status == 304 || plan.status == 416)) {
+                    let sidecar: ?String = null
+                    if isset(plan) : sidecar = cached_precompressed(in_memory, content_type, this.worker.server.compress, accept_encoding, plan)
+                    if isset(sidecar) {
+                        body = sidecar
+                    } else {
+                        let data = cached_file_data(in_memory)
+                        if !isset(data) {
+                            plan = null
+                            status = 500
+                            body = ""
+                        } else if isset(plan) && plan.zstd {
+                            body = cached_file_zstd(in_memory, data, this.worker.server.compress_level)
+                        } else if isset(plan) && plan.gzip {
+                            body = cached_file_gzip(in_memory, data, this.worker.server.compress_level)
+                        } else if isset(plan) {
+                            body = data.range(plan.start, plan.length)
+                        } else {
+                            body = data
+                        }
+                    }
+                    source = null
+                    size = body.bytes
+                    cached_body = true
+                } else if isset(plan) {
+                    if plan.status == 304 || plan.status == 416 {
+                        size = 0
+                    } else {
+                        file = open_precompressed_sidecar(path, info, content_type, this.worker.server.compress, accept_encoding, plan)
+                        if isset(file) {
+                            source = file.to(io.Reader)
+                            size = plan.length
+                        }
+                    }
+                }
+                if !cached_body && !isset(file) && !(isset(plan) && (plan.status == 304 || plan.status == 416)) {
+                    file = fs.stream(path) !? null
+                    if isset(file) {
+                        source = file.to(io.Reader)
+                        size = info.size
+                    } else {
+                        plan = null
+                        status = 404
+                        size = 0
+                    }
+                }
+            } else {
+                status = 404
+                size = 0
+            }
+        }
+        defer h2_close_file(file)
+        if isset(plan) {
+            status = plan.status
+            if !cached_body || plan.status == 304 || plan.status == 416 : size = plan.length
+            open_body = false
+            if isset(file) && plan.start > 0 : file.seek(plan.start.to(int)) ! throw .protocol
+            if (plan.zstd || plan.gzip) && isset(file) && request.method == "HEAD" {
+                source = null
+                open_body = true
+            } else if (plan.zstd || plan.gzip) && isset(file) {
+                let data = io.read_all(file.to(io.Reader)) ! throw .protocol
+                if data.length != plan.size : throw .protocol
+                source = null
+                body = plan.zstd ? compress.zstd(data, this.worker.server.compress_level) : compress.gzip(data, this.worker.server.compress_level)
+                size = body.bytes
+            }
+            if status == 304 || status == 416 : source = null
+        }
+        if status < 200 || status > 599 : status = 500
+        let headers = h3_resp_headers
+        headers.clear()
+        headers.append(.{ name: ":status", value: status == 200 ? "200" : status.to_string() })
+        if isset(extra) : content_type = extra.get("content-type") !? content_type
+        if !isset(source) && !isset(plan) && !cached_body && this.worker.server.compress && status != 204 && status != 304 && body.bytes >= GZIP_MIN_SIZE
+            && response_gzip_type(content_type) && !(isset(extra) && extra.has("content-encoding")) {
+            headers.append(.{ name: "vary", value: "Accept-Encoding" })
+            let accept_enc = request.header("accept-encoding") !? ""
+            if request_accepts_zstd(accept_enc) {
+                body = compress.zstd(body, this.worker.server.compress_level)
+                size = body.bytes
+                headers.append(.{ name: "content-encoding", value: "zstd" })
+            } else if request_accepts_gzip(accept_enc) {
+                body = compress.gzip(body, this.worker.server.compress_level)
+                size = body.bytes
+                headers.append(.{ name: "content-encoding", value: "gzip" })
+            }
+        }
+        if isset(plan) {
+            if status == 416 {
+                content_type = "text/plain"
+                headers.append(.{ name: "content-range", value: "bytes */" + plan.size })
+            } else {
+                h2_file_plan_fields(headers, plan)
+            }
+        }
+        let trailer_headers = response.trailer_list
+        let trailers = h3_resp_trailers
+        trailers.clear()
+        if isset(trailer_headers) {
+            each trailer_headers as value, name {
+                if response_header_is_framing(name) : continue
+                let field = HpackField { name: name.lower(), value: value, never_index: true }
+                if h2_regular_field(field) : trailers.append(field)
+            }
+        }
+        let has_trailers = trailers.length > 0
+        if status != 304 || !isset(plan) {
+            if response_header_value_is_safe(content_type) : headers.append(.{ name: "content-type", value: content_type })
+            if status != 204 && !open_body && !has_trailers : headers.append(.{ name: "content-length", value: h2_uint_str(size) })
+        }
+        if isset(extra) {
+            each extra as value, name {
+                if response_header_is_framing(name) : continue
+                let field = HpackField { name: name.lower(), value: value, never_index: true }
+                if h2_regular_field(field) : headers.append(field)
+            }
+        }
+        let filename = response.filename
+        if isset(filename) && response_header_value_is_safe(filename) && (!isset(extra) || !extra.has("content-disposition")) {
+            let disposition = ByteBuffer.new()
+            disposition.write("attachment; filename=\"")
+            write_response_quoted_header_value(disposition, filename)
+            disposition.write("\"")
+            headers.append(.{ name: "content-disposition", value: disposition.into_string() })
+        }
+
+        // Encode HEADERS frame into stream send buffer
+        let qbuf = h3_qpack_buf
+        qbuf.clear()
+        qpack_encode(headers, qbuf)
+        h3_write_frame_header(st.send_buf, H3_FRAME_HEADERS, qbuf.length.to(u64))
+        st.send_buf.write(qbuf.view(0, qbuf.length))
+
+        let no_body = request.method == "HEAD" || status == 204 || status == 304 || (size == 0 && !open_body)
+        if !no_body {
+            if open_body && isset(source) {
+                let chunk_buf = h2_take_chunk_buf()
+                defer h2_give_chunk_buf(chunk_buf)
+                while !st.cancelled && !this.closed {
+                    let read = read_body_piece(source, chunk_buf.view_spare(16_384)) ! throw .protocol
+                    if read == 0 : break
+                    h3_write_frame_header(st.send_buf, H3_FRAME_DATA, read.to(u64))
+                    st.send_buf.write(chunk_buf.view_spare(16_384).view(0, read))
+                    this.worker.wake()
+                    while st.pending_send() >= H3_STREAM_SEND_HIGH_WATER && !st.cancelled && !this.closed {
+                        st.write_waker.wait(50)
+                    }
+                }
+            } else if isset(source) {
+                let offset: uint = 0
+                let chunk_buf = h2_take_chunk_buf()
+                defer h2_give_chunk_buf(chunk_buf)
+                while offset < size && !st.cancelled && !this.closed {
+                    let amount = size - offset
+                    if amount > 16_384 : amount = 16_384
+                    let read = source.read(chunk_buf.view_spare(amount)) ! throw .protocol
+                    if read == 0 || read > amount : throw .protocol
+                    h3_write_frame_header(st.send_buf, H3_FRAME_DATA, read.to(u64))
+                    st.send_buf.write(chunk_buf.view_spare(amount).view(0, read))
+                    offset += read
+                    if st.pending_send() >= H3_STREAM_SEND_HIGH_WATER {
+                        this.worker.wake()
+                        while st.pending_send() >= H3_STREAM_SEND_HIGH_WATER && !st.cancelled && !this.closed {
+                            st.write_waker.wait(50)
+                        }
+                    }
+                }
+            } else if size > 0 {
+                h3_write_frame_header(st.send_buf, H3_FRAME_DATA, size.to(u64))
+                if !has_trailers && size > 512 {
+                    st.send_body = body
+                    st.send_body_pos = 0
+                } else {
+                    st.send_buf.write(body.view(0, size))
+                }
+            }
+        }
+        if has_trailers && !st.cancelled && !this.closed {
+            qbuf.clear()
+            qpack_encode(trailers, qbuf)
+            h3_write_frame_header(st.send_buf, H3_FRAME_HEADERS, qbuf.length.to(u64))
+            st.send_buf.write(qbuf.view(0, qbuf.length))
+        }
+    }
+}
+
+fn h3_validate_request_headers(fields: Array[HpackField], st: H3ServerStream) bool {
+    let saw_regular = false
+    let method = ""
+    let scheme = ""
+    let path = ""
+    let has_authority = false
+    let content_length: ?uint = null
+    each fields as f {
+        let name = f.name
+        if name.bytes == 0 : return false
+        if name[0] == ':' {
+            if saw_regular : return false
+            if name == ":method" {
+                if method.bytes > 0 || f.value.bytes == 0 : return false
+                method = f.value
+            } else if name == ":scheme" {
+                if scheme.bytes > 0 || f.value.bytes == 0 : return false
+                scheme = f.value
+            } else if name == ":path" {
+                if path.bytes > 0 || f.value.bytes == 0 : return false
+                path = f.value
+            } else if name == ":authority" {
+                if has_authority : return false
+                has_authority = true
+            } else {
+                return false
+            }
+            continue
+        }
+        saw_regular = true
+        if !h2_regular_field(f) : return false
+        if name == "connection" || name == "keep-alive" || name == "proxy-connection" || name == "transfer-encoding" || name == "upgrade" : return false
+        if name == "te" && f.value != "trailers" : return false
+        if name == "content-length" {
+            let parsed = f.value.to_uint() ! return false
+            let prev = content_length
+            if isset(prev) && prev != parsed : return false
+            content_length = parsed
+        }
+    }
+    if method.bytes == 0 : return false
+    if method != "CONNECT" && (scheme.bytes == 0 || path.bytes == 0) : return false
+    st.expected_length = content_length
+    return true
+}
+
+fn h3_validate_trailers(fields: Array[HpackField]) bool {
+    each fields as f {
+        if f.name.bytes == 0 || f.name[0] == ':' : return false
+        if !h2_regular_field(f) : return false
+    }
+    return true
+}
+
+class H3Worker {
+    server: atomic ServerWorkerData
+    listener: atomic net.QuicListener
+    conns: Array[H3ServerConn] (.new(16))
+    ready_streams: Deque[H3ServerStream] (.new())
+    idle_servers: Array[sync.Waker] (.{})
+    servers: uint (0)
+    runners: uint (0)
+    waking: uint (0)
+    total_active_handlers: uint (0)
+    waker: sync.Waker (.{})
+    watcher_waker: sync.Waker (.{})
+    watcher_started: bool (false)
+    watcher_armed: bool (false)
+    watcher_want_write: bool (false)
+    watcher_timeout_ms: uint (25)
+    in_dispatch: bool (false)
+    stopped: bool (false)
+
+    fn wake() {
+        this.waker.wake()
+    }
+
+    fn dispatch_ready() {
+        if this.ready_streams.length == 0 : return
+        if this.runners == 0 && this.waking == 0 {
+            this.wake_one_server()
+        }
+    }
+
+    fn wake_one_server() {
+        if this.stopped : return
+        let idle = this.idle_servers.pop_last() !? null
+        if isset(idle) {
+            this.waking++
+            idle.wake()
+            return
+        }
+        if this.servers < H3_SERVE_POOL_MAX {
+            let waker = sync.Waker.new() !? null
+            if isset(waker) {
+                this.servers++
+                this.waking++
+                co this.serve_loop(waker)
+                return
+            }
+        }
+        this.waking++
+        co this.serve_overflow()
+    }
+
+    fn serve_loop(waker: sync.Waker) {
+        while true {
+            this.waking--
+            this.serve_ready()
+            if this.stopped : break
+            this.idle_servers.append(waker)
+            waker.wait()
+            if this.stopped : break
+        }
+        this.servers--
+    }
+
+    fn serve_overflow() {
+        this.waking--
+        this.serve_ready()
+    }
+
+    fn runner_yielded() {
+        this.runners--
+        if this.ready_streams.length > 0 && this.runners == 0 && this.waking == 0 {
+            this.wake_one_server()
+        }
+    }
+
+    fn serve_ready() {
+        let self_coro = coro.current_coro.@cast(coro.Coro)
+        this.runners++
+        while true {
+            let st = this.ready_streams.pop_front() ! break
+            self_coro.on_yield_fn = h3_worker_on_yield
+            self_coro.on_yield_arg = this.@cast(ptr)
+            st.conn.handle_stream(st)
+            if !isset(self_coro.on_yield_fn) {
+                this.runners++
+                break
+            }
+            self_coro.on_yield_fn = null
+            self_coro.on_yield_arg = null
+        }
+        this.runners--
+        if this.ready_streams.length > 0 && this.runners == 0 && this.waking == 0 {
+            this.wake_one_server()
+        }
+    }
+
+    fn watcher_loop() {
+        while !this.stopped {
+            if !this.watcher_armed {
+                this.watcher_waker.wait(50)
+                continue
+            }
+            let want_w = this.watcher_want_write
+            let tms = this.watcher_timeout_ms
+            net.quic_await_fd(this.listener.fd, true, want_w, tms)
+            this.watcher_armed = false
+            this.waker.wake()
+        }
+    }
+
+    fn run() {
+        let draining = false
+        let last_sweep_ms = time.mono_ms()
+        while true {
+            if !draining && this.server.stopping != 0 {
+                draining = true
+                each this.conns as c : c.send_goaway()
+            }
+            this.listener.handle_events()
+
+            // Accept incoming QUIC connections unless shutting down
+            if !draining {
+                let max_conns = this.server.max_connections
+                while true {
+                    @unsafe
+                    let ssl = this.listener.accept_connection() ?! break
+                    if max_conns > 0 && this.conns.length >= max_conns {
+                        let args = net.SslShutdownExArgs { quic_error_code: H3_ERR_EXCESSIVE_LOAD, quic_reason: null }
+                        net.SSL_shutdown_ex(ssl, net.SSL_SHUTDOWN_FLAG_RAPID | net.SSL_SHUTDOWN_FLAG_NO_BLOCK, @ref(args), size_of(net.SslShutdownExArgs))
+                        net.SSL_free(ssl)
+                        continue
+                    }
+                    let conn = H3ServerConn.accept(this, ssl)
+                    if isset(conn) : this.conns.append(conn)
+                }
+            }
+
+            let now = time.mono_ms()
+            let progressed = false
+            let dispatched_any = false
+            each this.conns as c {
+                if c.closed : continue
+                c.flush_ctrl_out()
+                if c.accept_streams(now) : progressed = true
+                if c.pump_uni_streams(now) : progressed = true
+                if !c.closed {
+                    let rp, dp = c.pump_reads(now)
+                    if rp : progressed = true
+                    if dp : dispatched_any = true
+                }
+            }
+
+            // Yield once so newly dispatched synchronous handlers finish before we flush writes
+            if dispatched_any {
+                this.in_dispatch = true
+                this.dispatch_ready()
+                coro.await_last()
+                this.in_dispatch = false
+            }
+
+            let do_sweep = draining || (now >= last_sweep_ms && now - last_sweep_ms >= 100)
+            if do_sweep : last_sweep_ms = now
+            let idle_ms = this.server.idle_timeout_ms
+            let ci: uint = 0
+            while ci < this.conns.length {
+                let c = this.conns[ci]
+                if !c.closed && c.pump_writes(now) : progressed = true
+                let drop = c.closed
+                if !drop && c.active_handlers == 0 && c.streams.length == 0 {
+                    if draining {
+                        drop = true
+                    } else if idle_ms > 0 && now >= c.last_activity_ms && now - c.last_activity_ms >= idle_ms {
+                        drop = true
+                    }
+                }
+                if !drop && do_sweep {
+                    let item = net.SslPollItem {
+                        desc: net.BioPollDescriptor { kind: net.BIO_POLL_DESCRIPTOR_TYPE_SSL, value: c.ssl.@cast(ptr) },
+                        events: net.SSL_POLL_EVENT_EC | net.SSL_POLL_EVENT_ECD
+                    }
+                    let tv = ext.libc_timeval { tv_sec: 0, tv_usec: 0 }
+                    let rcount: uint = 0
+                    if net.SSL_poll(@ref(item), 1, size_of(net.SslPollItem), @ref(tv), net.SSL_POLL_FLAG_NO_HANDLE_EVENTS, @ref(rcount)) == 1
+                        && rcount > 0 && (item.revents & (net.SSL_POLL_EVENT_EC | net.SSL_POLL_EVENT_ECD)) != 0 {
+                        drop = true
+                    }
+                }
+                if drop {
+                    c.close_with_error(H3_ERR_NO_ERROR)
+                    this.conns.remove(ci)
+                } else {
+                    ci++
+                }
+            }
+
+            // Flush any newly queued QUIC packets
+            this.listener.handle_events()
+
+            if draining {
+                if this.conns.length == 0 : break
+                if time.mono_ms() >= this.server.deadline_ms : break
+            }
+            if progressed : continue
+
+            let max_wait: uint = draining ? 10 : 25
+            let wait_ms = this.listener.event_timeout_ms(max_wait)
+            if wait_ms == 0 {
+                coro.await_last()
+                continue
+            }
+            if this.total_active_handlers == 0 && !this.watcher_armed {
+                net.quic_await_fd(this.listener.fd, true, this.listener.write_desired(), wait_ms)
+                continue
+            }
+            if !this.watcher_started {
+                this.watcher_started = true
+                co this.watcher_loop()
+            }
+            if !this.watcher_armed {
+                this.watcher_want_write = this.listener.write_desired()
+                this.watcher_timeout_ms = wait_ms
+                this.watcher_armed = true
+                this.watcher_waker.wake()
+            }
+            this.waker.wait(wait_ms)
+        }
+
+        this.stopped = true
+        if this.watcher_started : this.watcher_waker.wake()
+        while true {
+            let idle = this.idle_servers.pop_last() ! break
+            idle.wake()
+        }
+        each this.conns as c : c.close_with_error(H3_ERR_NO_ERROR)
+        this.conns.clear()
+        this.listener.close()
+    }
+}
+
+fn h3_worker_on_yield(arg: ptr) {
+    let worker = arg.@cast(H3Worker)
+    worker.runner_yielded()
+}
+
+fn h3_worker(server: atomic ServerWorkerData, listener: atomic net.QuicListener) {
+    let w = H3Worker { server: server, listener: listener }
+    await co w.run()
+    if --server.workers == 0 : server.done.unlock()
+}
