@@ -3489,6 +3489,8 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     ~ cookies: CookieJar
     // Whether requests sent through this client prefer HTTP/2 (`h2` ALPN on HTTPS with HTTP/1.1 fallback, or cleartext prior-knowledge `h2c` on plain HTTP). Defaults to `false`.
     + http2: bool
+    // Whether requests sent through this client use HTTP/3 over QUIC (`h3`) on HTTPS URLs. Defaults to `false`.
+    + http3: bool
     // How long an idle connection is kept, in milliseconds.
     + idle_timeout_ms: uint
     // How many idle connections are kept per host.
@@ -3790,6 +3792,8 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     + host: ?String
     // Whether the HTTP client uses HTTP/2: ALPN `h2` with HTTP/1.1 fallback on `https://`, or prior-knowledge cleartext HTTP/2 (`h2c`) on `http://`. Defaults to `false`.
     + http2: bool
+    // Whether the HTTP client uses HTTP/3 over QUIC (`ALPN h3`) on `https://` URLs. Defaults to `false`.
+    + http3: bool
     // The number of redirects to follow before failing with `too_many_redirects`.
     + max_redirects: uint
     // The largest accepted response body in bytes, also when it goes to `output`; zero disables the limit.
@@ -3895,6 +3899,8 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 
     // Adds a header field, keeping earlier fields with the same name.
     + fn add_header(name: String, value: String) void
+    // Adds a trailing header field, keeping earlier fields with the same name.
+    + fn add_trailer(name: String, value: String) void
     // Deletes the cookie `name` at the browser, by sending it expired.
     + fn clear_cookie(name: String, path: String ("/"), domain: ?String (null)) void
     // Creates a response with an empty body; also backs default construction.
@@ -3919,10 +3925,14 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     + fn set_cookie(cookie: Cookie) void
     // Sets the header `name` to `value`, replacing earlier values for that name.
     + fn set_header(name: String, value: String) void
+    // Sets the trailing header `name` to `value`, replacing earlier values for that name.
+    + fn set_trailer(name: String, value: String) void
     // Creates a response whose body is streamed from `reader`.
     + static fn stream(reader: Reader, size: ?uint (null), content_type: String ("application/octet-stream"), filename: ?String (null)) Response
     // Creates a `text/plain; charset=utf-8` response.
     + static fn text(body: String, code: u16 (200), headers: ?Headers (null)) Response
+    // Trailing headers sent after the response body over HTTP/2, created empty on first access.
+    + get trailers: Headers
 }
 ```
 
@@ -3995,8 +4005,10 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     + header_timeout_ms: uint
     // The address the server listens on.
     ~ host: String
-    // Enables HTTP/2: negotiated through ALPN with HTTP/1.1 as fallback when `tls` is configured, or cleartext HTTP/2 (`h2c` prior knowledge) without `tls`.
+    // Enables HTTP/2: negotiated through ALPN with HTTP/1.1 as fallback when `tls` is configured, or cleartext HTTP/2 (`h2c` prior knowledge) with HTTP/1.1 as fallback without `tls`.
     + http2: bool
+    // Enables HTTP/3 over QUIC (UDP) on the same port alongside the TCP listener.
+    + http3: bool
     // How long a connection may wait for the next request, in milliseconds. Defaults to 75 seconds: an idle connection costs little, and a client that comes back within a minute keeps its connection.
     + idle_timeout_ms: uint
     // The number of open connections allowed; 0 means no limit, which is the default.
