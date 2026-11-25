@@ -1,9 +1,12 @@
 // Pure-Valk QUIC v1 connection state machine (RFC 9000 / 9001 / 9002)
 // driving TLS 1.3 through OpenSSL 3.5's SSL_set_quic_tls_cbs().
 
+use crypto
 use mem
+use time
 
 value QUIC_MAX_DATAGRAM_INIT (1200)
+value QUIC_MAX_DATAGRAM_MID (1350)
 value QUIC_MAX_DATAGRAM_1RTT (1452)
 value QUIC_INITIAL_RTT_US (333_000)
 value QUIC_GRANULARITY_US (1_000)
@@ -18,6 +21,7 @@ value QUIC_MAX_STREAM_OOO (64)
 class QuicServerContext {
     ctx: SSL_CTX
     has_client_ca: bool (false)
+    reset_secret: String ("")
 
     static fn new(
         certificate_file: String,
@@ -42,7 +46,12 @@ class QuicServerContext {
         }
         SSL_CTX_set_alpn_select_cb(ctx, h3_alpn_select, null)
         ERR_clear_error()
-        return SELF { ctx: ctx }
+        let secret_buf: [u8 x 32] = { 0... }
+        crypto.RAND_bytes(@ref(secret_buf).@cast(ptr), 32)
+        return SELF {
+            ctx: ctx,
+            reset_secret: String.copy_from_ptr(@ref(secret_buf).@cast(ptr), 32)
+        }
     }
 
     fn set_client_ca(ca_file: String, required: bool (true)) !NetError {
@@ -345,6 +354,7 @@ value QSP_HANDSHAKE_DONE (1 << 5)
 value QSP_MAX_DATA (1 << 6)
 value QSP_MAX_STREAMS_BIDI (1 << 7)
 value QSP_MAX_STREAMS_UNI (1 << 8)
+value QSP_MTU_PROBE (1 << 9)
 
 // Value struct recorded per transmitted stream frame (stored in flat ring, zero GC alloc)
 struct QuicSentChunk {
@@ -826,7 +836,7 @@ fn quic_tls_cb_got_transport_params(ssl: OSSL, params: ptr, params_len: uint, ar
     let dgram = p.max_udp_payload_size
     if dgram > QUIC_MAX_DATAGRAM_1RTT : dgram = QUIC_MAX_DATAGRAM_1RTT
     if dgram < QUIC_MAX_DATAGRAM_INIT : dgram = QUIC_MAX_DATAGRAM_INIT
-    conn.max_datagram_1rtt = dgram.to(uint)
+    conn.peer_max_udp = dgram.to(uint)
     return 1
 }
 
@@ -894,8 +904,12 @@ class QuicConn {
     pto_probes: [u8 x 3] ({ 0, 0, 0 })
     last_ack_eliciting_tx_us: u64 (0)
 
-    // CUBIC congestion control (RFC 9438)
+    // CUBIC congestion control (RFC 9438) & DPLPMTUD (RFC 8899)
     max_datagram_1rtt: uint (QUIC_MAX_DATAGRAM_INIT)
+    peer_max_udp: uint (QUIC_MAX_DATAGRAM_INIT)
+    mtu_probe_target: uint (0)
+    mtu_probe_attempts: u8 (0)
+    mtu_probe_in_flight: bool (false)
     cwnd: u64 (14_720)
     ssthresh: u64 (u64.$max)
     bytes_in_flight: u64 (0)
@@ -927,12 +941,15 @@ class QuicConn {
     need_path_response: bool (false)
     path_challenge_data: [u8 x 8] ({ 0... })
 
-    // Connection close / idle state
+    // Connection close / draining / idle state (RFC 9000 §10.2)
     last_rx_us: u64 (0)
     closing: bool (false)
+    peer_closed: bool (false)
     close_sent: bool (false)
     close_is_app: bool (false)
     close_err_code: u64 (0)
+    draining_until_us: u64 (0)
+    last_close_tx_us: u64 (0)
     closed: bool (false)
     dirty: bool (false)
     in_dirty_list: bool (false)
@@ -978,10 +995,17 @@ class QuicConn {
             return null
         }
 
+        let reset_tok: [u8 x 16] = { 0... }
+        let has_tok = quic_stateless_reset_token(
+            endpoint.listener.context.reset_secret.data,
+            @ref(conn.scid).@cast(ptr), QUIC_SCID_LEN,
+            @ref(reset_tok).@cast(ptr)
+        )
         quic_encode_server_transport_params(
             conn.local_tp,
             @ref(conn.odcid).@cast(ptr), conn.odcid_len,
             @ref(conn.scid).@cast(ptr), QUIC_SCID_LEN,
+            has_tok ? @ref(reset_tok).@cast(ptr) : null,
             30_000
         )
 
@@ -1009,12 +1033,50 @@ class QuicConn {
         this.mark_dirty()
     }
 
+    fn release_all_streams() {
+        each this.streams as st, _ {
+            st.closed = true
+            st.send_body = ""
+            st.send_tail = null
+            st.send_retrans = null
+            st.send_acked_ranges = null
+            st.recv_ooo = null
+            this.endpoint.give_stream(st)
+        }
+        this.streams.clear()
+        this.send_queue.clear()
+        this.rx_ready_streams.clear()
+    }
+
     fn close_with_error(code: u64, is_app: bool) {
         if this.closing || this.closed : return
         this.closing = true
         this.close_is_app = is_app
         this.close_err_code = code
+        this.close_sent = false
+        let now_us = time.mono_us().to(u64)
+        let hold = this.pto_duration_us() * 3
+        if hold < 50_000 : hold = 50_000
+        if hold > 3_000_000 : hold = 3_000_000
+        this.draining_until_us = now_us + hold
+        this.release_all_streams()
         this.mark_dirty()
+    }
+
+    fn enter_draining(now_us: u64) {
+        if this.closed : return
+        this.closing = true
+        this.peer_closed = true
+        this.close_sent = true
+        let hold = this.pto_duration_us() * 3
+        if hold < 50_000 : hold = 50_000
+        if hold > 1_000_000 : hold = 1_000_000
+        if this.draining_until_us == 0 : this.draining_until_us = now_us + hold
+        this.release_all_streams()
+    }
+
+    fn is_draining_expired(now_us: u64) bool $inline {
+        return this.closing && this.close_sent && this.draining_until_us > 0 && now_us >= this.draining_until_us
     }
 
     fn free_resources() {
@@ -1033,13 +1095,7 @@ class QuicConn {
             nxt.free()
             this.rx_next_cipher = null
         }
-        each this.streams as st, _ {
-            this.endpoint.give_buf(st.recv_buf)
-            this.endpoint.give_buf(st.send_hdr)
-        }
-        this.streams.clear()
-        this.send_queue.clear()
-        this.rx_ready_streams.clear()
+        this.release_all_streams()
     }
 
     fn open_server_uni_stream() QuicStream {
@@ -1097,9 +1153,11 @@ class QuicConn {
                 this.handshake_done = true
                 this.addr_validated = true
                 this.need_handshake_done = true
-                // Start 1-RTT CWND with negotiated 1-RTT datagram size
-                let init_cwnd: u64 = (10 * this.max_datagram_1rtt).to(u64)
-                if init_cwnd > this.cwnd : this.cwnd = init_cwnd
+                // Start DPLPMTUD probing upward from 1200 to peer_max_udp (up to 1452)
+                if this.peer_max_udp > this.max_datagram_1rtt {
+                    this.mtu_probe_target = this.peer_max_udp
+                    this.mtu_probe_attempts = 0
+                }
                 this.mark_dirty()
                 return
             }
@@ -1146,6 +1204,16 @@ class QuicConn {
     // Processes an incoming UDP datagram (which may contain multiple coalesced QUIC packets).
     fn on_datagram(pkt: ptr, len: uint, peer_addr: ptr, peer_addr_len: u32, now_us: u64) {
         if this.closed || len == 0 : return
+        if this.closing {
+            // Draining state (peer closed): MUST NOT transmit packets (RFC 9000 §10.2.2)
+            if this.peer_closed : return
+            // Closing state (we closed): rate-limited CONNECTION_CLOSE retransmission (RFC 9000 §10.2.1)
+            if this.close_sent && now_us >= this.last_close_tx_us + 20_000 {
+                this.close_sent = false
+                this.mark_dirty()
+            }
+            return
+        }
         this.last_rx_us = now_us
         if !this.addr_validated : this.bytes_rx_pre_val += len.to(u64)
         // Track peer address updates (connection migration / NAT rebinding)
@@ -1508,9 +1576,8 @@ class QuicConn {
                 continue
             }
             if ftype == QUIC_FRAME_CONNECTION_CLOSE || ftype == QUIC_FRAME_CONNECTION_CLOSE_APP {
-                // Peer closed connection
-                this.closing = true
-                this.close_sent = true
+                // Peer closed connection: enter draining state for 3*PTO (RFC 9000 §10.2.2)
+                this.enter_draining(now_us)
                 return
             }
             if ftype == QUIC_FRAME_NEW_TOKEN {
@@ -1715,6 +1782,16 @@ class QuicConn {
                     this.handshake_confirmed = true
                     this.discard_level(QUIC_LVL_HANDSHAKE)
                 }
+                if (pkt.flags & QSP_MTU_PROBE) != 0 {
+                    this.mtu_probe_in_flight = false
+                    let probed = pkt.bytes.to(uint)
+                    if probed > this.max_datagram_1rtt {
+                        this.max_datagram_1rtt = probed
+                        let min_cwnd: u64 = (10 * probed).to(u64)
+                        if min_cwnd > this.cwnd : this.cwnd = min_cwnd
+                    }
+                    this.mtu_probe_target = 0
+                }
                 if pkt.chunk_count > 0 {
                     let ci: uint = 0
                     let cbase = pkt.chunk_start.to(uint)
@@ -1793,6 +1870,23 @@ class QuicConn {
                 }
                 if (pkt.flags & QSP_ACK_ELICITING) != 0 && sp.ack_eliciting_in_flight > 0 {
                     sp.ack_eliciting_in_flight--
+                }
+                if (pkt.flags & QSP_MTU_PROBE) != 0 {
+                    // RFC 8899: MTU probe loss does NOT trigger congestion control reduction
+                    this.mtu_probe_in_flight = false
+                    if this.mtu_probe_attempts >= 2 {
+                        if this.mtu_probe_target > QUIC_MAX_DATAGRAM_MID {
+                            this.mtu_probe_target = QUIC_MAX_DATAGRAM_MID
+                            this.mtu_probe_attempts = 0
+                            this.mark_dirty()
+                        } else {
+                            this.mtu_probe_target = 0
+                        }
+                    } else {
+                        this.mark_dirty()
+                    }
+                    i++
+                    continue
                 }
                 if pkt.sent_us > largest_lost_sent_us : largest_lost_sent_us = pkt.sent_us
                 lost_any = true
@@ -1879,6 +1973,7 @@ class QuicConn {
     // Returns the earliest timer deadline in microseconds (0 = no timer active).
     fn next_timer_us() u64 {
         if this.closed : return 0
+        if this.closing : return this.draining_until_us
         let best: u64 = 0
         let lvl: uint = 0
         while lvl < 3 {
@@ -1904,8 +1999,41 @@ class QuicConn {
         return best
     }
 
+    // Directly re-queues the oldest unacked CRYPTO/control/STREAM data on PTO (RFC 9002 §6.2.4)
+    // so tail-packet loss recovers in 1 RTT instead of waiting for a PING/ACK round-trip.
+    fn schedule_pto_retransmit(lvl: uint) {
+        let sp = this.spaces[lvl]
+        this.pto_probes[lvl] = 1
+        let i = sp.sent_head
+        while i < sp.sent.length {
+            let pkt = sp.sent[i]
+            if (pkt.flags & (QSP_ACKED | QSP_LOST)) == 0 && (pkt.flags & QSP_ACK_ELICITING) != 0 && (pkt.flags & QSP_MTU_PROBE) == 0 {
+                if (pkt.flags & QSP_CRYPTO) != 0 && !sp.discarded {
+                    this.crypto_tx[lvl].mark_lost(pkt.crypto_off, pkt.crypto_len)
+                }
+                if (pkt.flags & QSP_HANDSHAKE_DONE) != 0 && !this.handshake_confirmed {
+                    this.need_handshake_done = true
+                }
+                if (pkt.flags & QSP_MAX_DATA) != 0 : this.need_max_data = true
+                if (pkt.flags & QSP_MAX_STREAMS_BIDI) != 0 : this.need_max_streams_bidi = true
+                if pkt.chunk_count > 0 {
+                    let ci: uint = 0
+                    let cbase = pkt.chunk_start.to(uint)
+                    while ci < pkt.chunk_count.to(uint) {
+                        let ch = sp.chunks[cbase + ci]
+                        let st = this.streams.get(ch.stream_id) !? null
+                        if isset(st) && !st.closed : st.on_lost(ch.off, ch.len, ch.fin)
+                        ci++
+                    }
+                }
+                return
+            }
+            i++
+        }
+    }
+
     fn on_timeout(now_us: u64) {
-        if this.closed : return
+        if this.closed || this.closing : return
         let lvl: uint = 0
         let had_loss_timer = false
         while lvl < 3 {
@@ -1931,13 +2059,12 @@ class QuicConn {
             if now_us >= pto_at {
                 this.pto_count++
                 this.last_ack_eliciting_tx_us = now_us
-                // Schedule a probe in the highest active space with ack-eliciting packets
                 if !this.spaces[QUIC_LVL_INITIAL].discarded && this.spaces[QUIC_LVL_INITIAL].ack_eliciting_in_flight > 0 {
-                    this.pto_probes[QUIC_LVL_INITIAL] = 1
+                    this.schedule_pto_retransmit(QUIC_LVL_INITIAL)
                 } else if !this.spaces[QUIC_LVL_HANDSHAKE].discarded && this.spaces[QUIC_LVL_HANDSHAKE].ack_eliciting_in_flight > 0 {
-                    this.pto_probes[QUIC_LVL_HANDSHAKE] = 1
+                    this.schedule_pto_retransmit(QUIC_LVL_HANDSHAKE)
                 } else {
-                    this.pto_probes[QUIC_LVL_APP] = 1
+                    this.schedule_pto_retransmit(QUIC_LVL_APP)
                 }
                 this.mark_dirty()
             }
@@ -1994,6 +2121,7 @@ class QuicConn {
             p = quic_put_varint(dst, p, 0)
             p = quic_put_varint(dst, p, 0)
             this.close_sent = true
+            this.last_close_tx_us = now_us
         }
         if send_crypto && !this.closing {
             // Retransmit lost crypto range first, otherwise fresh bytes
@@ -2113,6 +2241,7 @@ class QuicConn {
                 if !this.close_is_app : p = quic_put_varint(dst, p, 0)
                 p = quic_put_varint(dst, p, 0)
                 this.close_sent = true
+                this.last_close_tx_us = now_us
             }
         }
         // 2. ACK
@@ -2334,11 +2463,44 @@ class QuicConn {
         return total
     }
 
+    // Builds ONE standalone 1-RTT DPLPMTUD probe packet padded to `probe_len` (RFC 8899).
+    fn build_mtu_probe_packet(dst: ptr, probe_len: uint, now_us: u64) uint {
+        let sp = this.spaces[QUIC_LVL_APP]
+        if sp.discarded || !this.tx_cipher[QUIC_LVL_APP].ready : return 0
+        let pn = sp.next_pn
+        let pn_len = quic_pn_encode_len(pn, sp.largest_acked, sp.has_acked)
+        let pn_off: uint = 1 + this.peer_cid_len
+        let payload_start = pn_off + pn_len
+        if payload_start + QUIC_AEAD_TAG_LEN + 4 > probe_len : return 0
+        let payload_end = probe_len - QUIC_AEAD_TAG_LEN
+
+        @unsafe
+        @ptrv(dst, u8, 0) = 0x40 | (this.tx_key_phase ? 0x04 : 0) | (pn_len - 1).to(u8)
+        if this.peer_cid_len > 0 : mem.copy_bytes(@ref(this.peer_cid).@cast(ptr), dst.@offset(1), this.peer_cid_len)
+        quic_put_pn(dst, pn_off, pn, pn_len)
+        @ptrv(dst, u8, payload_start) = QUIC_FRAME_PING
+        mem.clear_bytes(dst.@offset(payload_start + 1), payload_end - payload_start - 1)
+
+        let pt_len = payload_end - payload_start
+        if !this.tx_cipher[QUIC_LVL_APP].encrypt_packet(dst, pn_off, pn_len, pt_len, pn) : return 0
+        sp.next_pn++
+        sp.ack_eliciting_in_flight++
+        this.last_ack_eliciting_tx_us = now_us
+        sp.sent.append(QuicSentPkt {
+            pn: pn,
+            sent_us: now_us,
+            bytes: probe_len.to(u32),
+            flags: QSP_ACK_ELICITING | QSP_MTU_PROBE
+        })
+        return probe_len
+    }
+
     // Flush handshake (coalesced Initial + Handshake + 1-RTT) and/or 1-RTT GSO burst!
     fn flush(now_us: u64) {
         @unsafe
         if this.closed : return
         this.dirty = false
+        if this.closing && this.peer_closed : return
 
         // 1. Handshake phase: coalesce Initial + Handshake + early 1-RTT into 1200B datagrams
         while !this.spaces[QUIC_LVL_INITIAL].discarded || !this.spaces[QUIC_LVL_HANDSHAKE].discarded {
@@ -2363,7 +2525,6 @@ class QuicConn {
             if off == 0 : break
             // Pad datagrams carrying ack-eliciting Initial packets to 1200 bytes (RFC 9000 §14.1)
             if has_ae_initial && off < 1200 {
-                @unsafe
                 mem.clear_bytes(dst.@offset(off), 1200 - off)
                 off = 1200
             }
@@ -2371,8 +2532,16 @@ class QuicConn {
             this.endpoint.queue_tx_datagram(dst, off, @ref(this.peer_addr).@cast(ptr), this.peer_addr_len)
         }
 
-        // 2. Steady-state 1-RTT: pack up to 44 packets per flush (using Linux UDP GSO when >=2 full packets!)
+        // 2. Steady-state 1-RTT: send standalone DPLPMTUD probe if pending, then GSO burst
         if !this.tx_cipher[QUIC_LVL_APP].ready : return
+        if !this.closing && this.mtu_probe_target > this.max_datagram_1rtt && !this.mtu_probe_in_flight && this.mtu_probe_attempts < 2 {
+            let probe_len = this.build_mtu_probe_packet(this.endpoint.gso_tx_buf, this.mtu_probe_target, now_us)
+            if probe_len > 0 {
+                this.mtu_probe_in_flight = true
+                this.mtu_probe_attempts++
+                this.endpoint.queue_tx_datagram(this.endpoint.gso_tx_buf, probe_len, @ref(this.peer_addr).@cast(ptr), this.peer_addr_len)
+            }
+        }
         let seg_sz = this.max_datagram_1rtt
         let gso_buf = this.endpoint.gso_tx_buf
         let gso_len: uint = 0

@@ -124,6 +124,8 @@ class QuicEndpoint {
     tx_lens: [uint x 64] ({ 0... })
     tx_count: uint (0)
     gso_enabled: bool (true)
+    reset_window_us: u64 (0)
+    reset_sent_in_window: u32 (0)
 
     #if OS == "linux"
     rx_addrs: ByteBuffer (.new(QUIC_RX_BATCH * 28))
@@ -324,6 +326,35 @@ class QuicEndpoint {
         #end
     }
 
+    // Emits a rate-limited Stateless Reset packet (RFC 9000 §10.3) for an unknown Short Header CID.
+    fn maybe_send_stateless_reset(pkt: ptr, trigger_len: uint, addr: ptr, alen: u32, now_us: u64) {
+        // RFC 9000 §10.3.3 anti-loop: trigger must be >= 43 bytes and response strictly smaller
+        if trigger_len < 43 : return
+        if now_us >= this.reset_window_us + 1_000_000 {
+            this.reset_window_us = now_us
+            this.reset_sent_in_window = 0
+        }
+        if this.reset_sent_in_window >= 64 : return
+        this.reset_sent_in_window++
+
+        let out_len: uint = trigger_len - 1
+        if out_len > 39 : out_len = 39
+        if out_len < 21 : return
+        let buf: [u8 x 39] = @undefined
+        @unsafe
+        let dst = @ref(buf).@cast(ptr)
+        let prefix_len = out_len - 16
+        crypto.RAND_bytes(dst, prefix_len.to(i32))
+        // Short header form (bit 7 = 0), fixed bit (bit 6 = 1)
+        @ptrv(dst, u8, 0) = (@ptrv(dst, u8, 0) & 0x3f) | 0x40
+        if !quic_stateless_reset_token(
+            this.listener.context.reset_secret.data,
+            pkt.@offset(1), QUIC_SCID_LEN,
+            dst.@offset(prefix_len)
+        ) : return
+        this.queue_tx_datagram(dst, out_len, addr, alen)
+    }
+
     fn dispatch_udp(pkt: ptr, len: uint, addr: ptr, alen: u32, now_us: u64, allow_new: bool) {
         if len < 21 : return
         @unsafe
@@ -333,19 +364,32 @@ class QuicEndpoint {
             if (b0 & 0x40) == 0 : return
             let scid = quic_get_u64_be(pkt, 1)
             let conn = this.conns_by_scid.get(scid) !? null
-            if isset(conn) : conn.on_datagram(pkt, len, addr, alen, now_us)
+            if isset(conn) {
+                conn.on_datagram(pkt, len, addr, alen, now_us)
+            } else {
+                this.maybe_send_stateless_reset(pkt, len, addr, alen, now_us)
+            }
             return
         }
         // Long Header: extract version, DCID, SCID
-        if (b0 & 0x40) == 0 : return
         let ver = quic_get_u32_be(pkt, 1)
-        if ver != QUIC_VERSION_1 : return
         let dcid_len = @ptrv(pkt, u8, 5).to(uint)
         if 6 + dcid_len + 1 > len : return
         let dcid_ptr = pkt.@offset(6)
         let scid_len = @ptrv(pkt, u8, 6 + dcid_len).to(uint)
         if 7 + dcid_len + scid_len > len : return
         let scid_ptr = pkt.@offset(7 + dcid_len)
+
+        // Unsupported QUIC version: reply with Version Negotiation (RFC 9000 §6, anti-amplification >= 1200B)
+        if ver != QUIC_VERSION_1 {
+            if ver != 0 && len >= QUIC_MAX_DATAGRAM_INIT && dcid_len <= 20 && scid_len <= 20 {
+                let vn: [u8 x 64] = @undefined
+                let vn_len = quic_build_version_negotiation(@ref(vn).@cast(ptr), 64, dcid_ptr, dcid_len, scid_ptr, scid_len)
+                if vn_len > 0 : this.queue_tx_datagram(@ref(vn).@cast(ptr), vn_len, addr, alen)
+            }
+            return
+        }
+        if (b0 & 0x40) == 0 : return
 
         // Lookup by our 8-byte SCID first
         if dcid_len == QUIC_SCID_LEN {

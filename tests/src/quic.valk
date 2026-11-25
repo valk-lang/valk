@@ -148,7 +148,7 @@ test "QUIC: transport parameters encode/decode and validation" {
 
     // Server-only parameter sent by client must be rejected
     let bad = ByteBuffer.new(64)
-    net.quic_encode_server_transport_params(bad, @ref(odcid).@cast(ptr), 8, @ref(scid).@cast(ptr), 8, 30_000)
+    net.quic_encode_server_transport_params(bad, @ref(odcid).@cast(ptr), 8, @ref(scid).@cast(ptr), 8, null, 30_000)
     let ok_bad, _ = net.quic_decode_peer_transport_params(bad.data, bad.length)
     assert(!ok_bad)
 
@@ -281,4 +281,130 @@ test "QUIC: repeated HTTP/3 requests on one connection clean up streams without 
     client.close()
     srv.shutdown(500)
     time.sleep_ms(30)
+}
+
+test "QUIC: Version Negotiation and Stateless Reset responses (RFC 9000 §6, §10.3)" {
+    @unsafe
+    let ctx = net.QuicServerContext.new(tls_cert_path(), tls_key_path()) !!
+    let ql = net.QuicListener.new(ctx, "127.0.0.1", 0, 5000, false) !!
+    let ep = net.QuicEndpoint.new(ql, 8)
+    defer ep.close()
+
+    let addr: [u8 x 16] = { 0... }
+    let ap = @ref(addr).@cast(ptr)
+
+    // 1. Unknown QUIC version (e.g. QUIC v2 0x6b3343cf) with < 1200B must NOT emit VN (anti-amplification)
+    let pkt: [u8 x 1250] = { 0... }
+    let p = @ref(pkt).@cast(ptr)
+    pkt[0] = 0xc0
+    net.quic_put_u32_be(p, 1, 0x6b3343cf)
+    pkt[5] = 8 // dcid_len
+    pkt[6] = 0x11; pkt[7] = 0x22; pkt[8] = 0x33; pkt[9] = 0x44
+    pkt[10] = 0x55; pkt[11] = 0x66; pkt[12] = 0x77; pkt[13] = 0x88
+    pkt[14] = 4 // scid_len
+    pkt[15] = 0xaa; pkt[16] = 0xbb; pkt[17] = 0xcc; pkt[18] = 0xdd
+
+    ep.dispatch_udp(p, 500, ap, 16, 1000, true)
+    assert(ep.tx_count == 0)
+
+    // With >= 1200B: MUST queue Version Negotiation packet advertising QUIC v1
+    ep.dispatch_udp(p, 1200, ap, 16, 2000, true)
+    assert(ep.tx_count == 1)
+    let vn = ep.tx_mem.data
+    let vn_len = ep.tx_lens[0]
+    assert(vn_len == 1 + 4 + 1 + 4 + 1 + 8 + 4)
+    assert((@ptrv(vn, u8, 0) & 0x80) != 0)
+    assert(net.quic_get_u32_be(vn, 1) == 0) // Version 0 = VN
+    assert(@ptrv(vn, u8, 5) == 4 && @ptrv(vn, u8, 6) == 0xaa && @ptrv(vn, u8, 9) == 0xdd) // client SCID -> VN DCID
+    assert(@ptrv(vn, u8, 10) == 8 && @ptrv(vn, u8, 11) == 0x11 && @ptrv(vn, u8, 18) == 0x88) // client DCID -> VN SCID
+    assert(net.quic_get_u32_be(vn, 19) == net.QUIC_VERSION_1)
+    ep.tx_count = 0
+
+    // 2. Stateless Reset for unknown Short Header CID:
+    //    < 43B must NOT trigger a reset (RFC 9000 §10.3.3 anti-loop)
+    let sh: [u8 x 64] = { 0... }
+    let sp = @ref(sh).@cast(ptr)
+    sh[0] = 0x40
+    sh[1] = 0xde; sh[2] = 0xad; sh[3] = 0xbe; sh[4] = 0xef
+    sh[5] = 0x01; sh[6] = 0x02; sh[7] = 0x03; sh[8] = 0x04
+    ep.dispatch_udp(sp, 42, ap, 16, 3000, true)
+    assert(ep.tx_count == 0)
+
+    //    >= 43B MUST emit a strictly smaller packet ending in the deterministic 16-byte HMAC token
+    ep.dispatch_udp(sp, 43, ap, 16, 4000, true)
+    assert(ep.tx_count == 1)
+    let sr = ep.tx_mem.data
+    let sr_len = ep.tx_lens[0]
+    assert(sr_len >= 21 && sr_len < 43)
+    assert((@ptrv(sr, u8, 0) & 0xc0) == 0x40)
+    let expected_tok: [u8 x 16] = { 0... }
+    assert(net.quic_stateless_reset_token(ctx.reset_secret.data, sp.@offset(1), 8, @ref(expected_tok).@cast(ptr)))
+    let ti: uint = 0
+    while ti < 16 {
+        assert(@ptrv(sr, u8, sr_len - 16 + ti) == expected_tok[ti])
+        ti++
+    }
+    ep.tx_count = 0
+}
+
+test "QUIC: DPLPMTUD probe upgrade, loss fallback without CC penalty, PTO retransmit, and draining hold" {
+    @unsafe
+    let ctx = net.QuicServerContext.new(tls_cert_path(), tls_key_path()) !!
+    let ql = net.QuicListener.new(ctx, "127.0.0.1", 0, 5000, false) !!
+    let ep = net.QuicEndpoint.new(ql, 8)
+    defer ep.close()
+
+    let odcid: [u8 x 8] = { 1, 2, 3, 4, 5, 6, 7, 8 }
+    let pcid: [u8 x 8] = { 9, 8, 7, 6, 5, 4, 3, 2 }
+    let addr: [u8 x 16] = { 0... }
+    let conn = net.QuicConn.create(ep, @ref(odcid).@cast(ptr), 8, @ref(pcid).@cast(ptr), 8, @ref(addr).@cast(ptr), 16, 1_000_000) ?! {
+        assert(false)
+        return
+    }
+    defer conn.free_resources()
+
+    // Starts conservatively at 1200
+    assert(conn.max_datagram_1rtt == net.QUIC_MAX_DATAGRAM_INIT)
+    let cwnd_before = conn.cwnd
+
+    // Simulate failed 1452 MTU probe (2 attempts) -> steps down to 1350 WITHOUT reducing CWND!
+    conn.peer_max_udp = net.QUIC_MAX_DATAGRAM_1RTT
+    conn.mtu_probe_target = net.QUIC_MAX_DATAGRAM_1RTT
+    conn.mtu_probe_attempts = 2
+    conn.mtu_probe_in_flight = true
+    let sp = conn.spaces[net.QUIC_LVL_APP]
+    sp.sent.append(net.QuicSentPkt { pn: 0, sent_us: 1_000_000, bytes: 1452, flags: net.QSP_ACK_ELICITING | net.QSP_MTU_PROBE })
+    sp.sent.append(net.QuicSentPkt { pn: 3, sent_us: 1_001_000, bytes: 100, flags: net.QSP_ACK_ELICITING | net.QSP_IN_FLIGHT })
+    sp.has_acked = true
+    sp.largest_acked = 3
+    conn.detect_lost_packets(net.QUIC_LVL_APP, 1_010_000)
+    assert(conn.cwnd == cwnd_before)
+    assert(!conn.mtu_probe_in_flight)
+    assert(conn.mtu_probe_target == net.QUIC_MAX_DATAGRAM_MID)
+
+    // Simulate ACK of 1350 MTU probe -> upgrades max_datagram_1rtt to 1350
+    conn.mtu_probe_in_flight = true
+    sp.sent.append(net.QuicSentPkt { pn: 4, sent_us: 1_011_000, bytes: 1350, flags: net.QSP_ACK_ELICITING | net.QSP_MTU_PROBE })
+    conn.apply_ack_range(net.QUIC_LVL_APP, 4, 4, 4)
+    assert(conn.max_datagram_1rtt == 1350)
+    assert(!conn.mtu_probe_in_flight && conn.mtu_probe_target == 0)
+
+    // PTO direct retransmission re-queues unacked CRYPTO data in Initial space
+    let isp = conn.spaces[net.QUIC_LVL_INITIAL]
+    isp.sent.append(net.QuicSentPkt {
+        pn: 0, sent_us: 1_000_000, bytes: 200,
+        flags: net.QSP_ACK_ELICITING | net.QSP_IN_FLIGHT | net.QSP_CRYPTO,
+        crypto_off: 0, crypto_len: 120
+    })
+    isp.ack_eliciting_in_flight = 1
+    conn.schedule_pto_retransmit(net.QUIC_LVL_INITIAL)
+    assert(conn.crypto_tx[net.QUIC_LVL_INITIAL].retrans.length == 1)
+    assert(conn.crypto_tx[net.QUIC_LVL_INITIAL].retrans[0].len == 120)
+
+    // Peer-initiated CONNECTION_CLOSE enters draining state for 3*PTO and suppresses all TX
+    conn.enter_draining(2_000_000)
+    assert(conn.closing && conn.peer_closed && conn.close_sent)
+    assert(conn.draining_until_us >= 2_050_000)
+    assert(!conn.is_draining_expired(2_010_000))
+    assert(conn.is_draining_expired(conn.draining_until_us))
 }
