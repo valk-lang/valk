@@ -102,6 +102,8 @@ def value_for(t, args, view=""):
         return "%s[%s, %s]{ %s => %s }" % (m.group(1), kt, vt, k, v)
     if t == "local &[u8]" or t == "&[u8]":
         return "\"ab\""
+    if t == "Writer":
+        return "ByteBuffer.new()"
     return None
 
 
@@ -144,6 +146,8 @@ def call_line(name, f, args, ctx):
             t = subst(a["type"].strip(), args)
             if t.startswith("local "):
                 t = t[len("local "):]
+            if t == "Writer":
+                t = "ByteBuffer"
             lets.append("let a%d: %s = %s" % (len(values), t, v))
             values.append("a%d" % len(values))
     call = "x.%s(%s)" % (name, ", ".join(values))
