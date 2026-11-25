@@ -4,6 +4,8 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
+- Release 0.9.4
+
 + Release 0.9.3
 + HTTP/3 & QUIC: replaced the OpenSSL QUIC server transport with a pure-Valk QUIC v1 engine over OpenSSL 3.5 `SSL_set_quic_tls_cbs` and `libcrypto` AEAD (UDP GSO/GRO, CUBIC congestion control, DPLPMTUD, PTO retransmit, Version Negotiation, stateless reset, and 3xPTO closing/draining state), delivering ~10x higher HTTP/3 throughput with flat memory usage; added automatic `Alt-Svc` header advertisement (`Server.alt_svc`), `curl --http3-only` + `h2load` interop tests, RFC 9114 `GOAWAY`/`Expect: 100-continue`/coroutine-safe trailer fixes, and faster `H3Client` event loop (4.6x sequential / +35% multiplexed throughput)
 + Cleanup (compiler & stdlib): removed dead private code, unused fields/helpers/FFI constants, and unused `tagged-union.valk` across the compiler and standard library with zero public API breaking changes; replaced 0.8.8 bootstrap workarounds in `gc` (`SharedStopLine $align(64)`) and `json` (`[const PRETTY: bool]`)
