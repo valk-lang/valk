@@ -1,0 +1,2421 @@
+// Pure-Valk QUIC v1 connection state machine (RFC 9000 / 9001 / 9002)
+// driving TLS 1.3 through OpenSSL 3.5's SSL_set_quic_tls_cbs().
+
+use mem
+
+value QUIC_MAX_DATAGRAM_INIT (1200)
+value QUIC_MAX_DATAGRAM_1RTT (1452)
+value QUIC_INITIAL_RTT_US (333_000)
+value QUIC_GRANULARITY_US (1_000)
+value QUIC_PACKET_THRESHOLD (3)
+value QUIC_MAX_ACK_RANGES (64)
+value QUIC_MAX_SENT_RING (4096)
+value QUIC_MAX_CHUNK_RING (8192)
+value QUIC_MAX_CRYPTO_OOO (64)
+value QUIC_MAX_STREAM_OOO (64)
+
+// Server TLS context shared across all QuicListeners on a server.
+class QuicServerContext {
+    ctx: SSL_CTX
+    has_client_ca: bool (false)
+
+    static fn new(
+        certificate_file: String,
+        private_key_file: String,
+        cipher_suites: ?String (null)
+    ) atomic SELF !NetError {
+        @unsafe
+        let ctx = SSL_CTX_new(TLS_server_method())
+        SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_3_VERSION, null)
+        SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MAX_PROTO_VERSION, TLS1_3_VERSION, null)
+        if SSL_CTX_use_certificate_file(ctx, certificate_file.data_cstring, SSL_FILETYPE_PEM) != 1
+            || SSL_CTX_use_PrivateKey_file(ctx, private_key_file.data_cstring, SSL_FILETYPE_PEM) != 1
+            || SSL_CTX_check_private_key(ctx) != 1 {
+            SSL_CTX_free(ctx)
+            ERR_clear_error()
+            throw .ssl
+        }
+        if isset(cipher_suites) && SSL_CTX_set_ciphersuites(ctx, cipher_suites.data_cstring) != 1 {
+            SSL_CTX_free(ctx)
+            ERR_clear_error()
+            throw .ssl
+        }
+        SSL_CTX_set_alpn_select_cb(ctx, h3_alpn_select, null)
+        ERR_clear_error()
+        return SELF { ctx: ctx }
+    }
+
+    fn set_client_ca(ca_file: String, required: bool (true)) !NetError {
+        @unsafe
+        if SSL_CTX_load_verify_locations(this.ctx, ca_file.data_cstring, null) != 1 {
+            ERR_clear_error()
+            throw .ssl
+        }
+        let names = SSL_load_client_CA_file(ca_file.data_cstring)
+        if !isset(names) {
+            ERR_clear_error()
+            throw .ssl
+        }
+        SSL_CTX_set_client_CA_list(this.ctx, names)
+        SSL_CTX_set_verify(this.ctx, required ? SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT : SSL_VERIFY_PEER, null)
+        this.has_client_ca = true
+    }
+
+    fn gc_free() {
+        @unsafe
+        SSL_CTX_free(this.ctx)
+    }
+}
+
+// Inclusive packet number range [lo..hi]
+struct QuicPnRange {
+    lo: u64 (0)
+    hi: u64 (0)
+}
+
+// Byte range [off .. off + len)
+struct QuicByteRange {
+    off: u64 (0)
+    len: u32 (0)
+    fin: bool (false)
+}
+
+// Out-of-order received chunk
+class QuicOooChunk {
+    off: u64 (0)
+    data: ByteBuffer
+}
+
+// Contiguous CRYPTO receive stream per encryption level
+class QuicCryptoRx {
+    buf: ByteBuffer (.new(512))
+    read_off: uint (0)
+    contig_end: u64 (0)
+    ooo: ?Array[QuicOooChunk] (null)
+
+    fn push(off: u64, src: ptr, len: uint) bool {
+        @unsafe
+        if len == 0 : return true
+        let end = off + len.to(u64)
+        if end <= this.contig_end : return true
+        if off <= this.contig_end {
+            let skip = (this.contig_end - off).to(uint)
+            let take = len - skip
+            if this.buf.length - this.read_off + take > 65_536 : return false
+            this.buf.write_bytes(src.@offset(skip), take)
+            this.contig_end += take.to(u64)
+            this.drain_ooo()
+            return true
+        }
+        let list = this.ooo ?? <{
+            let a = Array[QuicOooChunk].new(4)
+            this.ooo = a
+            return a
+        }
+        if list.length >= QUIC_MAX_CRYPTO_OOO : return false
+        let copy = ByteBuffer.new(len)
+        copy.write_bytes(src, len)
+        list.append(QuicOooChunk { off: off, data: copy })
+        return true
+    }
+
+    fn drain_ooo() {
+        @unsafe
+        let list = this.ooo ?! return
+        let progressed = true
+        while progressed && list.length > 0 {
+            progressed = false
+            let i: uint = 0
+            while i < list.length {
+                let c = list[i]
+                let cend = c.off + c.data.length.to(u64)
+                if cend <= this.contig_end {
+                    list.swap_remove(i)
+                    progressed = true
+                    continue
+                }
+                if c.off <= this.contig_end {
+                    let skip = (this.contig_end - c.off).to(uint)
+                    let take = c.data.length - skip
+                    this.buf.write_bytes(c.data.data.@offset(skip), take)
+                    this.contig_end += take.to(u64)
+                    list.swap_remove(i)
+                    progressed = true
+                    continue
+                }
+                i++
+            }
+        }
+    }
+
+    fn avail() uint $inline {
+        return this.buf.length - this.read_off
+    }
+
+    fn read_ptr() ptr $inline {
+        return this.buf.data.@offset(this.read_off)
+    }
+
+    fn consume(n: uint) {
+        this.read_off += n
+        if this.read_off >= this.buf.length {
+            this.buf.clear()
+            this.read_off = 0
+        } else if this.read_off > 4096 {
+            this.buf.clear_range(0, this.read_off)
+            this.read_off = 0
+        }
+    }
+}
+
+// CRYPTO send buffer per encryption level (kept intact until level keys are discarded)
+class QuicCryptoTx {
+    buf: ByteBuffer (.new(512))
+    sent_off: uint (0)
+    retrans: Array[QuicByteRange] (.{})
+
+    fn append(src: ptr, len: uint) {
+        if len == 0 : return
+        @unsafe
+        this.buf.write_bytes(src, len)
+    }
+
+    fn has_pending() bool $inline {
+        return this.retrans.length > 0 || this.sent_off < this.buf.length
+    }
+
+    fn mark_lost(off: u32, len: u32) {
+        if len == 0 : return
+        this.retrans.append(QuicByteRange { off: off.to(u64), len: len, fin: false })
+    }
+}
+
+// Tracks received packet numbers & ACK scheduling for one packet number space.
+class QuicAckTracker {
+    ranges: Array[QuicPnRange] (.new(4))
+    largest_rx: u64 (0)
+    largest_rx_us: u64 (0)
+    has_rx: bool (false)
+    ack_eliciting: u32 (0)
+    ack_immediate: bool (false)
+    ack_deadline_us: u64 (0)
+
+    fn is_dup(pn: u64) bool $inline {
+        let n = this.ranges.length
+        if n == 0 : return false
+        let last = this.ranges[n - 1]
+        if pn > last.hi : return false
+        if pn >= last.lo : return true
+        let i = n - 1
+        while i > 0 {
+            i--
+            let r = this.ranges[i]
+            if pn >= r.lo && pn <= r.hi : return true
+            if pn > r.hi : return false
+        }
+        return false
+    }
+
+    fn on_rx(pn: u64, now_us: u64, ack_eliciting: bool, immediate_threshold: u32, max_ack_delay_us: u64) bool {
+        let n = this.ranges.length
+        if n == 0 {
+            this.ranges.append(QuicPnRange { lo: pn, hi: pn })
+        } else {
+            // Fast path: extends highest range
+            let last = this.ranges[n - 1]
+            if pn == last.hi + 1 {
+                this.ranges[n - 1] = QuicPnRange { lo: last.lo, hi: pn }
+            } else if pn > last.hi + 1 {
+                this.ranges.append(QuicPnRange { lo: pn, hi: pn })
+                if this.ranges.length > QUIC_MAX_ACK_RANGES : this.ranges.remove(0)
+            } else if pn >= last.lo {
+                // Duplicate inside highest range
+                return false
+            } else {
+                // General insertion / merge in sorted ascending ranges
+                let idx: uint = n
+                while idx > 0 {
+                    let r = this.ranges[idx - 1]
+                    if pn >= r.lo && pn <= r.hi : return false
+                    if pn > r.hi : break
+                    idx--
+                }
+                let merge_left = idx > 0 && this.ranges[idx - 1].hi + 1 == pn
+                let merge_right = idx < this.ranges.length && pn + 1 == this.ranges[idx].lo
+                if merge_left && merge_right {
+                    let lo = this.ranges[idx - 1].lo
+                    let hi = this.ranges[idx].hi
+                    this.ranges[idx - 1] = QuicPnRange { lo: lo, hi: hi }
+                    this.ranges.remove(idx)
+                } else if merge_left {
+                    let lo = this.ranges[idx - 1].lo
+                    this.ranges[idx - 1] = QuicPnRange { lo: lo, hi: pn }
+                } else if merge_right {
+                    let hi = this.ranges[idx].hi
+                    this.ranges[idx] = QuicPnRange { lo: pn, hi: hi }
+                } else {
+                    this.ranges.insert(idx, QuicPnRange { lo: pn, hi: pn }) ! {}
+                    if this.ranges.length > QUIC_MAX_ACK_RANGES : this.ranges.remove(0)
+                }
+            }
+        }
+        if !this.has_rx || pn > this.largest_rx {
+            this.has_rx = true
+            this.largest_rx = pn
+            this.largest_rx_us = now_us
+        }
+        if ack_eliciting {
+            this.ack_eliciting++
+            if this.ack_eliciting >= immediate_threshold {
+                this.ack_immediate = true
+            } else if this.ack_deadline_us == 0 {
+                this.ack_deadline_us = now_us + max_ack_delay_us
+            }
+        }
+        return true
+    }
+
+    fn should_send(now_us: u64) bool $inline {
+        if !this.has_rx : return false
+        if this.ack_immediate : return true
+        return this.ack_deadline_us > 0 && now_us >= this.ack_deadline_us
+    }
+
+    fn write_ack(dst: ptr, off: uint, end: uint, now_us: u64, ack_delay_exp: u64) (bool, uint) {
+        let n = this.ranges.length
+        if n == 0 : return (false, off)
+        let top = this.ranges[n - 1]
+        let delay_us = now_us > this.largest_rx_us ? now_us - this.largest_rx_us : 0
+        let delay_val = delay_us >> ack_delay_exp
+        let first_range = top.hi - top.lo
+        let max_extra = n - 1
+        if max_extra > 16 : max_extra = 16
+        // Worst-case header check (type + largest + delay + count + first_range)
+        let need = 1 + quic_varint_len(top.hi) + quic_varint_len(delay_val) + quic_varint_len(max_extra.to(u64)) + quic_varint_len(first_range)
+        if off + need > end : return (false, off)
+
+        // Count how many additional ranges fit
+        let extra_fit: uint = 0
+        let sim_end = off + need
+        let k: uint = 0
+        while k < max_extra {
+            let higher = this.ranges[n - 1 - k]
+            let lower = this.ranges[n - 2 - k]
+            let gap = higher.lo - lower.hi - 2
+            let rlen = lower.hi - lower.lo
+            let sz = quic_varint_len(gap) + quic_varint_len(rlen)
+            if sim_end + sz > end : break
+            sim_end += sz
+            extra_fit++
+            k++
+        }
+
+        let p = off
+        @unsafe
+        @ptrv(dst, u8, p) = QUIC_FRAME_ACK
+        p++
+        p = quic_put_varint(dst, p, top.hi)
+        p = quic_put_varint(dst, p, delay_val)
+        p = quic_put_varint(dst, p, extra_fit.to(u64))
+        p = quic_put_varint(dst, p, first_range)
+        k = 0
+        while k < extra_fit {
+            let higher = this.ranges[n - 1 - k]
+            let lower = this.ranges[n - 2 - k]
+            let gap = higher.lo - lower.hi - 2
+            let rlen = lower.hi - lower.lo
+            p = quic_put_varint(dst, p, gap)
+            p = quic_put_varint(dst, p, rlen)
+            k++
+        }
+        this.ack_eliciting = 0
+        this.ack_immediate = false
+        this.ack_deadline_us = 0
+        return (true, p)
+    }
+}
+
+// Sent packet flags
+value QSP_ACK_ELICITING (1 << 0)
+value QSP_IN_FLIGHT (1 << 1)
+value QSP_ACKED (1 << 2)
+value QSP_LOST (1 << 3)
+value QSP_CRYPTO (1 << 4)
+value QSP_HANDSHAKE_DONE (1 << 5)
+value QSP_MAX_DATA (1 << 6)
+value QSP_MAX_STREAMS_BIDI (1 << 7)
+value QSP_MAX_STREAMS_UNI (1 << 8)
+
+// Value struct recorded per transmitted stream frame (stored in flat ring, zero GC alloc)
+struct QuicSentChunk {
+    stream_id: u64 (0)
+    off: u64 (0)
+    len: u32 (0)
+    fin: bool (false)
+}
+
+// Value struct recorded per transmitted packet (stored in flat ring, zero GC alloc)
+struct QuicSentPkt {
+    pn: u64 (0)
+    sent_us: u64 (0)
+    bytes: u32 (0)
+    flags: u16 (0)
+    chunk_count: u16 (0)
+    chunk_start: u32 (0)
+    crypto_off: u32 (0)
+    crypto_len: u32 (0)
+}
+
+// Per packet-number space tracking (Initial=0, Handshake=1, App=2)
+class QuicPnSpace {
+    next_pn: u64 (0)
+    largest_rx_pn: u64 (0)
+    has_rx_pn: bool (false)
+    largest_acked: u64 (0)
+    has_acked: bool (false)
+    ack: QuicAckTracker (.{})
+    sent: Array[QuicSentPkt] (.new(64))
+    sent_head: uint (0)
+    chunks: Array[QuicSentChunk] (.new(128))
+    chunk_head: uint (0)
+    loss_time_us: u64 (0)
+    ack_eliciting_in_flight: u32 (0)
+    discarded: bool (false)
+
+    fn unacked_count() uint $inline {
+        return this.sent.length - this.sent_head
+    }
+
+    fn compact() {
+        while this.sent_head < this.sent.length {
+            let p = this.sent[this.sent_head]
+            if (p.flags & (QSP_ACKED | QSP_LOST)) == 0 : break
+            this.chunk_head += p.chunk_count.to(uint)
+            this.sent_head++
+        }
+        if this.sent_head == this.sent.length {
+            this.sent.clear()
+            this.sent_head = 0
+            this.chunks.clear()
+            this.chunk_head = 0
+        } else if this.sent_head >= 512 && this.sent_head * 2 >= this.sent.length {
+            let keep = this.sent.length - this.sent_head
+            let i: uint = 0
+            while i < keep {
+                this.sent[i] = this.sent[this.sent_head + i]
+                i++
+            }
+            while this.sent.length > keep {
+                this.sent.pop_last() ! break
+            }
+            this.sent_head = 0
+            if this.chunk_head > 0 {
+                let ckeep = this.chunks.length - this.chunk_head
+                let j: uint = 0
+                while j < ckeep {
+                    this.chunks[j] = this.chunks[this.chunk_head + j]
+                    j++
+                }
+                let shift = this.chunk_head.to(u32)
+                while this.chunks.length > ckeep {
+                    this.chunks.pop_last() ! break
+                }
+                this.chunk_head = 0
+                i = 0
+                while i < this.sent.length {
+                    let sp = this.sent[i]
+                    if sp.chunk_count > 0 {
+                        sp.chunk_start -= shift
+                        this.sent[i] = sp
+                    }
+                    i++
+                }
+            }
+        }
+    }
+}
+
+// Per-stream state (zero-copy response body + immediate cleanup on completion).
+class QuicStream {
+    id: u64
+    conn: QuicConn
+    // Receive side
+    recv_buf: ByteBuffer
+    recv_off: u64 (0)
+    recv_consumed: u64 (0)
+    recv_fin: bool (false)
+    recv_fin_off: u64 (0)
+    recv_has_fin_off: bool (false)
+    recv_max_data: u64 (QUIC_LOCAL_INIT_MAX_STREAM_DATA_BIDI)
+    recv_reset: bool (false)
+    recv_ooo: ?Array[QuicOooChunk] (null)
+    // Send side: virtual bytes = [send_base .. send_base + send_hdr + send_body + send_tail]
+    send_hdr: ByteBuffer
+    send_body: String ("")
+    send_tail: ?ByteBuffer (null)
+    send_base: u64 (0)
+    send_off: u64 (0)
+    send_acked_end: u64 (0)
+    send_acked_ranges: ?Array[QuicPnRange] (null)
+    send_fin: bool (false)
+    send_fin_sent: bool (false)
+    send_fin_acked: bool (false)
+    send_max_data: u64 (0)
+    send_reset: bool (false)
+    send_reset_code: u64 (0)
+    send_reset_sent: bool (false)
+    send_retrans: ?Array[QuicByteRange] (null)
+    need_max_stream_data: bool (false)
+    in_send_queue: bool (false)
+    // Application flags (used by H3Server)
+    app_accepted: bool (false)
+    app_done: bool (false)
+    has_partial_app: bool (false)
+    closed: bool (false)
+
+    fn total_send_len() u64 $inline {
+        let tail = this.send_tail
+        let tail_len = isset(tail) ? tail.length : 0
+        return this.send_base + (this.send_hdr.length + this.send_body.bytes + tail_len).to(u64)
+    }
+
+    fn unsent_bytes() u64 $inline {
+        let tot = this.total_send_len()
+        return tot > this.send_off ? tot - this.send_off : 0
+    }
+
+    fn has_send_work() bool $inline {
+        if this.need_max_stream_data : return true
+        if this.send_reset : return !this.send_reset_sent
+        let retrans = this.send_retrans
+        if isset(retrans) && retrans.length > 0 : return true
+        if this.send_off < this.total_send_len() : return this.send_off < this.send_max_data
+        if this.send_fin && !this.send_fin_sent : return true
+        return false
+    }
+
+    fn on_recv_consumed(n: uint) {
+        if n == 0 || this.recv_fin || this.recv_reset : return
+        this.recv_consumed += n.to(u64)
+        let win: u64 = (this.id & 0x02) != 0 ? QUIC_LOCAL_INIT_MAX_STREAM_DATA_UNI : QUIC_LOCAL_INIT_MAX_STREAM_DATA_BIDI
+        if this.recv_max_data - this.recv_consumed < win / 2 {
+            this.recv_max_data = this.recv_consumed + win
+            this.need_max_stream_data = true
+            this.conn.enqueue_send_stream(this)
+        }
+    }
+
+    fn is_send_complete() bool $inline {
+        if this.send_reset : return this.send_reset_sent
+        return this.send_fin && this.send_fin_acked && this.send_acked_end >= this.total_send_len()
+    }
+
+    fn is_recv_complete() bool $inline {
+        if (this.id & 0x03) == 3 : return true // server-uni has no recv side
+        return this.recv_reset || (this.recv_fin && this.recv_buf.length == 0)
+    }
+
+    // Copies `len` bytes starting at virtual offset `voff` into `dst` (zero-copy across hdr/body/tail).
+    fn copy_send_bytes(voff: u64, dst: ptr, len: uint) {
+        if len == 0 : return
+        let rel = (voff - this.send_base).to(uint)
+        let rem = len
+        let dp: uint = 0
+        let hlen = this.send_hdr.length
+        if rel < hlen {
+            let take = hlen - rel
+            if take > rem : take = rem
+            @unsafe
+            mem.copy_bytes(this.send_hdr.data.@offset(rel), dst.@offset(dp), take)
+            dp += take
+            rem -= take
+            rel += take
+        }
+        if rem > 0 {
+            let blen = this.send_body.bytes
+            let brel = rel - hlen
+            if brel < blen {
+                let take = blen - brel
+                if take > rem : take = rem
+                @unsafe
+                mem.copy_bytes(this.send_body.data.@offset(brel), dst.@offset(dp), take)
+                dp += take
+                rem -= take
+                rel += take
+            }
+        }
+        if rem > 0 {
+            let tail = this.send_tail
+            if isset(tail) {
+                let trel = rel - hlen - this.send_body.bytes
+                if trel < tail.length {
+                    let take = tail.length - trel
+                    if take > rem : take = rem
+                    @unsafe
+                    mem.copy_bytes(tail.data.@offset(trel), dst.@offset(dp), take)
+                }
+            }
+        }
+    }
+
+    fn on_recv(off: u64, src: ptr, len: uint, fin: bool) bool {
+        @unsafe
+        let end = off + len.to(u64)
+        if end > this.recv_max_data : return false
+        if this.recv_has_fin_off {
+            if end > this.recv_fin_off : return false
+            if fin && end != this.recv_fin_off : return false
+        } else if fin {
+            if end < this.recv_off : return false
+            this.recv_has_fin_off = true
+            this.recv_fin_off = end
+        }
+        if len > 0 && end > this.recv_off {
+            if off <= this.recv_off {
+                let skip = (this.recv_off - off).to(uint)
+                let take = len - skip
+                this.recv_buf.write_bytes(src.@offset(skip), take)
+                this.recv_off += take.to(u64)
+                this.drain_recv_ooo()
+            } else {
+                let list = this.recv_ooo ?? <{
+                    let a = Array[QuicOooChunk].new(4)
+                    this.recv_ooo = a
+                    return a
+                }
+                if list.length >= QUIC_MAX_STREAM_OOO : return false
+                let copy = ByteBuffer.new(len)
+                copy.write_bytes(src, len)
+                list.append(QuicOooChunk { off: off, data: copy })
+            }
+        }
+        if this.recv_has_fin_off && this.recv_off >= this.recv_fin_off {
+            this.recv_fin = true
+            this.recv_ooo = null
+        }
+        return true
+    }
+
+    fn drain_recv_ooo() {
+        @unsafe
+        let list = this.recv_ooo ?! return
+        let progressed = true
+        while progressed && list.length > 0 {
+            progressed = false
+            let i: uint = 0
+            while i < list.length {
+                let c = list[i]
+                let cend = c.off + c.data.length.to(u64)
+                if cend <= this.recv_off {
+                    list.swap_remove(i)
+                    progressed = true
+                    continue
+                }
+                if c.off <= this.recv_off {
+                    let skip = (this.recv_off - c.off).to(uint)
+                    let take = c.data.length - skip
+                    this.recv_buf.write_bytes(c.data.data.@offset(skip), take)
+                    this.recv_off += take.to(u64)
+                    list.swap_remove(i)
+                    progressed = true
+                    continue
+                }
+                i++
+            }
+        }
+    }
+
+    // Records newly ACKed stream byte range `[off .. off + len)` and optional FIN.
+    fn on_acked(off: u64, len: u32, fin: bool) {
+        if fin : this.send_fin_acked = true
+        if len == 0 : return
+        let end = off + len.to(u64)
+        if end <= this.send_acked_end : return
+        if off <= this.send_acked_end {
+            this.send_acked_end = end
+            // Merge any stored out-of-order ACKed ranges now contiguous
+            let ranges = this.send_acked_ranges
+            if isset(ranges) && ranges.length > 0 {
+                while ranges.length > 0 {
+                    let r = ranges[0]
+                    if r.hi <= this.send_acked_end {
+                        ranges.remove(0)
+                        continue
+                    }
+                    if r.lo <= this.send_acked_end {
+                        this.send_acked_end = r.hi
+                        ranges.remove(0)
+                        continue
+                    }
+                    break
+                }
+            }
+            this.trim_acked_tail()
+            return
+        }
+        // Out-of-order ACK: insert into sorted non-overlapping ranges [lo .. hi)
+        let ranges = this.send_acked_ranges ?? <{
+            let a = Array[QuicPnRange].new(4)
+            this.send_acked_ranges = a
+            return a
+        }
+        let cur_lo = off
+        let cur_hi = end
+        let i: uint = 0
+        while i < ranges.length {
+            let r = ranges[i]
+            if r.hi < cur_lo {
+                i++
+                continue
+            }
+            if r.lo > cur_hi : break
+            if r.lo < cur_lo : cur_lo = r.lo
+            if r.hi > cur_hi : cur_hi = r.hi
+            ranges.remove(i)
+        }
+        ranges.insert(i, QuicPnRange { lo: cur_lo, hi: cur_hi }) ! {}
+    }
+
+    fn trim_acked_tail() {
+        let tail = this.send_tail ?! return
+        let prefix = (this.send_hdr.length + this.send_body.bytes).to(u64)
+        if this.send_acked_end < this.send_base + prefix : return
+        if prefix > 0 {
+            this.send_hdr.clear()
+            this.send_body = ""
+            this.send_base += prefix
+        }
+        let acked_in_tail = (this.send_acked_end - this.send_base).to(uint)
+        if acked_in_tail >= tail.length && tail.length > 0 {
+            this.send_base += tail.length.to(u64)
+            tail.clear()
+        } else if acked_in_tail >= 16_384 {
+            tail.clear_range(0, acked_in_tail)
+            this.send_base += acked_in_tail.to(u64)
+        }
+    }
+
+    fn on_lost(off: u64, len: u32, fin: bool) {
+        if this.send_reset : return
+        if len == 0 && !fin : return
+        let list = this.send_retrans ?? <{
+            let a = Array[QuicByteRange].new(4)
+            this.send_retrans = a
+            return a
+        }
+        list.append(QuicByteRange { off: off, len: len, fin: fin })
+        this.conn.enqueue_send_stream(this)
+    }
+
+    // Queue streaming response chunk (appended to send_tail; drains send_tail when ACKed).
+    fn queue_tail(data: local &[u8]) {
+        let tail = this.send_tail ?? <{
+            let b = ByteBuffer.new(data.length < 4096 ? 4096 : data.length)
+            this.send_tail = b
+            return b
+        }
+        tail.write(data)
+        this.conn.enqueue_send_stream(this)
+    }
+
+    fn finish_send() {
+        if this.send_fin : return
+        this.send_fin = true
+        this.conn.enqueue_send_stream(this)
+    }
+
+    fn reset_send(code: u64) {
+        if this.send_reset : return
+        this.send_reset = true
+        this.send_reset_code = code
+        this.send_body = ""
+        this.send_retrans = null
+        this.conn.enqueue_send_stream(this)
+    }
+
+    fn pending_send_bytes() uint $inline {
+        let tot = this.total_send_len()
+        if tot <= this.send_acked_end : return 0
+        return (tot - this.send_acked_end).to(uint)
+    }
+}
+
+// OpenSSL 3.5 SSL_set_quic_tls_cbs() callbacks (RFC 9001 TLS-for-QUIC)
+fn quic_tls_cb_crypto_send(ssl: OSSL, buf: ptr, buf_len: uint, consumed: *uint, arg: ptr) i32 $entrance {
+    @unsafe
+    let conn = arg.@cast(QuicConn)
+    let lvl = conn.tls_write_level
+    if lvl > QUIC_LVL_APP : return 0
+    conn.crypto_tx[lvl].append(buf, buf_len)
+    @ptrv(consumed, uint, 0) = buf_len
+    conn.dirty = true
+    return 1
+}
+
+fn quic_tls_cb_crypto_recv_rcd(ssl: OSSL, buf: *ptr, bytes_read: *uint, arg: ptr) i32 $entrance {
+    let conn = arg.@cast(QuicConn)
+    let lvl = conn.tls_read_level
+    let rx = conn.crypto_rx[lvl]
+    let avail = rx.avail()
+    if avail == 0 {
+        @ptrv(bytes_read, uint, 0) = 0
+        return 1
+    }
+    @ptrv(buf, ptr, 0) = rx.read_ptr()
+    @ptrv(bytes_read, uint, 0) = avail
+    return 1
+}
+
+fn quic_tls_cb_crypto_release_rcd(ssl: OSSL, bytes_read: uint, arg: ptr) i32 $entrance {
+    let conn = arg.@cast(QuicConn)
+    let lvl = conn.tls_read_level
+    conn.crypto_rx[lvl].consume(bytes_read)
+    return 1
+}
+
+fn quic_tls_cb_yield_secret(ssl: OSSL, prot_level: u32, direction: i32, secret: ptr, secret_len: uint, arg: ptr) i32 $entrance {
+    let conn = arg.@cast(QuicConn)
+    let lvl: uint = 0
+    if prot_level == OSSL_RECORD_PROTECTION_LEVEL_HANDSHAKE {
+        lvl = QUIC_LVL_HANDSHAKE
+    } else if prot_level == OSSL_RECORD_PROTECTION_LEVEL_APPLICATION {
+        lvl = QUIC_LVL_APP
+    } else {
+        // Ignore EARLY / NONE
+        return 1
+    }
+    @unsafe
+    let cipher = SSL_get_current_cipher(ssl)
+    let cid = SSL_CIPHER_get_id(cipher)
+    let kind = quic_cipher_kind_from_tls_id(cid)
+    if direction == 0 {
+        if !conn.rx_cipher[lvl].init_from_secret(kind, false, secret, secret_len) : return 0
+        conn.tls_read_level = lvl
+    } else {
+        if !conn.tx_cipher[lvl].init_from_secret(kind, true, secret, secret_len) : return 0
+        conn.tls_write_level = lvl
+    }
+    return 1
+}
+
+fn quic_tls_cb_got_transport_params(ssl: OSSL, params: ptr, params_len: uint, arg: ptr) i32 $entrance {
+    @unsafe
+    let conn = arg.@cast(QuicConn)
+    let ok, p = quic_decode_peer_transport_params(params, params_len)
+    if !ok {
+        conn.close_with_error(QUIC_ERR_TRANSPORT_PARAMETER_ERROR, false)
+        return 0
+    }
+    if !p.has_initial_scid || p.initial_scid_len != conn.peer_cid_len {
+        conn.close_with_error(QUIC_ERR_TRANSPORT_PARAMETER_ERROR, false)
+        return 0
+    }
+    let i: uint = 0
+    while i < conn.peer_cid_len {
+        if p.initial_scid[i] != conn.peer_cid[i] {
+            conn.close_with_error(QUIC_ERR_TRANSPORT_PARAMETER_ERROR, false)
+            return 0
+        }
+        i++
+    }
+    conn.peer_params = p
+    conn.got_peer_params = true
+    conn.send_max_data = p.initial_max_data
+    conn.peer_max_streams_bidi = p.initial_max_streams_bidi
+    conn.peer_max_streams_uni = p.initial_max_streams_uni
+    let dgram = p.max_udp_payload_size
+    if dgram > QUIC_MAX_DATAGRAM_1RTT : dgram = QUIC_MAX_DATAGRAM_1RTT
+    if dgram < QUIC_MAX_DATAGRAM_INIT : dgram = QUIC_MAX_DATAGRAM_INIT
+    conn.max_datagram_1rtt = dgram.to(uint)
+    return 1
+}
+
+fn quic_tls_cb_alert(ssl: OSSL, alert_code: u8, arg: ptr) i32 $entrance {
+    let conn = arg.@cast(QuicConn)
+    conn.close_with_error(QUIC_ERR_CRYPTO_BASE + alert_code.to(u64), false)
+    return 1
+}
+
+global quic_tls_dispatch: [OsslDispatch x 7] ({
+    OsslDispatch { function_id: OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_SEND, function: quic_tls_cb_crypto_send.@cast(ptr) },
+    OsslDispatch { function_id: OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_RECV_RCD, function: quic_tls_cb_crypto_recv_rcd.@cast(ptr) },
+    OsslDispatch { function_id: OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_RELEASE_RCD, function: quic_tls_cb_crypto_release_rcd.@cast(ptr) },
+    OsslDispatch { function_id: OSSL_FUNC_SSL_QUIC_TLS_YIELD_SECRET, function: quic_tls_cb_yield_secret.@cast(ptr) },
+    OsslDispatch { function_id: OSSL_FUNC_SSL_QUIC_TLS_GOT_TRANSPORT_PARAMS, function: quic_tls_cb_got_transport_params.@cast(ptr) },
+    OsslDispatch { function_id: OSSL_FUNC_SSL_QUIC_TLS_ALERT, function: quic_tls_cb_alert.@cast(ptr) },
+    OsslDispatch { function_id: 0, function: null }
+})
+
+// Single QUIC v1 server connection.
+class QuicConn {
+    endpoint: QuicEndpoint
+    ssl: OSSL
+    scid_u64: u64
+    scid: [u8 x 8] ({ 0... })
+    odcid: [u8 x 20] ({ 0... })
+    odcid_len: uint (0)
+    odcid_mapped: bool (false)
+    peer_cid: [u8 x 20] ({ 0... })
+    peer_cid_len: uint (0)
+    peer_addr: [u8 x 28] ({ 0... })
+    peer_addr_len: u32 (0)
+
+    local_tp: ByteBuffer (.new(128))
+    peer_params: QuicPeerParams (.{})
+    got_peer_params: bool (false)
+
+    // TLS / crypto state across 3 levels (0=Initial, 1=Handshake, 2=App)
+    rx_cipher: [QuicCipher x 3]
+    tx_cipher: [QuicCipher x 3]
+    rx_next_cipher: ?QuicCipher (null)
+    rx_key_phase: bool (false)
+    tx_key_phase: bool (false)
+    crypto_rx: [QuicCryptoRx x 3]
+    crypto_tx: [QuicCryptoTx x 3]
+    tls_read_level: uint (QUIC_LVL_INITIAL)
+    tls_write_level: uint (QUIC_LVL_INITIAL)
+    handshake_done: bool (false)
+    handshake_confirmed: bool (false)
+    need_handshake_done: bool (false)
+    addr_validated: bool (false)
+    bytes_rx_pre_val: u64 (0)
+    bytes_tx_pre_val: u64 (0)
+
+    // Packet number spaces
+    spaces: [QuicPnSpace x 3]
+
+    // RTT & loss detection (RFC 9002)
+    has_rtt: bool (false)
+    min_rtt_us: u64 (u64.$max)
+    smoothed_rtt_us: u64 (QUIC_INITIAL_RTT_US)
+    rttvar_us: u64 (QUIC_INITIAL_RTT_US / 2)
+    latest_rtt_us: u64 (0)
+    pto_count: u32 (0)
+    pto_probes: [u8 x 3] ({ 0, 0, 0 })
+    last_ack_eliciting_tx_us: u64 (0)
+
+    // CUBIC congestion control (RFC 9438)
+    max_datagram_1rtt: uint (QUIC_MAX_DATAGRAM_INIT)
+    cwnd: u64 (14_720)
+    ssthresh: u64 (u64.$max)
+    bytes_in_flight: u64 (0)
+    recovery_start_us: u64 (0)
+    cubic_w_max: f64 (0.0)
+    cubic_k: f64 (0.0)
+    cubic_epoch_us: u64 (0)
+
+    // Connection-level flow control
+    send_data_off: u64 (0)
+    send_max_data: u64 (0)
+    recv_data_off: u64 (0)
+    recv_consumed: u64 (0)
+    recv_max_data: u64 (QUIC_LOCAL_INIT_MAX_DATA)
+    need_max_data: bool (false)
+
+    // Stream tables & limits
+    streams: HashMap[u64, QuicStream] (.new(64))
+    send_queue: Deque[QuicStream] (.new())
+    rx_ready_streams: Array[QuicStream] (.new(32))
+    next_server_uni_id: u64 (3)
+    local_max_streams_bidi: u64 (QUIC_LOCAL_INIT_MAX_STREAMS_BIDI)
+    local_max_streams_uni: u64 (QUIC_LOCAL_INIT_MAX_STREAMS_UNI)
+    peer_max_streams_bidi: u64 (0)
+    peer_max_streams_uni: u64 (0)
+    closed_bidi_since_credit: u64 (0)
+    need_max_streams_bidi: bool (false)
+    need_max_streams_uni: bool (false)
+    need_path_response: bool (false)
+    path_challenge_data: [u8 x 8] ({ 0... })
+
+    // Connection close / idle state
+    last_rx_us: u64 (0)
+    closing: bool (false)
+    close_sent: bool (false)
+    close_is_app: bool (false)
+    close_err_code: u64 (0)
+    closed: bool (false)
+    dirty: bool (false)
+    in_dirty_list: bool (false)
+    app_attached: bool (false)
+    app_data: ?ptr (null)
+
+    static fn create(
+        endpoint: QuicEndpoint,
+        odcid: ptr,
+        odcid_len: uint,
+        peer_cid: ptr,
+        peer_cid_len: uint,
+        peer_addr: ptr,
+        peer_addr_len: u32,
+        now_us: u64
+    ) ?SELF {
+        @unsafe
+        let ssl = SSL_new(endpoint.listener.context.ctx)
+        SSL_set_accept_state(ssl)
+
+        let scid_u64 = endpoint.next_scid()
+        let conn = SELF {
+            endpoint: endpoint,
+            ssl: ssl,
+            scid_u64: scid_u64,
+            rx_cipher: { QuicCipher {}, QuicCipher {}, QuicCipher {} },
+            tx_cipher: { QuicCipher {}, QuicCipher {}, QuicCipher {} },
+            crypto_rx: { QuicCryptoRx {}, QuicCryptoRx {}, QuicCryptoRx {} },
+            crypto_tx: { QuicCryptoTx {}, QuicCryptoTx {}, QuicCryptoTx {} },
+            spaces: { QuicPnSpace {}, QuicPnSpace {}, QuicPnSpace {} },
+            last_rx_us: now_us
+        }
+        quic_put_u64_be(@ref(conn.scid).@cast(ptr), 0, scid_u64)
+        conn.odcid_len = odcid_len > 20 ? 20 : odcid_len
+        if conn.odcid_len > 0 : mem.copy_bytes(odcid, @ref(conn.odcid).@cast(ptr), conn.odcid_len)
+        conn.peer_cid_len = peer_cid_len > 20 ? 20 : peer_cid_len
+        if conn.peer_cid_len > 0 : mem.copy_bytes(peer_cid, @ref(conn.peer_cid).@cast(ptr), conn.peer_cid_len)
+        conn.peer_addr_len = peer_addr_len > 28 ? 28 : peer_addr_len
+        if conn.peer_addr_len > 0 : mem.copy_bytes(peer_addr, @ref(conn.peer_addr).@cast(ptr), conn.peer_addr_len.to(uint))
+
+        if !quic_derive_initial_ciphers(odcid, odcid_len, conn.rx_cipher[QUIC_LVL_INITIAL], conn.tx_cipher[QUIC_LVL_INITIAL]) {
+            SSL_free(ssl)
+            return null
+        }
+
+        quic_encode_server_transport_params(
+            conn.local_tp,
+            @ref(conn.odcid).@cast(ptr), conn.odcid_len,
+            @ref(conn.scid).@cast(ptr), QUIC_SCID_LEN,
+            30_000
+        )
+
+        if SSL_set_quic_tls_cbs(ssl, @ref(quic_tls_dispatch[0]), conn.@cast(ptr)) != 1
+            || SSL_set_quic_tls_transport_params(ssl, conn.local_tp.data, conn.local_tp.length) != 1 {
+            conn.free_resources()
+            return null
+        }
+        return conn
+    }
+
+    fn mark_dirty() $inline {
+        this.dirty = true
+        if !this.in_dirty_list {
+            this.in_dirty_list = true
+            this.endpoint.dirty_conns.append(this)
+        }
+    }
+
+    fn enqueue_send_stream(st: QuicStream) $inline {
+        if !st.in_send_queue {
+            st.in_send_queue = true
+            this.send_queue.push_back(st)
+        }
+        this.mark_dirty()
+    }
+
+    fn close_with_error(code: u64, is_app: bool) {
+        if this.closing || this.closed : return
+        this.closing = true
+        this.close_is_app = is_app
+        this.close_err_code = code
+        this.mark_dirty()
+    }
+
+    fn free_resources() {
+        if this.closed : return
+        this.closed = true
+        @unsafe
+        SSL_free(this.ssl)
+        this.rx_cipher[0].free()
+        this.rx_cipher[1].free()
+        this.rx_cipher[2].free()
+        this.tx_cipher[0].free()
+        this.tx_cipher[1].free()
+        this.tx_cipher[2].free()
+        let nxt = this.rx_next_cipher
+        if isset(nxt) {
+            nxt.free()
+            this.rx_next_cipher = null
+        }
+        each this.streams as st, _ {
+            this.endpoint.give_buf(st.recv_buf)
+            this.endpoint.give_buf(st.send_hdr)
+        }
+        this.streams.clear()
+        this.send_queue.clear()
+        this.rx_ready_streams.clear()
+    }
+
+    fn open_server_uni_stream() QuicStream {
+        let id = this.next_server_uni_id
+        this.next_server_uni_id += 4
+        let st = QuicStream {
+            id: id,
+            conn: this,
+            recv_buf: this.endpoint.take_buf(64),
+            send_hdr: this.endpoint.take_buf(64),
+            send_max_data: this.peer_params.initial_max_stream_data_uni,
+            recv_max_data: 0
+        }
+        this.streams.set(id, st)
+        return st
+    }
+
+    fn release_stream(st: QuicStream) {
+        st.app_done = true
+        this.maybe_gc_stream(st)
+    }
+
+    fn maybe_gc_stream(st: QuicStream) {
+        if st.closed || !st.app_done : return
+        if !st.is_send_complete() || !st.is_recv_complete() : return
+        st.closed = true
+        st.send_body = ""
+        st.send_tail = null
+        st.send_retrans = null
+        st.send_acked_ranges = null
+        st.recv_ooo = null
+        this.streams.remove(st.id)
+        if !st.in_send_queue {
+            this.endpoint.give_stream(st)
+        }
+        // Replenish client bidi MAX_STREAMS credit promptly
+        if (st.id & 0x03) == 0 {
+            this.closed_bidi_since_credit++
+            if this.closed_bidi_since_credit >= 32 {
+                this.local_max_streams_bidi += this.closed_bidi_since_credit
+                this.closed_bidi_since_credit = 0
+                this.need_max_streams_bidi = true
+                this.mark_dirty()
+            }
+        }
+    }
+
+    fn advance_tls() {
+        if this.closing || this.closed : return
+        @unsafe
+        if !this.handshake_done {
+            ERR_clear_error()
+            let r = SSL_do_handshake(this.ssl)
+            if r == 1 {
+                this.handshake_done = true
+                this.addr_validated = true
+                this.need_handshake_done = true
+                // Start 1-RTT CWND with negotiated 1-RTT datagram size
+                let init_cwnd: u64 = (10 * this.max_datagram_1rtt).to(u64)
+                if init_cwnd > this.cwnd : this.cwnd = init_cwnd
+                this.mark_dirty()
+                return
+            }
+            let err = SSL_get_error(this.ssl, r)
+            if err != ERROR.WANT_READ && err != ERROR.WANT_WRITE {
+                ERR_clear_error()
+                if !this.closing : this.close_with_error(QUIC_ERR_CRYPTO_BASE + 80, false)
+            }
+            return
+        }
+        // Post-handshake CRYPTO records (if any)
+        if this.crypto_rx[QUIC_LVL_APP].avail() > 0 {
+            let dummy: u8 = 0
+            let nread: uint = 0
+            SSL_read_ex(this.ssl, @ref(dummy).@cast(ptr), 0, @ref(nread).@cast(ptr))
+            ERR_clear_error()
+        }
+    }
+
+    fn discard_level(lvl: uint) {
+        let sp = this.spaces[lvl]
+        if sp.discarded : return
+        sp.discarded = true
+        // Subtract any remaining in-flight bytes from this level
+        let i = sp.sent_head
+        while i < sp.sent.length {
+            let p = sp.sent[i]
+            if (p.flags & (QSP_ACKED | QSP_LOST)) == 0 && (p.flags & QSP_IN_FLIGHT) != 0 {
+                let b = p.bytes.to(u64)
+                this.bytes_in_flight = this.bytes_in_flight > b ? this.bytes_in_flight - b : 0
+            }
+            i++
+        }
+        sp.sent.clear()
+        sp.sent_head = 0
+        sp.ack_eliciting_in_flight = 0
+        sp.loss_time_us = 0
+        this.rx_cipher[lvl].free()
+        this.tx_cipher[lvl].free()
+        this.crypto_tx[lvl].buf.clear()
+        this.crypto_tx[lvl].retrans.clear()
+    }
+
+    // Processes an incoming UDP datagram (which may contain multiple coalesced QUIC packets).
+    fn on_datagram(pkt: ptr, len: uint, peer_addr: ptr, peer_addr_len: u32, now_us: u64) {
+        if this.closed || len == 0 : return
+        this.last_rx_us = now_us
+        if !this.addr_validated : this.bytes_rx_pre_val += len.to(u64)
+        // Track peer address updates (connection migration / NAT rebinding)
+        if peer_addr_len > 0 && peer_addr_len <= 28 {
+            @unsafe
+            this.peer_addr_len = peer_addr_len
+            mem.copy_bytes(peer_addr, @ref(this.peer_addr).@cast(ptr), peer_addr_len.to(uint))
+        }
+
+        let off: uint = 0
+        while off < len && !this.closed {
+            @unsafe
+            let b0 = @ptrv(pkt, u8, off)
+            if (b0 & 0x80) == 0 {
+                // Short Header (1-RTT): consumes rest of UDP datagram
+                this.on_short_packet(pkt.@offset(off), len - off, now_us)
+                break
+            }
+            // Long Header packet
+            let consumed = this.on_long_packet(pkt.@offset(off), len - off, now_us)
+            if consumed == 0 : break
+            off += consumed
+        }
+    }
+
+    fn on_long_packet(pkt: ptr, rem: uint, now_us: u64) uint {
+        if rem < 7 : return 0
+        @unsafe
+        let b0 = @ptrv(pkt, u8, 0)
+        if (b0 & 0x40) == 0 : return 0 // fixed bit must be 1
+        let ver = quic_get_u32_be(pkt, 1)
+        if ver != QUIC_VERSION_1 : return 0
+        let ptype = (b0 >> 4) & 0x03
+        let dcid_len = @ptrv(pkt, u8, 5).to(uint)
+        if 6 + dcid_len + 1 > rem : return 0
+        let scid_off = 6 + dcid_len + 1
+        let scid_len = @ptrv(pkt, u8, 6 + dcid_len).to(uint)
+        let pos = scid_off + scid_len
+        if pos > rem : return 0
+
+        let lvl: uint = QUIC_LVL_INITIAL
+        if ptype == QUIC_PKT_INITIAL {
+            let ok_tok, tok_len_u64, p1 = quic_get_varint(pkt, pos, rem)
+            if !ok_tok || tok_len_u64 > (rem - p1).to(u64) : return 0
+            pos = p1 + tok_len_u64.to(uint)
+            lvl = QUIC_LVL_INITIAL
+        } else if ptype == QUIC_PKT_HANDSHAKE {
+            lvl = QUIC_LVL_HANDSHAKE
+        } else {
+            // Skip 0-RTT / Retry
+            return 0
+        }
+
+        let ok_len, pkt_len_u64, pn_off = quic_get_varint(pkt, pos, rem)
+        if !ok_len || pkt_len_u64 > (rem - pn_off).to(u64) : return 0
+        let total = pn_off + pkt_len_u64.to(uint)
+        if this.spaces[lvl].discarded || !this.rx_cipher[lvl].ready : return total
+
+        let ok_hp, pn_len, _, trunc_pn = this.rx_cipher[lvl].unprotect_header(pkt, total, pn_off)
+        if !ok_hp : return total
+        let sp = this.spaces[lvl]
+        let pn = quic_decode_pn(sp.largest_rx_pn, sp.has_rx_pn, trunc_pn, pn_len)
+        let ok_dec, pt_len = this.rx_cipher[lvl].decrypt_payload(pkt, total, pn_off, pn_len, pn)
+        if !ok_dec : return total
+
+        if !sp.has_rx_pn || pn > sp.largest_rx_pn {
+            sp.has_rx_pn = true
+            sp.largest_rx_pn = pn
+        }
+        if lvl == QUIC_LVL_HANDSHAKE {
+            this.addr_validated = true
+            // Once client sends a valid Handshake packet, we can discard Initial keys (RFC 9001 §4.9.1)
+            this.discard_level(QUIC_LVL_INITIAL)
+        }
+        this.process_frames(lvl, pn, pkt.@offset(pn_off + pn_len), pt_len, now_us)
+        return total
+    }
+
+    fn on_short_packet(pkt: ptr, len: uint, now_us: u64) {
+        @unsafe
+        if this.spaces[QUIC_LVL_APP].discarded || !this.rx_cipher[QUIC_LVL_APP].ready : return
+        let pn_off: uint = 1 + QUIC_SCID_LEN
+        if pn_off + 20 > len : return
+
+        let rx_c = this.rx_cipher[QUIC_LVL_APP]
+        let ok_hp, pn_len, key_phase, trunc_pn = rx_c.unprotect_header(pkt, len, pn_off)
+        if !ok_hp : return
+        let sp = this.spaces[QUIC_LVL_APP]
+        let pn = quic_decode_pn(sp.largest_rx_pn, sp.has_rx_pn, trunc_pn, pn_len)
+
+        let pt_len: uint = 0
+        let ok_dec = false
+        if key_phase == this.rx_key_phase {
+            let ok, plen = rx_c.decrypt_payload(pkt, len, pn_off, pn_len, pn)
+            ok_dec = ok
+            pt_len = plen
+        } else {
+            // Peer initiated Key Update (RFC 9001 §6)
+            let next_c = this.rx_next_cipher ?? QuicCipher {}
+            if !next_c.ready : next_c.init_key_update(rx_c)
+            let ok, plen = next_c.decrypt_payload(pkt, len, pn_off, pn_len, pn)
+            if ok {
+                ok_dec = true
+                pt_len = plen
+                // Commit RX + TX key update (preserve HP ctx!)
+                let old_hp = rx_c.hp
+                rx_c.hp = null
+                rx_c.free()
+                next_c.hp = old_hp
+                this.rx_cipher[QUIC_LVL_APP] = next_c
+                this.rx_next_cipher = null
+                this.rx_key_phase = key_phase
+                // Update TX keys to match new phase
+                let next_tx = QuicCipher {}
+                if next_tx.init_key_update(this.tx_cipher[QUIC_LVL_APP]) {
+                    let old_tx_hp = this.tx_cipher[QUIC_LVL_APP].hp
+                    this.tx_cipher[QUIC_LVL_APP].hp = null
+                    this.tx_cipher[QUIC_LVL_APP].free()
+                    next_tx.hp = old_tx_hp
+                    this.tx_cipher[QUIC_LVL_APP] = next_tx
+                    this.tx_key_phase = key_phase
+                }
+            } else {
+                this.rx_next_cipher = next_c
+            }
+        }
+        if !ok_dec : return
+
+        if !sp.has_rx_pn || pn > sp.largest_rx_pn {
+            sp.has_rx_pn = true
+            sp.largest_rx_pn = pn
+        }
+        if this.odcid_mapped {
+            this.odcid_mapped = false
+            this.endpoint.remove_odcid(this)
+        }
+        this.process_frames(QUIC_LVL_APP, pn, pkt.@offset(pn_off + pn_len), pt_len, now_us)
+    }
+
+    fn process_frames(lvl: uint, pn: u64, data: ptr, len: uint, now_us: u64) {
+        let sp = this.spaces[lvl]
+        if sp.ack.is_dup(pn) : return
+        let ack_eliciting = false
+        let got_crypto = false
+        let off: uint = 0
+        while off < len && !this.closing && !this.closed {
+            @unsafe
+            let ftype = @ptrv(data, u8, off)
+            if ftype == QUIC_FRAME_PADDING {
+                off++
+                continue
+            }
+            if ftype == QUIC_FRAME_PING {
+                ack_eliciting = true
+                off++
+                continue
+            }
+            if ftype == QUIC_FRAME_ACK || ftype == QUIC_FRAME_ACK_ECN {
+                let ok, next = this.parse_ack_frame(lvl, data, off + 1, len, ftype == QUIC_FRAME_ACK_ECN, now_us)
+                if !ok {
+                    this.close_with_error(QUIC_ERR_FRAME_ENCODING_ERROR, false)
+                    return
+                }
+                off = next
+                continue
+            }
+            if (ftype & 0xf8) == QUIC_FRAME_STREAM_BASE {
+                ack_eliciting = true
+                if lvl != QUIC_LVL_APP {
+                    this.close_with_error(QUIC_ERR_PROTOCOL_VIOLATION, false)
+                    return
+                }
+                let ok, next = this.parse_stream_frame(ftype, data, off + 1, len)
+                if !ok {
+                    if !this.closing : this.close_with_error(QUIC_ERR_FRAME_ENCODING_ERROR, false)
+                    return
+                }
+                off = next
+                continue
+            }
+            if ftype == QUIC_FRAME_CRYPTO {
+                ack_eliciting = true
+                let ok1, coff, p1 = quic_get_varint(data, off + 1, len)
+                if !ok1 {
+                    this.close_with_error(QUIC_ERR_FRAME_ENCODING_ERROR, false)
+                    return
+                }
+                let ok2, clen_u64, p2 = quic_get_varint(data, p1, len)
+                if !ok2 || clen_u64 > (len - p2).to(u64) {
+                    this.close_with_error(QUIC_ERR_FRAME_ENCODING_ERROR, false)
+                    return
+                }
+                let clen = clen_u64.to(uint)
+                if !this.crypto_rx[lvl].push(coff, data.@offset(p2), clen) {
+                    this.close_with_error(QUIC_ERR_CRYPTO_BUFFER_EXCEEDED, false)
+                    return
+                }
+                got_crypto = true
+                off = p2 + clen
+                continue
+            }
+            if ftype == QUIC_FRAME_MAX_DATA {
+                ack_eliciting = true
+                let ok, val, p1 = quic_get_varint(data, off + 1, len)
+                if !ok {
+                    this.close_with_error(QUIC_ERR_FRAME_ENCODING_ERROR, false)
+                    return
+                }
+                if val > this.send_max_data {
+                    this.send_max_data = val
+                    this.mark_dirty()
+                }
+                off = p1
+                continue
+            }
+            if ftype == QUIC_FRAME_MAX_STREAM_DATA {
+                ack_eliciting = true
+                let ok1, sid, p1 = quic_get_varint(data, off + 1, len)
+                let ok2, val, p2 = quic_get_varint(data, p1, len)
+                if !ok1 || !ok2 {
+                    this.close_with_error(QUIC_ERR_FRAME_ENCODING_ERROR, false)
+                    return
+                }
+                let st = this.streams.get(sid) !? null
+                if isset(st) && val > st.send_max_data {
+                    st.send_max_data = val
+                    if st.has_send_work() : this.enqueue_send_stream(st)
+                }
+                off = p2
+                continue
+            }
+            if ftype == QUIC_FRAME_MAX_STREAMS_BIDI || ftype == QUIC_FRAME_MAX_STREAMS_UNI {
+                ack_eliciting = true
+                let ok, val, p1 = quic_get_varint(data, off + 1, len)
+                if !ok {
+                    this.close_with_error(QUIC_ERR_FRAME_ENCODING_ERROR, false)
+                    return
+                }
+                if ftype == QUIC_FRAME_MAX_STREAMS_BIDI && val > this.peer_max_streams_bidi : this.peer_max_streams_bidi = val
+                if ftype == QUIC_FRAME_MAX_STREAMS_UNI && val > this.peer_max_streams_uni : this.peer_max_streams_uni = val
+                off = p1
+                continue
+            }
+            if ftype == QUIC_FRAME_RESET_STREAM {
+                ack_eliciting = true
+                let ok1, sid, p1 = quic_get_varint(data, off + 1, len)
+                let ok2, _, p2 = quic_get_varint(data, p1, len)
+                let ok3, _, p3 = quic_get_varint(data, p2, len)
+                if !ok1 || !ok2 || !ok3 {
+                    this.close_with_error(QUIC_ERR_FRAME_ENCODING_ERROR, false)
+                    return
+                }
+                let st = this.streams.get(sid) !? null
+                if isset(st) {
+                    st.recv_reset = true
+                    st.recv_buf.clear()
+                    this.rx_ready_streams.append(st)
+                    this.maybe_gc_stream(st)
+                }
+                off = p3
+                continue
+            }
+            if ftype == QUIC_FRAME_STOP_SENDING {
+                ack_eliciting = true
+                let ok1, sid, p1 = quic_get_varint(data, off + 1, len)
+                let ok2, err_code, p2 = quic_get_varint(data, p1, len)
+                if !ok1 || !ok2 {
+                    this.close_with_error(QUIC_ERR_FRAME_ENCODING_ERROR, false)
+                    return
+                }
+                let st = this.streams.get(sid) !? null
+                if isset(st) : st.reset_send(err_code)
+                off = p2
+                continue
+            }
+            if ftype == QUIC_FRAME_DATA_BLOCKED {
+                ack_eliciting = true
+                let ok, _, p1 = quic_get_varint(data, off + 1, len)
+                if !ok {
+                    this.close_with_error(QUIC_ERR_FRAME_ENCODING_ERROR, false)
+                    return
+                }
+                this.need_max_data = true
+                this.mark_dirty()
+                off = p1
+                continue
+            }
+            if ftype == QUIC_FRAME_STREAM_DATA_BLOCKED {
+                ack_eliciting = true
+                let ok1, _, p1 = quic_get_varint(data, off + 1, len)
+                let ok2, _, p2 = quic_get_varint(data, p1, len)
+                if !ok1 || !ok2 {
+                    this.close_with_error(QUIC_ERR_FRAME_ENCODING_ERROR, false)
+                    return
+                }
+                off = p2
+                continue
+            }
+            if ftype == QUIC_FRAME_STREAMS_BLOCKED_BIDI || ftype == QUIC_FRAME_STREAMS_BLOCKED_UNI {
+                ack_eliciting = true
+                let ok, _, p1 = quic_get_varint(data, off + 1, len)
+                if !ok {
+                    this.close_with_error(QUIC_ERR_FRAME_ENCODING_ERROR, false)
+                    return
+                }
+                if ftype == QUIC_FRAME_STREAMS_BLOCKED_BIDI && this.closed_bidi_since_credit > 0 {
+                    this.local_max_streams_bidi += this.closed_bidi_since_credit
+                    this.closed_bidi_since_credit = 0
+                    this.need_max_streams_bidi = true
+                    this.mark_dirty()
+                }
+                off = p1
+                continue
+            }
+            if ftype == QUIC_FRAME_NEW_CONNECTION_ID {
+                ack_eliciting = true
+                let ok1, _, p1 = quic_get_varint(data, off + 1, len)
+                let ok2, _, p2 = quic_get_varint(data, p1, len)
+                if !ok1 || !ok2 || p2 >= len {
+                    this.close_with_error(QUIC_ERR_FRAME_ENCODING_ERROR, false)
+                    return
+                }
+                let clen = @ptrv(data, u8, p2).to(uint)
+                if p2 + 1 + clen + 16 > len {
+                    this.close_with_error(QUIC_ERR_FRAME_ENCODING_ERROR, false)
+                    return
+                }
+                off = p2 + 1 + clen + 16
+                continue
+            }
+            if ftype == QUIC_FRAME_RETIRE_CONNECTION_ID {
+                ack_eliciting = true
+                let ok, _, p1 = quic_get_varint(data, off + 1, len)
+                if !ok {
+                    this.close_with_error(QUIC_ERR_FRAME_ENCODING_ERROR, false)
+                    return
+                }
+                off = p1
+                continue
+            }
+            if ftype == QUIC_FRAME_PATH_CHALLENGE {
+                ack_eliciting = true
+                if off + 9 > len {
+                    this.close_with_error(QUIC_ERR_FRAME_ENCODING_ERROR, false)
+                    return
+                }
+                mem.copy_bytes(data.@offset(off + 1), @ref(this.path_challenge_data).@cast(ptr), 8)
+                this.need_path_response = true
+                this.mark_dirty()
+                off += 9
+                continue
+            }
+            if ftype == QUIC_FRAME_PATH_RESPONSE {
+                ack_eliciting = true
+                if off + 9 > len {
+                    this.close_with_error(QUIC_ERR_FRAME_ENCODING_ERROR, false)
+                    return
+                }
+                off += 9
+                continue
+            }
+            if ftype == QUIC_FRAME_CONNECTION_CLOSE || ftype == QUIC_FRAME_CONNECTION_CLOSE_APP {
+                // Peer closed connection
+                this.closing = true
+                this.close_sent = true
+                return
+            }
+            if ftype == QUIC_FRAME_NEW_TOKEN {
+                ack_eliciting = true
+                let ok, tlen, p1 = quic_get_varint(data, off + 1, len)
+                if !ok || tlen > (len - p1).to(u64) {
+                    this.close_with_error(QUIC_ERR_FRAME_ENCODING_ERROR, false)
+                    return
+                }
+                off = p1 + tlen.to(uint)
+                continue
+            }
+            // Unknown or disallowed frame type (e.g. HANDSHAKE_DONE from client)
+            this.close_with_error(QUIC_ERR_FRAME_ENCODING_ERROR, false)
+            return
+        }
+
+        // Record packet number in ACK tracker
+        let imm_thresh: u32 = lvl == QUIC_LVL_APP ? 2 : 1
+        sp.ack.on_rx(pn, now_us, ack_eliciting, imm_thresh, QUIC_LOCAL_MAX_ACK_DELAY_MS * 1000)
+        if sp.ack.should_send(now_us) : this.mark_dirty()
+
+        if got_crypto : this.advance_tls()
+    }
+
+    fn parse_stream_frame(ftype: u8, data: ptr, off: uint, len: uint) (bool, uint) {
+        @unsafe
+        let has_off = (ftype & 0x04) != 0
+        let has_len = (ftype & 0x02) != 0
+        let fin = (ftype & 0x01) != 0
+        let ok1, sid, p = quic_get_varint(data, off, len)
+        if !ok1 : return (false, off)
+        let soff: u64 = 0
+        if has_off {
+            let ok2, v, p2 = quic_get_varint(data, p, len)
+            if !ok2 : return (false, off)
+            soff = v
+            p = p2
+        }
+        let slen: uint = len - p
+        if has_len {
+            let ok3, v, p3 = quic_get_varint(data, p, len)
+            if !ok3 || v > (len - p3).to(u64) : return (false, off)
+            slen = v.to(uint)
+            p = p3
+        }
+        // Only client-initiated streams (bit 0 == 0) may be opened by client
+        let st = this.streams.get(sid) !? null
+        if !isset(st) {
+            if (sid & 0x01) != 0 {
+                // Stream frame on server-initiated stream we don't know
+                return (true, p + slen)
+            }
+            let is_uni = (sid & 0x02) != 0
+            let seq = (sid >> 2) + 1
+            if is_uni {
+                if seq > this.local_max_streams_uni {
+                    this.close_with_error(QUIC_ERR_STREAM_LIMIT_ERROR, false)
+                    return (false, off)
+                }
+            } else {
+                if seq > this.local_max_streams_bidi {
+                    this.close_with_error(QUIC_ERR_STREAM_LIMIT_ERROR, false)
+                    return (false, off)
+                }
+            }
+            let init_send_win = is_uni ? 0.to(u64) : this.peer_params.initial_max_stream_data_bidi_local
+            let init_recv_win: u64 = is_uni ? QUIC_LOCAL_INIT_MAX_STREAM_DATA_UNI : QUIC_LOCAL_INIT_MAX_STREAM_DATA_BIDI
+            let created = this.endpoint.take_stream(sid, this, init_recv_win, init_send_win)
+            this.streams.set(sid, created)
+            st = created
+        }
+        let prev_off = st.recv_off
+        if !st.on_recv(soff, data.@offset(p), slen, fin) {
+            this.close_with_error(QUIC_ERR_FLOW_CONTROL_ERROR, false)
+            return (false, off)
+        }
+        let delta = st.recv_off - prev_off
+        if delta > 0 {
+            this.recv_data_off += delta
+            if this.recv_data_off > this.recv_max_data {
+                this.close_with_error(QUIC_ERR_FLOW_CONTROL_ERROR, false)
+                return (false, off)
+            }
+            // Auto-replenish connection MAX_DATA when >50% consumed
+            this.recv_consumed += delta
+            if this.recv_max_data - this.recv_consumed < QUIC_LOCAL_INIT_MAX_DATA / 2 {
+                this.recv_max_data = this.recv_consumed + QUIC_LOCAL_INIT_MAX_DATA
+                this.need_max_data = true
+                this.mark_dirty()
+            }
+        }
+        if delta > 0 || fin : this.rx_ready_streams.append(st)
+        return (true, p + slen)
+    }
+
+    fn parse_ack_frame(lvl: uint, data: ptr, off: uint, len: uint, has_ecn: bool, now_us: u64) (bool, uint) {
+        @unsafe
+        let ok1, largest, p1 = quic_get_varint(data, off, len)
+        let ok2, delay_raw, p2 = quic_get_varint(data, p1, len)
+        let ok3, range_cnt, p3 = quic_get_varint(data, p2, len)
+        let ok4, first_range, p = quic_get_varint(data, p3, len)
+        if !ok1 || !ok2 || !ok3 || !ok4 : return (false, off)
+        if first_range > largest : return (false, off)
+
+        let sp = this.spaces[lvl]
+        let prev_largest_acked = sp.largest_acked
+        let had_acked = sp.has_acked
+        let newly_acked_largest = false
+        let newly_acked_largest_sent_us: u64 = 0
+        let newly_acked_ack_eliciting = false
+        let total_acked_bytes: u64 = 0
+
+        // First range [largest - first_range .. largest]
+        let r_hi = largest
+        let r_lo = largest - first_range
+        let b1, nl1, ns1, ae1 = this.apply_ack_range(lvl, r_lo, r_hi, largest)
+        total_acked_bytes += b1
+        if nl1 {
+            newly_acked_largest = true
+            newly_acked_largest_sent_us = ns1
+        }
+        if ae1 : newly_acked_ack_eliciting = true
+
+        let cur_lo = r_lo
+        let k: u64 = 0
+        while k < range_cnt {
+            let okg, gap, pg = quic_get_varint(data, p, len)
+            let okr, rlen, pr = quic_get_varint(data, pg, len)
+            if !okg || !okr : return (false, off)
+            p = pr
+            if gap + 2 > cur_lo : return (false, off)
+            let hi = cur_lo - gap - 2
+            if rlen > hi : return (false, off)
+            let lo = hi - rlen
+            let bk, _, _, aek = this.apply_ack_range(lvl, lo, hi, largest)
+            total_acked_bytes += bk
+            if aek : newly_acked_ack_eliciting = true
+            cur_lo = lo
+            k++
+        }
+        if has_ecn {
+            let oe1, _, pe1 = quic_get_varint(data, p, len)
+            let oe2, _, pe2 = quic_get_varint(data, pe1, len)
+            let oe3, _, pe3 = quic_get_varint(data, pe2, len)
+            if !oe1 || !oe2 || !oe3 : return (false, off)
+            p = pe3
+        }
+
+        if !had_acked || largest > prev_largest_acked {
+            sp.has_acked = true
+            sp.largest_acked = largest
+        }
+        if newly_acked_largest && newly_acked_ack_eliciting && now_us >= newly_acked_largest_sent_us {
+            let latest = now_us - newly_acked_largest_sent_us
+            let ack_delay_us = lvl == QUIC_LVL_APP ? (delay_raw << this.peer_params.ack_delay_exponent) : 0
+            let max_ad = this.peer_params.max_ack_delay_ms * 1000
+            if ack_delay_us > max_ad : ack_delay_us = max_ad
+            this.update_rtt(latest, ack_delay_us)
+        }
+        if total_acked_bytes > 0 {
+            this.pto_count = 0
+            this.on_cc_ack(total_acked_bytes, newly_acked_largest_sent_us, now_us)
+            // If we were CWND-limited and have queued streams, wake up flush!
+            if this.send_queue.length > 0 : this.mark_dirty()
+        }
+        this.detect_lost_packets(lvl, now_us)
+        sp.compact()
+        return (true, p)
+    }
+
+    fn apply_ack_range(lvl: uint, lo: u64, hi: u64, largest: u64) (u64, bool, u64, bool) {
+        let sp = this.spaces[lvl]
+        let acked_bytes: u64 = 0
+        let got_largest = false
+        let largest_sent_us: u64 = 0
+        let got_ae = false
+        let i = sp.sent_head
+        while i < sp.sent.length {
+            let pkt = sp.sent[i]
+            if pkt.pn > hi : break
+            if pkt.pn >= lo && (pkt.flags & QSP_ACKED) == 0 {
+                let was_lost = (pkt.flags & QSP_LOST) != 0
+                pkt.flags = pkt.flags | QSP_ACKED
+                sp.sent[i] = pkt
+                if !was_lost {
+                    if (pkt.flags & QSP_IN_FLIGHT) != 0 {
+                        let b = pkt.bytes.to(u64)
+                        this.bytes_in_flight = this.bytes_in_flight > b ? this.bytes_in_flight - b : 0
+                        acked_bytes += b
+                    }
+                    if (pkt.flags & QSP_ACK_ELICITING) != 0 {
+                        if sp.ack_eliciting_in_flight > 0 : sp.ack_eliciting_in_flight--
+                        got_ae = true
+                    }
+                }
+                if pkt.pn == largest {
+                    got_largest = true
+                    largest_sent_us = pkt.sent_us
+                }
+                if (pkt.flags & QSP_HANDSHAKE_DONE) != 0 {
+                    this.handshake_confirmed = true
+                    this.discard_level(QUIC_LVL_HANDSHAKE)
+                }
+                if pkt.chunk_count > 0 {
+                    let ci: uint = 0
+                    let cbase = pkt.chunk_start.to(uint)
+                    while ci < pkt.chunk_count.to(uint) {
+                        let ch = sp.chunks[cbase + ci]
+                        let st = this.streams.get(ch.stream_id) !? null
+                        if isset(st) {
+                            st.on_acked(ch.off, ch.len, ch.fin)
+                            this.maybe_gc_stream(st)
+                        }
+                        ci++
+                    }
+                }
+            }
+            i++
+        }
+        return (acked_bytes, got_largest, largest_sent_us, got_ae)
+    }
+
+    fn update_rtt(latest_us: u64, ack_delay_us: u64) {
+        this.latest_rtt_us = latest_us
+        if !this.has_rtt {
+            this.has_rtt = true
+            this.min_rtt_us = latest_us
+            this.smoothed_rtt_us = latest_us
+            this.rttvar_us = latest_us / 2
+            return
+        }
+        if latest_us < this.min_rtt_us : this.min_rtt_us = latest_us
+        let adj = latest_us
+        if adj >= this.min_rtt_us + ack_delay_us : adj -= ack_delay_us
+        let diff = this.smoothed_rtt_us > adj ? this.smoothed_rtt_us - adj : adj - this.smoothed_rtt_us
+        this.rttvar_us = (3 * this.rttvar_us + diff) / 4
+        this.smoothed_rtt_us = (7 * this.smoothed_rtt_us + adj) / 8
+    }
+
+    fn loss_delay_us() u64 $inline {
+        let m = this.latest_rtt_us > this.smoothed_rtt_us ? this.latest_rtt_us : this.smoothed_rtt_us
+        let d = (m * 9) / 8
+        return d > QUIC_GRANULARITY_US ? d : QUIC_GRANULARITY_US
+    }
+
+    fn pto_duration_us() u64 $inline {
+        let rttvar4 = this.rttvar_us * 4
+        let v = rttvar4 > QUIC_GRANULARITY_US ? rttvar4 : QUIC_GRANULARITY_US
+        let pto = this.smoothed_rtt_us + v + (this.handshake_done ? this.peer_params.max_ack_delay_ms * 1000 : 0)
+        let shift = this.pto_count > 6 ? 6 : this.pto_count
+        return pto << shift.to(u64)
+    }
+
+    fn detect_lost_packets(lvl: uint, now_us: u64) {
+        let sp = this.spaces[lvl]
+        if !sp.has_acked : return
+        let loss_delay = this.loss_delay_us()
+        let lost_send_time = now_us > loss_delay ? now_us - loss_delay : 0
+        let new_loss_time: u64 = 0
+        let largest_lost_sent_us: u64 = 0
+        let lost_any = false
+
+        let i = sp.sent_head
+        while i < sp.sent.length {
+            let pkt = sp.sent[i]
+            if pkt.pn > sp.largest_acked : break
+            if (pkt.flags & (QSP_ACKED | QSP_LOST)) != 0 {
+                i++
+                continue
+            }
+            let by_time = pkt.sent_us <= lost_send_time
+            let by_pkt = sp.largest_acked >= pkt.pn + QUIC_PACKET_THRESHOLD
+            if by_time || by_pkt {
+                pkt.flags = pkt.flags | QSP_LOST
+                sp.sent[i] = pkt
+                if (pkt.flags & QSP_IN_FLIGHT) != 0 {
+                    let b = pkt.bytes.to(u64)
+                    this.bytes_in_flight = this.bytes_in_flight > b ? this.bytes_in_flight - b : 0
+                }
+                if (pkt.flags & QSP_ACK_ELICITING) != 0 && sp.ack_eliciting_in_flight > 0 {
+                    sp.ack_eliciting_in_flight--
+                }
+                if pkt.sent_us > largest_lost_sent_us : largest_lost_sent_us = pkt.sent_us
+                lost_any = true
+                // Re-queue lost frames for retransmission
+                if (pkt.flags & QSP_CRYPTO) != 0 && !sp.discarded {
+                    this.crypto_tx[lvl].mark_lost(pkt.crypto_off, pkt.crypto_len)
+                }
+                if (pkt.flags & QSP_HANDSHAKE_DONE) != 0 && !this.handshake_confirmed {
+                    this.need_handshake_done = true
+                }
+                if (pkt.flags & QSP_MAX_DATA) != 0 : this.need_max_data = true
+                if (pkt.flags & QSP_MAX_STREAMS_BIDI) != 0 : this.need_max_streams_bidi = true
+                if (pkt.flags & QSP_MAX_STREAMS_UNI) != 0 : this.need_max_streams_uni = true
+                if pkt.chunk_count > 0 {
+                    let ci: uint = 0
+                    let cbase = pkt.chunk_start.to(uint)
+                    while ci < pkt.chunk_count.to(uint) {
+                        let ch = sp.chunks[cbase + ci]
+                        let st = this.streams.get(ch.stream_id) !? null
+                        if isset(st) : st.on_lost(ch.off, ch.len, ch.fin)
+                        ci++
+                    }
+                }
+            } else {
+                let lt = pkt.sent_us + loss_delay
+                if new_loss_time == 0 || lt < new_loss_time : new_loss_time = lt
+                break
+            }
+            i++
+        }
+        sp.loss_time_us = new_loss_time
+        if lost_any {
+            this.on_cc_loss(largest_lost_sent_us, now_us)
+            this.mark_dirty()
+        }
+    }
+
+    // CUBIC congestion window growth on ACK
+    fn on_cc_ack(acked_bytes: u64, largest_sent_us: u64, now_us: u64) {
+        if largest_sent_us <= this.recovery_start_us && this.recovery_start_us > 0 : return
+        let max_cwnd: u64 = 32 * 1024 * 1024
+        if this.cwnd < this.ssthresh {
+            // Slow start
+            this.cwnd += acked_bytes
+            if this.cwnd > max_cwnd : this.cwnd = max_cwnd
+            return
+        }
+        // CUBIC congestion avoidance (C = 0.4, beta = 0.7)
+        let mss = this.max_datagram_1rtt.to(f64)
+        if this.cubic_epoch_us == 0 {
+            this.cubic_epoch_us = now_us
+            if this.cubic_w_max <= this.cwnd.to(f64) {
+                this.cubic_k = 0.0
+                this.cubic_w_max = this.cwnd.to(f64)
+            } else {
+                // K = cbrt((W_max - cwnd) / (0.4 * mss))
+                let diff_pkts = (this.cubic_w_max - this.cwnd.to(f64)) / (0.4 * mss)
+                this.cubic_k = quic_cbrt(diff_pkts)
+            }
+        }
+        let t_sec = (now_us > this.cubic_epoch_us ? now_us - this.cubic_epoch_us : 0).to(f64) / 1_000_000.0
+        let dt = t_sec - this.cubic_k
+        let w_cubic = 0.4 * dt * dt * dt * mss + this.cubic_w_max
+        let add = (acked_bytes * this.max_datagram_1rtt.to(u64)) / (this.cwnd > 0 ? this.cwnd : 1)
+        let target = this.cwnd.to(f64) + add.to(f64)
+        if w_cubic > target : target = w_cubic
+        let next = target.to(u64)
+        if next > this.cwnd : this.cwnd = next
+        if this.cwnd > max_cwnd : this.cwnd = max_cwnd
+    }
+
+    // CUBIC congestion reduction on loss (beta = 0.7)
+    fn on_cc_loss(lost_sent_us: u64, now_us: u64) {
+        if lost_sent_us <= this.recovery_start_us && this.recovery_start_us > 0 : return
+        this.recovery_start_us = now_us
+        this.cubic_w_max = this.cwnd.to(f64)
+        this.cubic_epoch_us = 0
+        let min_cwnd: u64 = (2 * this.max_datagram_1rtt).to(u64)
+        let reduced = (this.cwnd * 7) / 10
+        this.cwnd = reduced > min_cwnd ? reduced : min_cwnd
+        this.ssthresh = this.cwnd
+    }
+
+    // Returns the earliest timer deadline in microseconds (0 = no timer active).
+    fn next_timer_us() u64 {
+        if this.closed : return 0
+        let best: u64 = 0
+        let lvl: uint = 0
+        while lvl < 3 {
+            let sp = this.spaces[lvl]
+            if !sp.discarded {
+                if sp.ack.ack_deadline_us > 0 && (best == 0 || sp.ack.ack_deadline_us < best) {
+                    best = sp.ack.ack_deadline_us
+                }
+                if sp.loss_time_us > 0 && (best == 0 || sp.loss_time_us < best) {
+                    best = sp.loss_time_us
+                }
+            }
+            lvl++
+        }
+        // PTO timer if any ack-eliciting packets are in flight
+        let any_ae = this.spaces[0].ack_eliciting_in_flight > 0
+            || this.spaces[1].ack_eliciting_in_flight > 0
+            || this.spaces[2].ack_eliciting_in_flight > 0
+        if any_ae && this.last_ack_eliciting_tx_us > 0 {
+            let pto_at = this.last_ack_eliciting_tx_us + this.pto_duration_us()
+            if best == 0 || pto_at < best : best = pto_at
+        }
+        return best
+    }
+
+    fn on_timeout(now_us: u64) {
+        if this.closed : return
+        let lvl: uint = 0
+        let had_loss_timer = false
+        while lvl < 3 {
+            let sp = this.spaces[lvl]
+            if !sp.discarded {
+                if sp.ack.ack_deadline_us > 0 && now_us >= sp.ack.ack_deadline_us {
+                    this.mark_dirty()
+                }
+                if sp.loss_time_us > 0 && now_us >= sp.loss_time_us {
+                    had_loss_timer = true
+                    this.detect_lost_packets(lvl, now_us)
+                    sp.compact()
+                }
+            }
+            lvl++
+        }
+        if had_loss_timer : return
+        let any_ae = this.spaces[0].ack_eliciting_in_flight > 0
+            || this.spaces[1].ack_eliciting_in_flight > 0
+            || this.spaces[2].ack_eliciting_in_flight > 0
+        if any_ae && this.last_ack_eliciting_tx_us > 0 {
+            let pto_at = this.last_ack_eliciting_tx_us + this.pto_duration_us()
+            if now_us >= pto_at {
+                this.pto_count++
+                this.last_ack_eliciting_tx_us = now_us
+                // Schedule a probe in the highest active space with ack-eliciting packets
+                if !this.spaces[QUIC_LVL_INITIAL].discarded && this.spaces[QUIC_LVL_INITIAL].ack_eliciting_in_flight > 0 {
+                    this.pto_probes[QUIC_LVL_INITIAL] = 1
+                } else if !this.spaces[QUIC_LVL_HANDSHAKE].discarded && this.spaces[QUIC_LVL_HANDSHAKE].ack_eliciting_in_flight > 0 {
+                    this.pto_probes[QUIC_LVL_HANDSHAKE] = 1
+                } else {
+                    this.pto_probes[QUIC_LVL_APP] = 1
+                }
+                this.mark_dirty()
+            }
+        }
+    }
+
+    // Builds one Initial or Handshake packet into `dst[0..max_len]`. Returns bytes written (0 if nothing to send).
+    fn build_long_packet(lvl: uint, dst: ptr, max_len: uint, now_us: u64) (uint, bool) {
+        let sp = this.spaces[lvl]
+        if sp.discarded || !this.tx_cipher[lvl].ready : return (0, false)
+        let ctx = this.crypto_tx[lvl]
+        let send_ack = sp.ack.should_send(now_us)
+        let send_crypto = ctx.has_pending()
+        let send_probe = this.pto_probes[lvl] > 0
+        let send_close = this.closing && !this.close_sent && !this.tx_cipher[QUIC_LVL_APP].ready && lvl == this.tls_write_level
+        if !send_ack && !send_crypto && !send_probe && !send_close : return (0, false)
+
+        // Header layout: flags(1) + ver(4) + dcid_len(1) + dcid + scid_len(1) + scid + [tok_len(1)] + length(2) + pn(2)
+        let ptype: u8 = lvl == QUIC_LVL_INITIAL ? QUIC_PKT_INITIAL : QUIC_PKT_HANDSHAKE
+        let pn = sp.next_pn
+        let pn_len: uint = 2
+        let hdr_fixed: uint = 1 + 4 + 1 + this.peer_cid_len + 1 + QUIC_SCID_LEN + (lvl == QUIC_LVL_INITIAL ? 1 : 0)
+        let len_off = hdr_fixed
+        let pn_off = len_off + 2 // reserve 2-byte varint for Length
+        let payload_start = pn_off + pn_len
+        if payload_start + QUIC_AEAD_TAG_LEN + 8 > max_len : return (0, false)
+        let payload_end = max_len - QUIC_AEAD_TAG_LEN
+
+        @unsafe
+        @ptrv(dst, u8, 0) = 0xc0 | (ptype << 4) | (pn_len - 1).to(u8)
+        quic_put_u32_be(dst, 1, QUIC_VERSION_1)
+        @ptrv(dst, u8, 5) = this.peer_cid_len.to(u8)
+        if this.peer_cid_len > 0 : mem.copy_bytes(@ref(this.peer_cid).@cast(ptr), dst.@offset(6), this.peer_cid_len)
+        let s_off = 6 + this.peer_cid_len
+        @ptrv(dst, u8, s_off) = QUIC_SCID_LEN
+        mem.copy_bytes(@ref(this.scid).@cast(ptr), dst.@offset(s_off + 1), QUIC_SCID_LEN)
+        if lvl == QUIC_LVL_INITIAL : @ptrv(dst, u8, s_off + 1 + QUIC_SCID_LEN) = 0 // 0-byte token
+        quic_put_pn(dst, pn_off, pn, pn_len)
+
+        let p = payload_start
+        let ae = false
+        let flags: u16 = 0
+        let c_off: u32 = 0
+        let c_len: u32 = 0
+
+        if send_ack {
+            let ok, p2 = sp.ack.write_ack(dst, p, payload_end, now_us, QUIC_LOCAL_ACK_DELAY_EXP)
+            if ok : p = p2
+        }
+        if send_close && p + 6 <= payload_end {
+            @ptrv(dst, u8, p) = QUIC_FRAME_CONNECTION_CLOSE
+            p++
+            p = quic_put_varint(dst, p, this.close_err_code)
+            p = quic_put_varint(dst, p, 0)
+            p = quic_put_varint(dst, p, 0)
+            this.close_sent = true
+        }
+        if send_crypto && !this.closing {
+            // Retransmit lost crypto range first, otherwise fresh bytes
+            let coff: uint = 0
+            let clen: uint = 0
+            let from_retrans = false
+            if ctx.retrans.length > 0 {
+                let r = ctx.retrans[0]
+                coff = r.off.to(uint)
+                clen = r.len.to(uint)
+                from_retrans = true
+            } else {
+                coff = ctx.sent_off
+                clen = ctx.buf.length - ctx.sent_off
+            }
+            let fhdr_max = 1 + quic_varint_len(coff.to(u64)) + 2
+            if p + fhdr_max < payload_end {
+                let avail = payload_end - p - fhdr_max
+                if clen > avail : clen = avail
+                if clen > 0 {
+                    @ptrv(dst, u8, p) = QUIC_FRAME_CRYPTO
+                    p++
+                    p = quic_put_varint(dst, p, coff.to(u64))
+                    p = quic_put_varint(dst, p, clen.to(u64))
+                    mem.copy_bytes(ctx.buf.data.@offset(coff), dst.@offset(p), clen)
+                    p += clen
+                    ae = true
+                    flags = flags | QSP_CRYPTO
+                    c_off = coff.to(u32)
+                    c_len = clen.to(u32)
+                    if from_retrans {
+                        let r = ctx.retrans[0]
+                        if clen.to(u32) >= r.len {
+                            ctx.retrans.remove(0)
+                        } else {
+                            ctx.retrans[0] = QuicByteRange { off: r.off + clen.to(u64), len: r.len - clen.to(u32), fin: false }
+                        }
+                    } else {
+                        ctx.sent_off += clen
+                    }
+                }
+            }
+        }
+        if send_probe {
+            this.pto_probes[lvl]--
+            if !ae && p < payload_end {
+                @ptrv(dst, u8, p) = QUIC_FRAME_PING
+                p++
+                ae = true
+            }
+        }
+        if p == payload_start : return (0, false)
+
+        // Ensure sample at pn_off + 4 fits (pn_len + pt_len + 16 >= 20 -> pt_len >= 4 - pn_len)
+        let min_pt = pn_len < 4 ? 4 - pn_len : 0
+        while p - payload_start < min_pt {
+            @ptrv(dst, u8, p) = QUIC_FRAME_PADDING
+            p++
+        }
+        let pt_len = p - payload_start
+        let quic_len = pn_len + pt_len + QUIC_AEAD_TAG_LEN
+        // Write 2-byte varint at len_off
+        @ptrv(dst, u8, len_off) = ((quic_len >> 8).to(u8) & 0x3f) | 0x40
+        @ptrv(dst, u8, len_off + 1) = (quic_len & 0xff).to(u8)
+
+        if !this.tx_cipher[lvl].encrypt_packet(dst, pn_off, pn_len, pt_len, pn) : return (0, false)
+        let total = payload_start + pt_len + QUIC_AEAD_TAG_LEN
+        sp.next_pn++
+        if ae {
+            flags = flags | QSP_ACK_ELICITING | QSP_IN_FLIGHT
+            sp.ack_eliciting_in_flight++
+            this.bytes_in_flight += total.to(u64)
+            this.last_ack_eliciting_tx_us = now_us
+        }
+        sp.sent.append(QuicSentPkt {
+            pn: pn,
+            sent_us: now_us,
+            bytes: total.to(u32),
+            flags: flags,
+            crypto_off: c_off,
+            crypto_len: c_len
+        })
+        return (total, ae)
+    }
+
+    // Builds ONE 1-RTT Short Header packet into `dst[0..max_len]`.
+    // If `pad_to_exact` is true (for GSO non-final segments), pads to `max_len` when data was written.
+    fn build_1rtt_packet(dst: ptr, max_len: uint, now_us: u64, allow_data: bool) uint {
+        let sp = this.spaces[QUIC_LVL_APP]
+        if sp.discarded || !this.tx_cipher[QUIC_LVL_APP].ready : return 0
+
+        let pn = sp.next_pn
+        let pn_len = quic_pn_encode_len(pn, sp.largest_acked, sp.has_acked)
+        let pn_off: uint = 1 + this.peer_cid_len
+        let payload_start = pn_off + pn_len
+        if payload_start + QUIC_AEAD_TAG_LEN + 4 > max_len : return 0
+        let payload_end = max_len - QUIC_AEAD_TAG_LEN
+
+        @unsafe
+        let first: u8 = 0x40 | (this.tx_key_phase ? 0x04 : 0) | (pn_len - 1).to(u8)
+        @ptrv(dst, u8, 0) = first
+        if this.peer_cid_len > 0 : mem.copy_bytes(@ref(this.peer_cid).@cast(ptr), dst.@offset(1), this.peer_cid_len)
+        quic_put_pn(dst, pn_off, pn, pn_len)
+
+        let p = payload_start
+        let ae = false
+        let flags: u16 = 0
+        let chunk_start = sp.chunks.length.to(u32)
+        let chunk_count: u16 = 0
+
+        // 1. CONNECTION_CLOSE
+        if this.closing && !this.close_sent {
+            if p + 8 <= payload_end {
+                @ptrv(dst, u8, p) = this.close_is_app ? QUIC_FRAME_CONNECTION_CLOSE_APP : QUIC_FRAME_CONNECTION_CLOSE
+                p++
+                p = quic_put_varint(dst, p, this.close_err_code)
+                if !this.close_is_app : p = quic_put_varint(dst, p, 0)
+                p = quic_put_varint(dst, p, 0)
+                this.close_sent = true
+            }
+        }
+        // 2. ACK
+        if sp.ack.should_send(now_us) {
+            let ok, p2 = sp.ack.write_ack(dst, p, payload_end, now_us, QUIC_LOCAL_ACK_DELAY_EXP)
+            if ok : p = p2
+        }
+        // 3. HANDSHAKE_DONE
+        if this.need_handshake_done && p < payload_end {
+            @ptrv(dst, u8, p) = QUIC_FRAME_HANDSHAKE_DONE
+            p++
+            this.need_handshake_done = false
+            ae = true
+            flags = flags | QSP_HANDSHAKE_DONE
+        }
+        // 4. PATH_RESPONSE
+        if this.need_path_response && p + 9 <= payload_end {
+            @ptrv(dst, u8, p) = QUIC_FRAME_PATH_RESPONSE
+            mem.copy_bytes(@ref(this.path_challenge_data).@cast(ptr), dst.@offset(p + 1), 8)
+            p += 9
+            this.need_path_response = false
+            ae = true
+        }
+        // 5. Connection flow control & stream credit
+        if this.need_max_data && p + 9 <= payload_end {
+            @ptrv(dst, u8, p) = QUIC_FRAME_MAX_DATA
+            p++
+            p = quic_put_varint(dst, p, this.recv_max_data)
+            this.need_max_data = false
+            ae = true
+            flags = flags | QSP_MAX_DATA
+        }
+        if this.need_max_streams_bidi && p + 9 <= payload_end {
+            @ptrv(dst, u8, p) = QUIC_FRAME_MAX_STREAMS_BIDI
+            p++
+            p = quic_put_varint(dst, p, this.local_max_streams_bidi)
+            this.need_max_streams_bidi = false
+            ae = true
+            flags = flags | QSP_MAX_STREAMS_BIDI
+        }
+        // 6. STREAM frames (round-robin across ready streams, coalescing as many as fit!)
+        if allow_data && !this.closing {
+            let tries = this.send_queue.length
+            let checked: uint = 0
+            while checked < tries && p + 12 < payload_end {
+                let st = this.send_queue.pop_front() ! break
+                checked++
+                if st.closed {
+                    st.in_send_queue = false
+                    this.endpoint.give_stream(st)
+                    continue
+                }
+                // MAX_STREAM_DATA (stream recv flow control)
+                if st.need_max_stream_data && p + 17 <= payload_end {
+                    @ptrv(dst, u8, p) = QUIC_FRAME_MAX_STREAM_DATA
+                    p++
+                    p = quic_put_varint(dst, p, st.id)
+                    p = quic_put_varint(dst, p, st.recv_max_data)
+                    st.need_max_stream_data = false
+                    ae = true
+                    if !st.has_send_work() {
+                        st.in_send_queue = false
+                        continue
+                    }
+                }
+                // RESET_STREAM
+                if st.send_reset {
+                    if !st.send_reset_sent && p + 25 <= payload_end {
+                        @ptrv(dst, u8, p) = QUIC_FRAME_RESET_STREAM
+                        p++
+                        p = quic_put_varint(dst, p, st.id)
+                        p = quic_put_varint(dst, p, st.send_reset_code)
+                        p = quic_put_varint(dst, p, st.send_off)
+                        st.send_reset_sent = true
+                        ae = true
+                        this.maybe_gc_stream(st)
+                        st.in_send_queue = false
+                    } else if !st.send_reset_sent {
+                        this.send_queue.push_front(st)
+                        break
+                    } else {
+                        st.in_send_queue = false
+                    }
+                    continue
+                }
+                // Retransmit lost stream range first
+                let retrans = st.send_retrans
+                if isset(retrans) && retrans.length > 0 {
+                    let r = retrans[0]
+                    let hdr_sz = 1 + quic_varint_len(st.id) + (r.off > 0 ? quic_varint_len(r.off) : 0) + 2
+                    if p + hdr_sz >= payload_end {
+                        this.send_queue.push_front(st)
+                        break
+                    }
+                    let avail = payload_end - p - hdr_sz
+                    let take = r.len.to(uint)
+                    let send_fin = r.fin
+                    if take > avail {
+                        take = avail
+                        send_fin = false
+                    }
+                    let sf: u8 = QUIC_FRAME_STREAM_BASE | 0x02 | (r.off > 0 ? 0x04 : 0) | (send_fin ? 0x01 : 0)
+                    @ptrv(dst, u8, p) = sf
+                    p++
+                    p = quic_put_varint(dst, p, st.id)
+                    if r.off > 0 : p = quic_put_varint(dst, p, r.off)
+                    p = quic_put_varint(dst, p, take.to(u64))
+                    st.copy_send_bytes(r.off, dst.@offset(p), take)
+                    p += take
+                    sp.chunks.append(QuicSentChunk { stream_id: st.id, off: r.off, len: take.to(u32), fin: send_fin })
+                    chunk_count++
+                    ae = true
+                    if take.to(u32) >= r.len && (!r.fin || send_fin) {
+                        retrans.remove(0)
+                    } else {
+                        retrans[0] = QuicByteRange { off: r.off + take.to(u64), len: r.len - take.to(u32), fin: r.fin }
+                    }
+                    if st.has_send_work() {
+                        this.send_queue.push_back(st)
+                    } else {
+                        st.in_send_queue = false
+                    }
+                    continue
+                }
+                // Fresh stream bytes
+                let tot = st.total_send_len()
+                let rem = tot > st.send_off ? tot - st.send_off : 0
+                let stream_win = st.send_max_data > st.send_off ? st.send_max_data - st.send_off : 0
+                let conn_win = this.send_max_data > this.send_data_off ? this.send_max_data - this.send_data_off : 0
+                let can_send = rem
+                if can_send > stream_win : can_send = stream_win
+                if can_send > conn_win : can_send = conn_win
+                let want_fin = st.send_fin && !st.send_fin_sent && can_send == rem
+                if can_send == 0 && !want_fin {
+                    // Flow-control blocked: push to back and try next stream
+                    this.send_queue.push_back(st)
+                    continue
+                }
+                let has_off = st.send_off > 0
+                let base_hdr = 1 + quic_varint_len(st.id) + (has_off ? quic_varint_len(st.send_off) : 0)
+                if p + base_hdr + 2 > payload_end {
+                    this.send_queue.push_front(st)
+                    break
+                }
+                let avail_with_len = payload_end - p - base_hdr - 2
+                let take: uint = can_send.to(uint)
+                let omit_len = false
+                if take >= avail_with_len {
+                    let avail_no_len = payload_end - p - base_hdr
+                    if take >= avail_no_len {
+                        take = avail_no_len
+                        omit_len = true
+                    }
+                }
+                let send_fin = st.send_fin && !st.send_fin_sent && take.to(u64) == rem
+                let sf: u8 = QUIC_FRAME_STREAM_BASE | (has_off ? 0x04 : 0) | (omit_len ? 0 : 0x02) | (send_fin ? 0x01 : 0)
+                @ptrv(dst, u8, p) = sf
+                p++
+                p = quic_put_varint(dst, p, st.id)
+                if has_off : p = quic_put_varint(dst, p, st.send_off)
+                if !omit_len : p = quic_put_varint(dst, p, take.to(u64))
+                if take > 0 : st.copy_send_bytes(st.send_off, dst.@offset(p), take)
+                p += take
+                sp.chunks.append(QuicSentChunk { stream_id: st.id, off: st.send_off, len: take.to(u32), fin: send_fin })
+                chunk_count++
+                st.send_off += take.to(u64)
+                this.send_data_off += take.to(u64)
+                if send_fin : st.send_fin_sent = true
+                ae = true
+                if st.has_send_work() {
+                    this.send_queue.push_back(st)
+                } else {
+                    st.in_send_queue = false
+                }
+            }
+        }
+
+        // 7. PTO probe PING if needed
+        if this.pto_probes[QUIC_LVL_APP] > 0 {
+            this.pto_probes[QUIC_LVL_APP]--
+            if !ae && p < payload_end {
+                @ptrv(dst, u8, p) = QUIC_FRAME_PING
+                p++
+                ae = true
+            }
+        }
+
+        if p == payload_start : return 0
+
+        // Pad near-full packets to exact `max_len` when more stream data is queued so GSO stays coalesced
+        if allow_data && this.send_queue.length > 0 && p < payload_end && payload_end - p < 32 {
+            mem.clear_bytes(dst.@offset(p), payload_end - p)
+            p = payload_end
+        }
+        // Minimum payload for HP sample (pn_len + pt_len + 16 >= 20)
+        let min_pt = pn_len < 4 ? 4 - pn_len : 0
+        while p - payload_start < min_pt {
+            @ptrv(dst, u8, p) = QUIC_FRAME_PADDING
+            p++
+        }
+        let pt_len = p - payload_start
+        if !this.tx_cipher[QUIC_LVL_APP].encrypt_packet(dst, pn_off, pn_len, pt_len, pn) : return 0
+        let total = payload_start + pt_len + QUIC_AEAD_TAG_LEN
+        sp.next_pn++
+        if ae {
+            flags = flags | QSP_ACK_ELICITING | QSP_IN_FLIGHT
+            sp.ack_eliciting_in_flight++
+            this.bytes_in_flight += total.to(u64)
+            this.last_ack_eliciting_tx_us = now_us
+        }
+        sp.sent.append(QuicSentPkt {
+            pn: pn,
+            sent_us: now_us,
+            bytes: total.to(u32),
+            flags: flags,
+            chunk_count: chunk_count,
+            chunk_start: chunk_start
+        })
+        return total
+    }
+
+    // Flush handshake (coalesced Initial + Handshake + 1-RTT) and/or 1-RTT GSO burst!
+    fn flush(now_us: u64) {
+        @unsafe
+        if this.closed : return
+        this.dirty = false
+
+        // 1. Handshake phase: coalesce Initial + Handshake + early 1-RTT into 1200B datagrams
+        while !this.spaces[QUIC_LVL_INITIAL].discarded || !this.spaces[QUIC_LVL_HANDSHAKE].discarded {
+            if !this.addr_validated && this.bytes_tx_pre_val + QUIC_MAX_DATAGRAM_INIT > this.bytes_rx_pre_val * 3 : return
+            let buf: [u8 x 1200] = @undefined
+            let dst = @ref(buf).@cast(ptr)
+            let off: uint = 0
+            let has_ae_initial = false
+            if !this.spaces[QUIC_LVL_INITIAL].discarded {
+                let n, ae = this.build_long_packet(QUIC_LVL_INITIAL, dst, 1200, now_us)
+                off += n
+                if ae : has_ae_initial = true
+            }
+            if !this.spaces[QUIC_LVL_HANDSHAKE].discarded && 1200 - off >= 64 {
+                let n, _ = this.build_long_packet(QUIC_LVL_HANDSHAKE, dst.@offset(off), 1200 - off, now_us)
+                off += n
+            }
+            if this.tx_cipher[QUIC_LVL_APP].ready && 1200 - off >= 64 {
+                let n = this.build_1rtt_packet(dst.@offset(off), 1200 - off, now_us, this.bytes_in_flight < this.cwnd)
+                off += n
+            }
+            if off == 0 : break
+            // Pad datagrams carrying ack-eliciting Initial packets to 1200 bytes (RFC 9000 §14.1)
+            if has_ae_initial && off < 1200 {
+                @unsafe
+                mem.clear_bytes(dst.@offset(off), 1200 - off)
+                off = 1200
+            }
+            if !this.addr_validated : this.bytes_tx_pre_val += off.to(u64)
+            this.endpoint.queue_tx_datagram(dst, off, @ref(this.peer_addr).@cast(ptr), this.peer_addr_len)
+        }
+
+        // 2. Steady-state 1-RTT: pack up to 44 packets per flush (using Linux UDP GSO when >=2 full packets!)
+        if !this.tx_cipher[QUIC_LVL_APP].ready : return
+        let seg_sz = this.max_datagram_1rtt
+        let gso_buf = this.endpoint.gso_tx_buf
+        let gso_len: uint = 0
+        let gso_pkts: uint = 0
+        let max_burst: uint = 44
+
+        while gso_pkts < max_burst {
+            let allow_data = this.bytes_in_flight < this.cwnd
+            let p_len = this.build_1rtt_packet(gso_buf.@offset(gso_len), seg_sz, now_us, allow_data)
+            if p_len == 0 : break
+            gso_len += p_len
+            gso_pkts++
+            // GSO requires every segment except the last to be exact `seg_sz` bytes!
+            if p_len < seg_sz : break
+        }
+
+        if gso_pkts == max_burst && this.send_queue.length > 0 && this.bytes_in_flight < this.cwnd {
+            this.mark_dirty()
+        }
+        if gso_pkts == 0 : return
+        if gso_pkts == 1 {
+            // Single packet: queue in sendmmsg batch so multiple connections flush in 1 syscall!
+            this.endpoint.queue_tx_datagram(gso_buf, gso_len, @ref(this.peer_addr).@cast(ptr), this.peer_addr_len)
+        } else {
+            // Multiple full-size packets to the same peer: send via Linux UDP GSO (1 syscall for all 44 packets!)
+            this.endpoint.send_gso(gso_buf, gso_len, seg_sz.to(u16), @ref(this.peer_addr).@cast(ptr), this.peer_addr_len)
+        }
+    }
+}
+
+// Fast Newton-Raphson cube root for CUBIC K calculation (avoids libm cbrt dependency)
+fn quic_cbrt(x: f64) f64 {
+    if x <= 0.0 : return 0.0
+    let y: f64 = 1.0
+    let t = x
+    while t > 8.0 {
+        t *= 0.125
+        y *= 2.0
+    }
+    let i: uint = 0
+    while i < 8 {
+        y = (2.0 * y + x / (y * y)) / 3.0
+        i++
+    }
+    return y
+}

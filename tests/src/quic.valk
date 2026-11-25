@@ -1,0 +1,284 @@
+@ignore_access
+use valk.net
+use valk.http
+use valk.mem
+use valk.time
+
+test "QUIC: varint encode/decode boundaries and truncation" {
+    let vals = Array[u64]{ 0, 1, 63, 64, 16_383, 16_384, 1_073_741_823, 1_073_741_824, 4_611_686_018_427_387_903 }
+    let lens = Array[uint]{ 1, 1, 1, 2, 2, 4, 4, 8, 8 }
+    let buf: [u8 x 16] = { 0... }
+    @unsafe
+    let p = @ref(buf).@cast(ptr)
+    each vals as v, i {
+        assert(net.quic_varint_len(v) == lens[i])
+        let end = net.quic_put_varint(p, 0, v)
+        assert(end == lens[i])
+        let ok, got, next = net.quic_get_varint(p, 0, end)
+        assert(ok && got == v && next == end)
+        // Truncated input must fail cleanly
+        let ok_short, _, _ = net.quic_get_varint(p, 0, end - 1)
+        assert(!ok_short)
+    }
+    let ok_empty, _, _ = net.quic_get_varint(p, 0, 0)
+    assert(!ok_empty)
+}
+
+test "QUIC: packet number encode length and RFC 9000 Appendix A.3 decode" {
+    assert(net.quic_pn_encode_len(0, 0, false) == 1)
+    assert(net.quic_pn_encode_len(127, 0, true) == 1)
+    assert(net.quic_pn_encode_len(128, 0, true) == 2)
+    assert(net.quic_pn_encode_len(32_768, 0, true) == 3)
+    assert(net.quic_pn_encode_len(8_388_608, 0, true) == 4)
+
+    // RFC 9000 Appendix A.3 example: largest=0xa82f30ea, truncated=0x9b32 (16-bit) -> 0xa82f9b32
+    assert(net.quic_decode_pn(0xa82f30ea, true, 0x9b32, 2) == 0xa82f9b32)
+    // First packet when no largest yet
+    assert(net.quic_decode_pn(0, false, 0, 1) == 0)
+    assert(net.quic_decode_pn(0, false, 42, 1) == 42)
+    // Wraparound across 256 boundary with 1-byte PN
+    assert(net.quic_decode_pn(254, true, 1, 1) == 257)
+    // Out-of-order earlier packet across 256 boundary
+    assert(net.quic_decode_pn(257, true, 254, 1) == 254)
+}
+
+test "QUIC: RFC 9001 Initial keys, AEAD + HP round-trip across all 3 ciphers and key update" {
+    @unsafe
+    // RFC 9001 Appendix A.1 DCID: 0x8394c8f03e515708
+    let dcid: [u8 x 8] = { 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 }
+    let rx = net.QuicCipher {}
+    let tx = net.QuicCipher {}
+    assert(net.quic_derive_initial_ciphers(@ref(dcid).@cast(ptr), 8, rx, tx))
+    // RFC 9001 Appendix A.1 client_in IV: 0xfa044b2f42a3fd3b46fb255c
+    assert(rx.iv[0] == 0xfa && rx.iv[1] == 0x04 && rx.iv[2] == 0x4b && rx.iv[11] == 0x5c)
+    // RFC 9001 Appendix A.1 server_in IV: 0x0ac1493ca1905853b0bba03e
+    assert(tx.iv[0] == 0x0a && tx.iv[1] == 0xc1 && tx.iv[2] == 0x49 && tx.iv[11] == 0x3e)
+
+    // Test encrypt/decrypt + header protection round-trip for AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305
+    let kinds = Array[u8]{ net.QUIC_CIPHER_AES_128_GCM, net.QUIC_CIPHER_AES_256_GCM, net.QUIC_CIPHER_CHACHA20 }
+    let secret: [u8 x 48] = { 0... }
+    let si: uint = 0
+    while si < 48 {
+        secret[si] = (si * 7 + 3).to(u8)
+        si++
+    }
+    each kinds as kind {
+        let slen: uint = kind == net.QUIC_CIPHER_AES_256_GCM ? 48 : 32
+        let enc = net.QuicCipher {}
+        let dec = net.QuicCipher {}
+        assert(enc.init_from_secret(kind, true, @ref(secret).@cast(ptr), slen))
+        assert(dec.init_from_secret(kind, false, @ref(secret).@cast(ptr), slen))
+
+        // Build a 1-RTT short header packet: 1B flags + 8B DCID + 2B PN + 24B payload + 16B tag
+        let pkt: [u8 x 64] = { 0... }
+        let p = @ref(pkt).@cast(ptr)
+        pkt[0] = 0x41 // Short header, fixed bit, pn_len = 2 (0x01)
+        mem.copy_bytes(@ref(dcid).@cast(ptr), p.@offset(1), 8)
+        let pn: u64 = 0x1234
+        net.quic_put_pn(p, 9, pn, 2)
+        let msg = "hello quic aead payload!"
+        mem.copy_bytes(msg.data, p.@offset(11), msg.bytes)
+        let total = 11 + msg.bytes + 16
+
+        assert(enc.encrypt_packet(p, 9, 2, msg.bytes, pn))
+        // Verify ciphertext differs from plaintext
+        assert(pkt[11] != 'h' || pkt[12] != 'e' || pkt[13] != 'l')
+
+        let ok_hp, pn_len, kp, trunc = dec.unprotect_header(p, total, 9)
+        assert(ok_hp && pn_len == 2 && !kp && trunc == 0x1234)
+        let ok_dec, pt_len = dec.decrypt_payload(p, total, 9, pn_len, pn)
+        assert(ok_dec && pt_len == msg.bytes)
+        assert(String.copy_from_ptr(p.@offset(11), pt_len) == msg)
+
+        // Tampered tag must fail decryption
+        pkt[total - 1] = pkt[total - 1] ^ 0x01
+        let ok_bad, _ = dec.decrypt_payload(p, total, 9, pn_len, pn)
+        assert(!ok_bad)
+
+        // Key update (RFC 9001 §6.1) round-trip
+        let enc2 = net.QuicCipher {}
+        let dec2 = net.QuicCipher {}
+        assert(enc2.init_key_update(enc))
+        assert(dec2.init_key_update(dec))
+        enc2.hp = enc.hp
+        dec2.hp = dec.hp
+        enc.hp = null
+        dec.hp = null
+        pkt[0] = 0x45 // key_phase = 1, pn_len = 2
+        net.quic_put_pn(p, 9, pn + 1, 2)
+        mem.copy_bytes(msg.data, p.@offset(11), msg.bytes)
+        assert(enc2.encrypt_packet(p, 9, 2, msg.bytes, pn + 1))
+        let ok_hp2, pn_len2, kp2, trunc2 = dec2.unprotect_header(p, total, 9)
+        assert(ok_hp2 && pn_len2 == 2 && kp2 && trunc2 == 0x1235)
+        let ok_dec2, pt_len2 = dec2.decrypt_payload(p, total, 9, pn_len2, pn + 1)
+        assert(ok_dec2 && pt_len2 == msg.bytes)
+        assert(String.copy_from_ptr(p.@offset(11), pt_len2) == msg)
+
+        enc.free()
+        dec.free()
+        enc2.free()
+        dec2.free()
+    }
+    rx.free()
+    tx.free()
+}
+
+test "QUIC: transport parameters encode/decode and validation" {
+    @unsafe
+    let odcid: [u8 x 8] = { 1, 2, 3, 4, 5, 6, 7, 8 }
+    let scid: [u8 x 8] = { 9, 10, 11, 12, 13, 14, 15, 16 }
+    // Client TP buffer (must not include server-only orig_dcid)
+    let buf = ByteBuffer.new(128)
+    net.quic_tp_write_int(buf, net.QUIC_TP_MAX_IDLE_TIMEOUT, 30_000)
+    net.quic_tp_write_int(buf, net.QUIC_TP_MAX_UDP_PAYLOAD_SIZE, 1452)
+    net.quic_tp_write_int(buf, net.QUIC_TP_INITIAL_MAX_DATA, 1_048_576)
+    net.quic_tp_write_int(buf, net.QUIC_TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL, 262_144)
+    net.quic_tp_write_int(buf, net.QUIC_TP_INITIAL_MAX_STREAMS_BIDI, 100)
+    net.quic_tp_write_int(buf, net.QUIC_TP_ACK_DELAY_EXPONENT, 3)
+    net.quic_tp_write_bytes(buf, net.QUIC_TP_INITIAL_SCID, @ref(scid).@cast(ptr), 8)
+
+    let ok, p = net.quic_decode_peer_transport_params(buf.data, buf.length)
+    assert(ok)
+    assert(p.max_idle_timeout_ms == 30_000)
+    assert(p.max_udp_payload_size == 1452)
+    assert(p.initial_max_data == 1_048_576)
+    assert(p.initial_max_stream_data_bidi_local == 262_144)
+    assert(p.initial_max_streams_bidi == 100)
+    assert(p.has_initial_scid && p.initial_scid_len == 8 && p.initial_scid[0] == 9 && p.initial_scid[7] == 16)
+
+    // Server-only parameter sent by client must be rejected
+    let bad = ByteBuffer.new(64)
+    net.quic_encode_server_transport_params(bad, @ref(odcid).@cast(ptr), 8, @ref(scid).@cast(ptr), 8, 30_000)
+    let ok_bad, _ = net.quic_decode_peer_transport_params(bad.data, bad.length)
+    assert(!ok_bad)
+
+    // Invalid max_udp_payload_size < 1200 must be rejected
+    let bad_mtu = ByteBuffer.new(32)
+    net.quic_tp_write_int(bad_mtu, net.QUIC_TP_MAX_UDP_PAYLOAD_SIZE, 1199)
+    let ok_mtu, _ = net.quic_decode_peer_transport_params(bad_mtu.data, bad_mtu.length)
+    assert(!ok_mtu)
+}
+
+test "QUIC: ACK tracker range merging, duplicate detection, and ACK frame encoding" {
+    let ack = net.QuicAckTracker {}
+    assert(!ack.is_dup(0))
+    assert(ack.on_rx(0, 1000, true, 2, 25_000))
+    assert(ack.on_rx(1, 1010, true, 2, 25_000))
+    assert(ack.should_send(1010))
+    assert(ack.ranges.length == 1 && ack.ranges[0].lo == 0 && ack.ranges[0].hi == 1)
+    assert(ack.is_dup(0) && ack.is_dup(1) && !ack.is_dup(2))
+    assert(!ack.on_rx(1, 1020, true, 2, 25_000)) // duplicate rejected
+
+    // Out-of-order gap then fill
+    assert(ack.on_rx(4, 1030, true, 2, 25_000))
+    assert(ack.on_rx(5, 1040, true, 2, 25_000))
+    assert(ack.ranges.length == 2)
+    assert(ack.on_rx(3, 1050, true, 2, 25_000))
+    assert(ack.ranges.length == 2 && ack.ranges[1].lo == 3 && ack.ranges[1].hi == 5)
+    assert(ack.on_rx(2, 1060, true, 2, 25_000))
+    // Gap fully bridged -> single range [0..5]
+    assert(ack.ranges.length == 1 && ack.ranges[0].lo == 0 && ack.ranges[0].hi == 5)
+
+    // Encode ACK frame
+    let wire: [u8 x 64] = { 0... }
+    @unsafe
+    let ok, end = ack.write_ack(@ref(wire).@cast(ptr), 0, 64, 1100, 3)
+    assert(ok && end > 4 && wire[0] == net.QUIC_FRAME_ACK)
+    assert(!ack.should_send(1100))
+}
+
+test "QUIC: stream out-of-order reassembly, out-of-order ACK tracking, and tail trimming" {
+    @unsafe
+    let st = net.QuicStream {
+        id: 0,
+        conn: @undefined,
+        recv_buf: ByteBuffer.new(64),
+        send_hdr: ByteBuffer.new(64),
+        recv_max_data: 4096,
+        send_max_data: 4096
+    }
+    // Receive out-of-order chunks: [5..10) with FIN, then [0..5)
+    let p2 = "world"
+    let p1 = "hello"
+    assert(st.on_recv(5, p2.data, 5, true))
+    assert(!st.recv_fin && st.recv_off == 0)
+    assert(st.on_recv(0, p1.data, 5, false))
+    assert(st.recv_fin && st.recv_off == 10)
+    assert(st.recv_buf.to_string() == "helloworld")
+
+    // Out-of-order ACK tracking on send side
+    st.send_hdr.write("abcdefghij")
+    st.send_fin = true
+    st.on_acked(5, 5, true)
+    assert(st.send_acked_end == 0 && st.send_fin_acked && !st.is_send_complete())
+    st.on_acked(0, 5, false)
+    assert(st.send_acked_end == 10 && st.is_send_complete())
+}
+
+test "QUIC: malformed and truncated UDP datagrams fuzz resilience" {
+    @unsafe
+    let ctx = net.QuicServerContext.new(tls_cert_path(), tls_key_path()) ! {
+        assert(false)
+        return
+    }
+    let ql = net.QuicListener.new(ctx, "127.0.0.1", 0, 5000, false) ! {
+        assert(false)
+        return
+    }
+    let ep = net.QuicEndpoint.new(ql, 8)
+    defer ep.close()
+
+    let addr: [u8 x 16] = { 0... }
+    let buf: [u8 x 1300] = { 0... }
+    let p = @ref(buf).@cast(ptr)
+    let ap = @ref(addr).@cast(ptr)
+    let seed: u64 = 0x9e3779b97f4a7c15
+    let i: uint = 0
+    while i < 2000 {
+        seed = (seed ^ (seed >> 12))
+        seed = (seed ^ (seed << 25))
+        seed = (seed ^ (seed >> 27))
+        let r = seed * 0x2545f4914f6cdd1d
+        let plen: uint = (r % 1280).to(uint)
+        let j: uint = 0
+        while j < plen {
+            seed = seed * 6364136223846793005 + 1
+            buf[j] = (seed >> 56).to(u8)
+            j++
+        }
+        // Also explicitly hit short-header and v1 Initial header paths
+        if (i & 3) == 0 && plen >= 32 {
+            buf[0] = 0x40
+        } else if (i & 3) == 1 && plen >= 1200 {
+            buf[0] = 0xc0
+            buf[1] = 0; buf[2] = 0; buf[3] = 0; buf[4] = 1
+            buf[5] = 8
+            buf[14] = 8
+        }
+        ep.dispatch_udp(p, plen, ap, 16, 100_000 + i.to(u64) * 10, true)
+        i++
+    }
+    assert(ep.conns.length <= 8)
+}
+
+test "QUIC: repeated HTTP/3 requests on one connection clean up streams without leaking" {
+    let port: u16 = 18_951
+    let srv = h3_start_test_server(port)
+    let client = http.Client.new()
+    client.http3 = true
+    let opts = http.Options { verify_tls_cert: false }
+    let base = "https://127.0.0.1:" + port
+    let i: uint = 0
+    while i < 200 {
+        let res = client.get(base + "/hello?n=" + i, opts) ! {
+            assert(false)
+            break
+        }
+        assert(res.status == 200)
+        assert(res.body == "hello-h3:n=" + i)
+        i++
+    }
+    client.close()
+    srv.shutdown(500)
+    time.sleep_ms(30)
+}

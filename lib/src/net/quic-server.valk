@@ -1,0 +1,565 @@
+// High-performance QUIC UDP listener & per-worker endpoint.
+// Uses Linux recvmmsg + UDP_GRO + sendmmsg + UDP_SEGMENT (GSO), with portable recvfrom/sendto fallback.
+
+use ext
+use crypto
+use core
+use mem
+use time
+
+value QUIC_RX_BATCH (32)
+value QUIC_RX_SLOT_SIZE (16_384)
+value QUIC_TX_BATCH (64)
+value QUIC_TX_SLOT_SIZE (1500)
+value QUIC_GSO_BUF_SIZE (65_536)
+
+#if OS == "linux"
+value QUIC_SOL_UDP (17)
+value QUIC_UDP_SEGMENT (103)
+value QUIC_UDP_GRO (104)
+
+struct QuicIovec {
+    iov_base: ?ptr (null)
+    iov_len: uint (0)
+}
+
+struct QuicMsghdr {
+    msg_name: ?ptr (null)
+    msg_namelen: u32 (0)
+    pad0: u32 (0)
+    msg_iov: ?ptr (null)
+    msg_iovlen: uint (0)
+    msg_control: ?ptr (null)
+    msg_controllen: uint (0)
+    msg_flags: i32 (0)
+    pad1: i32 (0)
+}
+
+struct QuicMmsghdr {
+    msg_hdr: QuicMsghdr (.{})
+    msg_len: u32 (0)
+    pad: u32 (0)
+}
+#end
+
+#if OS == "win"
+struct QuicWsaBuf {
+    len: u32 (0)
+    pad: u32 (0)
+    buf: ?ptr (null)
+}
+#end
+
+// Atomic UDP listener handle created on the server startup thread and handed to an H3Worker thread.
+class QuicListener {
+    context: atomic QuicServerContext
+    fd: Fd
+    ipv6: bool (false)
+    closed: bool (false)
+
+    static fn new(context: atomic QuicServerContext, host: String, port: u16, timeout_ms: uint (5000), reuse_port: bool (false)) atomic SELF !NetError {
+        @unsafe
+        let addrinfo = resolve_host(host, port, timeout_ms, true) !>
+        let ipv6 = addrinfo.is_ipv6()
+        let fd = create_socket(true, false, ipv6) !>
+        quic_set_fd_nonblocking(fd) ! {
+            close_fd_cleanup(fd, __FILE__, __LINE__)
+            throw E
+        }
+        bind_fd(fd, addrinfo, true, false, reuse_port) ! {
+            close_fd_cleanup(fd, __FILE__, __LINE__)
+            throw E
+        }
+        // Best-effort larger UDP buffers reduce datagram drops under bursty HTTP/3 load
+        let buf_sz: i32 = 8 * 1024 * 1024
+        ext.setsockopt(fd, ext.SOL_SOCKET, ext.SO_RCVBUF, @ref(buf_sz), size_of(i32))
+        ext.setsockopt(fd, ext.SOL_SOCKET, ext.SO_SNDBUF, @ref(buf_sz), size_of(i32))
+        #if OS == "linux"
+        let one: i32 = 1
+        ext.setsockopt(fd, QUIC_SOL_UDP, QUIC_UDP_GRO, @ref(one), size_of(i32))
+        #end
+        return SELF {
+            context: context,
+            fd: fd,
+            ipv6: ipv6
+        }
+    }
+
+    fn close() {
+        if this.closed : return
+        this.closed = true
+        close_fd(this.fd) ! core.cleanup_warning("Failed to close QUIC listener", __FILE__, __LINE__)
+    }
+
+    fn gc_free() {
+        if this.closed : return
+        this.closed = true
+        close_fd_cleanup(this.fd, __FILE__, __LINE__)
+    }
+}
+
+// Per-worker thread-local QUIC endpoint managing connections, batch UDP I/O, and GSO.
+class QuicEndpoint {
+    listener: atomic QuicListener
+    fd: Fd
+    max_connections: uint (0)
+    scid_seq: u64 (1)
+    scid_salt: u64 (0)
+    conns: Array[QuicConn] (.new(32))
+    conns_by_scid: HashMap[u64, QuicConn] (.new(64))
+    conns_by_odcid: HashMap[String, QuicConn] (.new(32))
+    dirty_conns: Array[QuicConn] (.new(32))
+    flush_scratch: Array[QuicConn] (.new(32))
+    new_conns: Array[QuicConn] (.new(16))
+    buf_pool: Array[ByteBuffer] (.new(64))
+    stream_pool: Array[QuicStream] (.new(128))
+
+    // Pre-allocated I/O buffers (freed on close/gc_free)
+    rx_mem: ByteBuffer (.new(QUIC_RX_BATCH * QUIC_RX_SLOT_SIZE))
+    tx_mem: ByteBuffer (.new(QUIC_TX_BATCH * QUIC_TX_SLOT_SIZE))
+    gso_mem: ByteBuffer (.new(QUIC_GSO_BUF_SIZE))
+    gso_tx_buf: ptr
+    tx_addrs: ByteBuffer (.new(QUIC_TX_BATCH * 28))
+    tx_addr_lens: [u32 x 64] ({ 0... })
+    tx_lens: [uint x 64] ({ 0... })
+    tx_count: uint (0)
+    gso_enabled: bool (true)
+
+    #if OS == "linux"
+    rx_addrs: ByteBuffer (.new(QUIC_RX_BATCH * 28))
+    rx_cmsgs: ByteBuffer (.new(QUIC_RX_BATCH * 64))
+    rx_iovs: [QuicIovec x 32] ({ QuicIovec {} ... })
+    rx_msgs: [QuicMmsghdr x 32] ({ QuicMmsghdr {} ... })
+    tx_iovs: [QuicIovec x 64] ({ QuicIovec {} ... })
+    tx_msgs: [QuicMmsghdr x 64] ({ QuicMmsghdr {} ... })
+    #end
+
+    static fn new(listener: atomic QuicListener, max_connections: uint (0)) SELF {
+        @unsafe
+        let salt: u64 = 0
+        crypto.RAND_bytes(@ref(salt).@cast(ptr), 8)
+        let gso = ByteBuffer.new(QUIC_GSO_BUF_SIZE)
+        let ep = SELF {
+            listener: listener,
+            fd: listener.fd,
+            max_connections: max_connections,
+            scid_salt: salt,
+            gso_mem: gso,
+            gso_tx_buf: gso.data
+        }
+        return ep
+    }
+
+    fn next_scid() u64 $inline {
+        // Fast bijective mix (splitmix64 step) so SCIDs are unpredictable and unique per worker
+        let x = this.scid_seq++ ^ this.scid_salt
+        let z = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9
+        z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+        z = z ^ (z >> 31)
+        if z == 0 : z = 1
+        return z
+    }
+
+    fn take_buf(min_cap: uint) ByteBuffer {
+        let buf = this.buf_pool.pop_last() !? ByteBuffer.new(min_cap)
+        buf.clear()
+        return buf
+    }
+
+    fn give_buf(buf: ByteBuffer) {
+        buf.clear()
+        if buf.size > 65_536 : buf.shrink_capacity(4096)
+        if this.buf_pool.length < 256 : this.buf_pool.append(buf)
+    }
+
+    fn take_stream(id: u64, conn: QuicConn, recv_max: u64, send_max: u64) QuicStream {
+        let st = this.stream_pool.pop_last() !? null
+        if isset(st) {
+            st.id = id
+            st.conn = conn
+            st.recv_buf.clear()
+            st.recv_off = 0
+            st.recv_consumed = 0
+            st.recv_fin = false
+            st.recv_fin_off = 0
+            st.recv_has_fin_off = false
+            st.recv_max_data = recv_max
+            st.recv_reset = false
+            st.recv_ooo = null
+            st.send_hdr.clear()
+            st.send_body = ""
+            st.send_tail = null
+            st.send_base = 0
+            st.send_off = 0
+            st.send_acked_end = 0
+            st.send_acked_ranges = null
+            st.send_fin = false
+            st.send_fin_sent = false
+            st.send_fin_acked = false
+            st.send_max_data = send_max
+            st.send_reset = false
+            st.send_reset_code = 0
+            st.send_reset_sent = false
+            st.send_retrans = null
+            st.need_max_stream_data = false
+            st.in_send_queue = false
+            st.app_accepted = false
+            st.app_done = false
+            st.has_partial_app = false
+            st.closed = false
+            return st
+        }
+        return QuicStream {
+            id: id,
+            conn: conn,
+            recv_buf: this.take_buf(256),
+            send_hdr: this.take_buf(256),
+            recv_max_data: recv_max,
+            send_max_data: send_max
+        }
+    }
+
+    fn give_stream(st: QuicStream) {
+        st.recv_buf.clear()
+        if st.recv_buf.size > 65_536 : st.recv_buf.shrink_capacity(4096)
+        st.send_hdr.clear()
+        if st.send_hdr.size > 65_536 : st.send_hdr.shrink_capacity(4096)
+        if this.stream_pool.length < 256 : this.stream_pool.append(st)
+    }
+
+    fn remove_odcid(conn: QuicConn) {
+        if conn.odcid_len == 0 : return
+        @unsafe
+        let key = String.copy_from_ptr(@ref(conn.odcid).@cast(ptr), conn.odcid_len)
+        this.conns_by_odcid.remove(key)
+    }
+
+    fn drop_conn(conn: QuicConn) {
+        this.conns_by_scid.remove(conn.scid_u64)
+        if conn.odcid_mapped {
+            conn.odcid_mapped = false
+            this.remove_odcid(conn)
+        }
+        conn.free_resources()
+    }
+
+    // Receives up to a batch of UDP datagrams and dispatches them to connections.
+    // Returns true if at least one datagram was processed.
+    fn recv_batch(now_us: u64, allow_new: bool) bool {
+        @unsafe
+        #if OS == "linux"
+        let rx_base = this.rx_mem.data
+        let addr_base = this.rx_addrs.data
+        let cmsg_base = this.rx_cmsgs.data
+        let i: uint = 0
+        while i < QUIC_RX_BATCH {
+            this.rx_iovs[i].iov_base = rx_base.@offset(i * QUIC_RX_SLOT_SIZE)
+            this.rx_iovs[i].iov_len = QUIC_RX_SLOT_SIZE
+            let hdr = @ref(this.rx_msgs[i].msg_hdr)
+            hdr.msg_name = addr_base.@offset(i * 28)
+            hdr.msg_namelen = 28
+            hdr.msg_iov = @ref(this.rx_iovs[i]).@cast(ptr)
+            hdr.msg_iovlen = 1
+            hdr.msg_control = cmsg_base.@offset(i * 64)
+            hdr.msg_controllen = 64
+            hdr.msg_flags = 0
+            this.rx_msgs[i].msg_len = 0
+            i++
+        }
+        let n = ext.recvmmsg(this.fd, @ref(this.rx_msgs[0]).@cast(ptr), QUIC_RX_BATCH.to(u32), ext.MSG_DONTWAIT, null)
+        if n <= 0 : return false
+        let cnt = n.to(uint)
+        i = 0
+        while i < cnt {
+            let mlen = this.rx_msgs[i].msg_len.to(uint)
+            let addr = addr_base.@offset(i * 28)
+            let alen = this.rx_msgs[i].msg_hdr.msg_namelen
+            let pkt = rx_base.@offset(i * QUIC_RX_SLOT_SIZE)
+            let gso_sz = quic_parse_gro_cmsg(cmsg_base.@offset(i * 64), this.rx_msgs[i].msg_hdr.msg_controllen)
+            if gso_sz > 0 && gso_sz < mlen {
+                let off: uint = 0
+                while off < mlen {
+                    let take = mlen - off
+                    if take > gso_sz : take = gso_sz
+                    this.dispatch_udp(pkt.@offset(off), take, addr, alen, now_us, allow_new)
+                    off += take
+                }
+            } else if mlen > 0 {
+                this.dispatch_udp(pkt, mlen, addr, alen, now_us, allow_new)
+            }
+            i++
+        }
+        return true
+        #elif OS == "win"
+        let got_any = false
+        let addr_buf: [u8 x 28] = @undefined
+        let pkt = this.rx_mem.data
+        let k: uint = 0
+        while k < QUIC_RX_BATCH {
+            let wbuf = QuicWsaBuf { len: QUIC_RX_SLOT_SIZE.to(u32), buf: pkt }
+            let nread: u32 = 0
+            let flags: u32 = 0
+            let alen: i32 = 28
+            let rc = ext.WSARecvFrom(this.fd, @ref(wbuf).@cast(ptr), 1, @ref(nread), @ref(flags), @ref(addr_buf).@cast(ptr), @ref(alen), null, null)
+            if rc != 0 || nread == 0 : break
+            got_any = true
+            this.dispatch_udp(pkt, nread.to(uint), @ref(addr_buf).@cast(ptr), alen.to(u32), now_us, allow_new)
+            k++
+        }
+        return got_any
+        #else
+        let got_any = false
+        let addr_buf: [u8 x 28] = @undefined
+        let pkt = this.rx_mem.data
+        let k: uint = 0
+        while k < QUIC_RX_BATCH {
+            let alen: u32 = 28
+            let n = ext.recvfrom(this.fd, pkt, QUIC_RX_SLOT_SIZE, 0, @ref(addr_buf).@cast(*ext.libc_sockaddr), @ref(alen))
+            if n <= 0 : break
+            got_any = true
+            this.dispatch_udp(pkt, n.to(uint), @ref(addr_buf).@cast(ptr), alen, now_us, allow_new)
+            k++
+        }
+        return got_any
+        #end
+    }
+
+    fn dispatch_udp(pkt: ptr, len: uint, addr: ptr, alen: u32, now_us: u64, allow_new: bool) {
+        if len < 21 : return
+        @unsafe
+        let b0 = @ptrv(pkt, u8, 0)
+        // Fast path: 1-RTT Short Header (bit 7 == 0, fixed bit 6 == 1)
+        if (b0 & 0x80) == 0 {
+            if (b0 & 0x40) == 0 : return
+            let scid = quic_get_u64_be(pkt, 1)
+            let conn = this.conns_by_scid.get(scid) !? null
+            if isset(conn) : conn.on_datagram(pkt, len, addr, alen, now_us)
+            return
+        }
+        // Long Header: extract version, DCID, SCID
+        if (b0 & 0x40) == 0 : return
+        let ver = quic_get_u32_be(pkt, 1)
+        if ver != QUIC_VERSION_1 : return
+        let dcid_len = @ptrv(pkt, u8, 5).to(uint)
+        if 6 + dcid_len + 1 > len : return
+        let dcid_ptr = pkt.@offset(6)
+        let scid_len = @ptrv(pkt, u8, 6 + dcid_len).to(uint)
+        if 7 + dcid_len + scid_len > len : return
+        let scid_ptr = pkt.@offset(7 + dcid_len)
+
+        // Lookup by our 8-byte SCID first
+        if dcid_len == QUIC_SCID_LEN {
+            let cid_u64 = quic_get_u64_be(dcid_ptr, 0)
+            let conn = this.conns_by_scid.get(cid_u64) !? null
+            if isset(conn) {
+                conn.on_datagram(pkt, len, addr, alen, now_us)
+                return
+            }
+        }
+        // Lookup by client's original DCID (retransmitted Initial packets)
+        if dcid_len > 0 && dcid_len <= 20 {
+            let key = String.copy_from_ptr(dcid_ptr, dcid_len)
+            let conn = this.conns_by_odcid.get(key) !? null
+            if isset(conn) {
+                conn.on_datagram(pkt, len, addr, alen, now_us)
+                return
+            }
+        }
+        // Only Initial packets >= 1200 bytes may open a new connection (RFC 9000 §14.1)
+        let ptype = (b0 >> 4) & 0x03
+        if ptype != QUIC_PKT_INITIAL || len < QUIC_MAX_DATAGRAM_INIT || !allow_new : return
+        if dcid_len == 0 || dcid_len > 20 || scid_len > 20 : return
+        if this.max_connections > 0 && this.conns.length >= this.max_connections : return
+
+        let conn = QuicConn.create(this, dcid_ptr, dcid_len, scid_ptr, scid_len, addr, alen, now_us) ?! return
+        this.conns.append(conn)
+        this.conns_by_scid.set(conn.scid_u64, conn)
+        let odcid_key = String.copy_from_ptr(dcid_ptr, dcid_len)
+        this.conns_by_odcid.set(odcid_key, conn)
+        conn.odcid_mapped = true
+        this.new_conns.append(conn)
+        conn.on_datagram(pkt, len, addr, alen, now_us)
+    }
+
+    fn queue_tx_datagram(src: ptr, len: uint, addr: ptr, alen: u32) {
+        if len == 0 || len > QUIC_TX_SLOT_SIZE : return
+        if this.tx_count >= QUIC_TX_BATCH : this.flush_tx_batch()
+        let idx = this.tx_count
+        @unsafe
+        mem.copy_bytes(src, this.tx_mem.data.@offset(idx * QUIC_TX_SLOT_SIZE), len)
+        mem.copy_bytes(addr, this.tx_addrs.data.@offset(idx * 28), alen.to(uint))
+        this.tx_addr_lens[idx] = alen
+        this.tx_lens[idx] = len
+        this.tx_count = idx + 1
+    }
+
+    fn flush_tx_batch() {
+        let cnt = this.tx_count
+        if cnt == 0 : return
+        this.tx_count = 0
+        @unsafe
+        #if OS == "linux"
+        if cnt == 1 {
+            ext.sendto(this.fd, this.tx_mem.data, this.tx_lens[0], ext.MSG_DONTWAIT, this.tx_addrs.data.@cast(*ext.libc_sockaddr), this.tx_addr_lens[0])
+            return
+        }
+        let tx_base = this.tx_mem.data
+        let addr_base = this.tx_addrs.data
+        let i: uint = 0
+        while i < cnt {
+            this.tx_iovs[i].iov_base = tx_base.@offset(i * QUIC_TX_SLOT_SIZE)
+            this.tx_iovs[i].iov_len = this.tx_lens[i]
+            let hdr = @ref(this.tx_msgs[i].msg_hdr)
+            hdr.msg_name = addr_base.@offset(i * 28)
+            hdr.msg_namelen = this.tx_addr_lens[i]
+            hdr.msg_iov = @ref(this.tx_iovs[i]).@cast(ptr)
+            hdr.msg_iovlen = 1
+            hdr.msg_control = null
+            hdr.msg_controllen = 0
+            hdr.msg_flags = 0
+            this.tx_msgs[i].msg_len = 0
+            i++
+        }
+        ext.sendmmsg(this.fd, @ref(this.tx_msgs[0]).@cast(ptr), cnt.to(u32), ext.MSG_DONTWAIT)
+        #elif OS == "win"
+        let tx_base = this.tx_mem.data
+        let addr_base = this.tx_addrs.data
+        let i: uint = 0
+        while i < cnt {
+            let wbuf = QuicWsaBuf { len: this.tx_lens[i].to(u32), buf: tx_base.@offset(i * QUIC_TX_SLOT_SIZE) }
+            let nsent: u32 = 0
+            ext.WSASendTo(this.fd, @ref(wbuf).@cast(ptr), 1, @ref(nsent), 0, addr_base.@offset(i * 28), this.tx_addr_lens[i].to(i32), null, null)
+            i++
+        }
+        #else
+        let tx_base = this.tx_mem.data
+        let addr_base = this.tx_addrs.data
+        let i: uint = 0
+        while i < cnt {
+            ext.sendto(this.fd, tx_base.@offset(i * QUIC_TX_SLOT_SIZE), this.tx_lens[i], 0, addr_base.@offset(i * 28).@cast(*ext.libc_sockaddr), this.tx_addr_lens[i])
+            i++
+        }
+        #end
+    }
+
+    // Sends a contiguous burst of `seg_size`-byte packets via Linux UDP GSO, with automatic fallback.
+    fn send_gso(buf: ptr, total_len: uint, seg_size: u16, addr: ptr, alen: u32) {
+        @unsafe
+        #if OS == "linux"
+        if this.gso_enabled {
+            let iov = QuicIovec { iov_base: buf, iov_len: total_len }
+            // CMSG_SPACE(sizeof(u16)) = 24 bytes, 8-byte aligned
+            let cmsg_mem: [u64 x 3] = { 0, 0, 0 }
+            let cptr = @ref(cmsg_mem).@cast(ptr)
+            @ptrv(cptr, uint, 0) = 18 // CMSG_LEN(sizeof(u16)) = 16 + 2
+            @ptrv(cptr, i32, 2) = QUIC_SOL_UDP // offset 8
+            @ptrv(cptr, i32, 3) = QUIC_UDP_SEGMENT // offset 12
+            @ptrv(cptr, u16, 8) = seg_size // offset 16
+            let msg = QuicMsghdr {
+                msg_name: addr,
+                msg_namelen: alen,
+                msg_iov: @ref(iov).@cast(ptr),
+                msg_iovlen: 1,
+                msg_control: cptr,
+                msg_controllen: 24,
+                msg_flags: 0
+            }
+            let r = ext.sendmsg(this.fd, @ref(msg).@cast(ptr), ext.MSG_DONTWAIT)
+            if r >= 0 : return
+            let err = ext.get_errno()
+            if err == ext.EAGAIN || err == ext.EWOULDBLOCK : return
+            // GSO not supported on this interface/kernel: disable and fall back to sendmmsg
+            this.gso_enabled = false
+        }
+        #end
+        // Fallback: split into individual datagrams via sendmmsg batch
+        let step = seg_size.to(uint)
+        let off: uint = 0
+        while off < total_len {
+            let take = total_len - off
+            if take > step : take = step
+            this.queue_tx_datagram(buf.@offset(off), take, addr, alen)
+            off += take
+        }
+    }
+
+    // Flushes all dirty connections and emits any queued sendmmsg datagrams.
+    // Returns true if any connection still has pending dirty work.
+    fn flush_all(now_us: u64) bool {
+        let count = this.dirty_conns.length
+        if count == 0 {
+            this.flush_tx_batch()
+            return false
+        }
+        // Snapshot current dirty list into reusable scratch so re-marked connections wait for next iteration
+        let batch = this.flush_scratch
+        batch.clear()
+        let i: uint = 0
+        while i < count {
+            let c = this.dirty_conns[i]
+            c.in_dirty_list = false
+            batch.append(c)
+            i++
+        }
+        this.dirty_conns.clear()
+        i = 0
+        while i < count {
+            batch[i].flush(now_us)
+            i++
+        }
+        batch.clear()
+        this.flush_tx_batch()
+        return this.dirty_conns.length > 0
+    }
+
+    // Drives timers across connections and returns the next wakeup timeout in milliseconds.
+    fn process_timers(now_us: u64, max_ms: uint) uint {
+        let best_us: u64 = 0
+        let i: uint = 0
+        while i < this.conns.length {
+            let c = this.conns[i]
+            if !c.closed {
+                c.on_timeout(now_us)
+                let t = c.next_timer_us()
+                if t > 0 && (best_us == 0 || t < best_us) : best_us = t
+            }
+            i++
+        }
+        if this.dirty_conns.length > 0 : return 0
+        if best_us == 0 : return max_ms
+        if best_us <= now_us : return 0
+        let diff_us = best_us - now_us
+        let ms = ((diff_us + 999) / 1000).to(uint)
+        return ms < max_ms ? ms : max_ms
+    }
+
+    fn close() {
+        each this.conns as c : c.free_resources()
+        this.conns.clear()
+        this.conns_by_scid.clear()
+        this.conns_by_odcid.clear()
+        this.dirty_conns.clear()
+        this.new_conns.clear()
+        this.listener.close()
+    }
+}
+
+#if OS == "linux"
+fn quic_parse_gro_cmsg(cmsg_buf: ptr, controllen: uint) uint $inline {
+    if controllen < 18 : return 0
+    let off: uint = 0
+    while off + 16 <= controllen {
+        let clen = @ptrv(cmsg_buf, uint, off / 8)
+        if clen < 16 || off + clen > controllen : break
+        let level = @ptrv(cmsg_buf, i32, (off + 8) / 4)
+        let ctype = @ptrv(cmsg_buf, i32, (off + 12) / 4)
+        if level == QUIC_SOL_UDP && ctype == QUIC_UDP_GRO && clen >= 18 {
+            return @ptrv(cmsg_buf, u16, (off + 16) / 2).to(uint)
+        }
+        let step = (clen + 7) & ~7.to(uint)
+        if step == 0 : break
+        off += step
+    }
+    return 0
+}
+#end

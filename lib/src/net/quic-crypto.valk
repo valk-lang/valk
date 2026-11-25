@@ -1,0 +1,307 @@
+// QUIC v1 packet protection & header protection (RFC 9001) using OpenSSL libcrypto.
+
+use crypto
+use mem
+
+value QUIC_CIPHER_AES_128_GCM (0)
+value QUIC_CIPHER_AES_256_GCM (1)
+value QUIC_CIPHER_CHACHA20 (2)
+
+// OpenSSL SSL_CIPHER_get_id() values for TLS 1.3 cipher suites
+value TLS13_CIPHER_ID_AES_128_GCM (0x03001301)
+value TLS13_CIPHER_ID_AES_256_GCM (0x03001302)
+value TLS13_CIPHER_ID_CHACHA20 (0x03001303)
+
+global quic_v1_initial_salt: [u8 x 20] ({
+    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17,
+    0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a
+})
+
+fn quic_cipher_kind_from_tls_id(id: u32) u8 {
+    if id == TLS13_CIPHER_ID_AES_256_GCM : return QUIC_CIPHER_AES_256_GCM
+    if id == TLS13_CIPHER_ID_CHACHA20 : return QUIC_CIPHER_CHACHA20
+    return QUIC_CIPHER_AES_128_GCM
+}
+
+fn quic_cipher_key_len(kind: u8) uint $inline {
+    return kind == QUIC_CIPHER_AES_128_GCM ? 16 : 32
+}
+
+fn quic_cipher_md(kind: u8) crypto.EVP_MD {
+    return kind == QUIC_CIPHER_AES_256_GCM ? crypto.EVP_sha384() : crypto.EVP_sha256()
+}
+
+// Single-block TLS 1.3 HKDF-Expand-Label (RFC 8446 §7.1 / RFC 9001 §5.1).
+// Valid for `out_len <= hash_len` (all QUIC key/iv/hp/ku derivations).
+fn quic_hkdf_expand_label(md: crypto.EVP_MD, secret: ptr, secret_len: uint, label: String, out: ptr, out_len: uint) bool {
+    @unsafe
+    let info: [u8 x 64] = @undefined
+    let llen = 6 + label.bytes
+    if llen + 5 > 64 : return false
+    info[0] = ((out_len >> 8) & 0xff).to(u8)
+    info[1] = (out_len & 0xff).to(u8)
+    info[2] = llen.to(u8)
+    info[3] = 't'
+    info[4] = 'l'
+    info[5] = 's'
+    info[6] = '1'
+    info[7] = '3'
+    info[8] = ' '
+    mem.copy_bytes(label.data, @ref(info).@cast(ptr).@offset(9), label.bytes)
+    let p = 9 + label.bytes
+    info[p] = 0 // empty context
+    info[p + 1] = 1 // HKDF counter = 1
+    let digest: [u8 x 64] = @undefined
+    let dlen: u32 = 0
+    let ok = crypto.HMAC(md, secret, secret_len.to(i32), @ref(info).@cast(ptr), p + 2, @ref(digest).@cast(ptr), @ref(dlen))
+    if !isset(ok) || dlen.to(uint) < out_len : return false
+    mem.copy_bytes(@ref(digest).@cast(ptr), out, out_len)
+    return true
+}
+
+class QuicCipher {
+    ready: bool (false)
+    is_tx: bool (false)
+    kind: u8 (QUIC_CIPHER_AES_128_GCM)
+    aead: ?crypto.EVP_CIPHER_CTX (null)
+    hp: ?crypto.EVP_CIPHER_CTX (null)
+    iv: [u8 x 12] ({ 0... })
+    secret: [u8 x 48] ({ 0... })
+    secret_len: uint (0)
+
+    fn free() {
+        @unsafe
+        let a = this.aead
+        if isset(a) {
+            crypto.EVP_CIPHER_CTX_free(a)
+            this.aead = null
+        }
+        let h = this.hp
+        if isset(h) {
+            crypto.EVP_CIPHER_CTX_free(h)
+            this.hp = null
+        }
+        this.ready = false
+    }
+
+    fn gc_free() {
+        this.free()
+    }
+
+    // Derives QUIC key, IV, and HP key from a traffic secret and pre-initializes EVP contexts.
+    fn init_from_secret(kind: u8, is_tx: bool, secret: ptr, secret_len: uint) bool {
+        @unsafe
+        if secret_len > 48 : return false
+        let md = quic_cipher_md(kind)
+        let klen = quic_cipher_key_len(kind)
+        let key: [u8 x 32] = @undefined
+        let hp_key: [u8 x 32] = @undefined
+        let iv: [u8 x 12] = @undefined
+        if !quic_hkdf_expand_label(md, secret, secret_len, "quic key", @ref(key).@cast(ptr), klen) : return false
+        if !quic_hkdf_expand_label(md, secret, secret_len, "quic iv", @ref(iv).@cast(ptr), 12) : return false
+        if !quic_hkdf_expand_label(md, secret, secret_len, "quic hp", @ref(hp_key).@cast(ptr), klen) : return false
+
+        let aead_ctx = this.aead ?? crypto.EVP_CIPHER_CTX_new() ?! return false
+        this.aead = aead_ctx
+        let hp_ctx = this.hp ?? crypto.EVP_CIPHER_CTX_new() ?! return false
+        this.hp = hp_ctx
+
+        let evp_aead = kind == QUIC_CIPHER_AES_256_GCM ? crypto.EVP_aes_256_gcm()
+            : (kind == QUIC_CIPHER_CHACHA20 ? crypto.EVP_chacha20_poly1305() : crypto.EVP_aes_128_gcm())
+        let evp_hp = kind == QUIC_CIPHER_AES_256_GCM ? crypto.EVP_aes_256_ecb()
+            : (kind == QUIC_CIPHER_CHACHA20 ? crypto.EVP_chacha20() : crypto.EVP_aes_128_ecb())
+
+        if is_tx {
+            if crypto.EVP_EncryptInit_ex(aead_ctx, evp_aead, null, null, null) != 1 : return false
+            if crypto.EVP_CIPHER_CTX_ctrl(aead_ctx, crypto.EVP_CTRL_AEAD_SET_IVLEN, 12, null) != 1 : return false
+            if crypto.EVP_EncryptInit_ex(aead_ctx, null, null, @ref(key).@cast(ptr), null) != 1 : return false
+        } else {
+            if crypto.EVP_DecryptInit_ex(aead_ctx, evp_aead, null, null, null) != 1 : return false
+            if crypto.EVP_CIPHER_CTX_ctrl(aead_ctx, crypto.EVP_CTRL_AEAD_SET_IVLEN, 12, null) != 1 : return false
+            if crypto.EVP_DecryptInit_ex(aead_ctx, null, null, @ref(key).@cast(ptr), null) != 1 : return false
+        }
+
+        if crypto.EVP_EncryptInit_ex(hp_ctx, evp_hp, null, @ref(hp_key).@cast(ptr), null) != 1 : return false
+        if kind != QUIC_CIPHER_CHACHA20 {
+            crypto.EVP_CIPHER_CTX_set_padding(hp_ctx, 0)
+        }
+
+        mem.copy_bytes(@ref(iv).@cast(ptr), @ref(this.iv).@cast(ptr), 12)
+        mem.copy_bytes(secret, @ref(this.secret).@cast(ptr), secret_len)
+        this.secret_len = secret_len
+        this.kind = kind
+        this.is_tx = is_tx
+        this.ready = true
+        return true
+    }
+
+    // Derives next 1-RTT key update cipher (RFC 9001 §6.1), reusing existing HP key.
+    fn init_key_update(from: QuicCipher) bool {
+        @unsafe
+        if !from.ready : return false
+        let md = quic_cipher_md(from.kind)
+        let next_secret: [u8 x 48] = @undefined
+        if !quic_hkdf_expand_label(md, @ref(from.secret).@cast(ptr), from.secret_len, "quic ku", @ref(next_secret).@cast(ptr), from.secret_len) : return false
+        let klen = quic_cipher_key_len(from.kind)
+        let key: [u8 x 32] = @undefined
+        let iv: [u8 x 12] = @undefined
+        if !quic_hkdf_expand_label(md, @ref(next_secret).@cast(ptr), from.secret_len, "quic key", @ref(key).@cast(ptr), klen) : return false
+        if !quic_hkdf_expand_label(md, @ref(next_secret).@cast(ptr), from.secret_len, "quic iv", @ref(iv).@cast(ptr), 12) : return false
+
+        let aead_ctx = this.aead ?? crypto.EVP_CIPHER_CTX_new() ?! return false
+        this.aead = aead_ctx
+        let evp_aead = from.kind == QUIC_CIPHER_AES_256_GCM ? crypto.EVP_aes_256_gcm()
+            : (from.kind == QUIC_CIPHER_CHACHA20 ? crypto.EVP_chacha20_poly1305() : crypto.EVP_aes_128_gcm())
+
+        if from.is_tx {
+            if crypto.EVP_EncryptInit_ex(aead_ctx, evp_aead, null, null, null) != 1 : return false
+            if crypto.EVP_CIPHER_CTX_ctrl(aead_ctx, crypto.EVP_CTRL_AEAD_SET_IVLEN, 12, null) != 1 : return false
+            if crypto.EVP_EncryptInit_ex(aead_ctx, null, null, @ref(key).@cast(ptr), null) != 1 : return false
+        } else {
+            if crypto.EVP_DecryptInit_ex(aead_ctx, evp_aead, null, null, null) != 1 : return false
+            if crypto.EVP_CIPHER_CTX_ctrl(aead_ctx, crypto.EVP_CTRL_AEAD_SET_IVLEN, 12, null) != 1 : return false
+            if crypto.EVP_DecryptInit_ex(aead_ctx, null, null, @ref(key).@cast(ptr), null) != 1 : return false
+        }
+
+        mem.copy_bytes(@ref(iv).@cast(ptr), @ref(this.iv).@cast(ptr), 12)
+        mem.copy_bytes(@ref(next_secret).@cast(ptr), @ref(this.secret).@cast(ptr), from.secret_len)
+        this.secret_len = from.secret_len
+        this.kind = from.kind
+        this.is_tx = from.is_tx
+        this.ready = true
+        return true
+    }
+
+    fn make_nonce(pn: u64, nonce: *[u8 x 12]) $inline {
+        @unsafe
+        let iv_ptr = @ref(this.iv).@cast(ptr)
+        let n_ptr = nonce.@cast(ptr)
+        mem.copy_bytes(iv_ptr, n_ptr, 12)
+        @ptrv(n_ptr, u8, 4) = @ptrv(n_ptr, u8, 4) ^ ((pn >> 56) & 0xff).to(u8)
+        @ptrv(n_ptr, u8, 5) = @ptrv(n_ptr, u8, 5) ^ ((pn >> 48) & 0xff).to(u8)
+        @ptrv(n_ptr, u8, 6) = @ptrv(n_ptr, u8, 6) ^ ((pn >> 40) & 0xff).to(u8)
+        @ptrv(n_ptr, u8, 7) = @ptrv(n_ptr, u8, 7) ^ ((pn >> 32) & 0xff).to(u8)
+        @ptrv(n_ptr, u8, 8) = @ptrv(n_ptr, u8, 8) ^ ((pn >> 24) & 0xff).to(u8)
+        @ptrv(n_ptr, u8, 9) = @ptrv(n_ptr, u8, 9) ^ ((pn >> 16) & 0xff).to(u8)
+        @ptrv(n_ptr, u8, 10) = @ptrv(n_ptr, u8, 10) ^ ((pn >> 8) & 0xff).to(u8)
+        @ptrv(n_ptr, u8, 11) = @ptrv(n_ptr, u8, 11) ^ (pn & 0xff).to(u8)
+    }
+
+    fn hp_mask(sample: ptr, mask: *[u8 x 16]) bool $inline {
+        @unsafe
+        let hp_ctx = this.hp ?! return false
+        let outl: i32 = 0
+        if this.kind == QUIC_CIPHER_CHACHA20 {
+            let zeros: [u8 x 5] = { 0, 0, 0, 0, 0 }
+            if crypto.EVP_EncryptInit_ex(hp_ctx, null, null, null, sample) != 1 : return false
+            if crypto.EVP_EncryptUpdate(hp_ctx, mask.@cast(ptr), @ref(outl), @ref(zeros).@cast(ptr), 5) != 1 : return false
+            return true
+        }
+        return crypto.EVP_EncryptUpdate(hp_ctx, mask.@cast(ptr), @ref(outl), sample, 16) == 1
+    }
+
+    // Encrypts payload in-place, writes 16-byte AEAD tag, and applies header protection.
+    // `pkt` has header+PN in `[0 .. pn_offset + pn_len]` and plaintext in `[pn_offset + pn_len .. +pt_len]`.
+    // Requires `pn_len + pt_len + 16 >= 20` so the 16-byte HP sample at `pn_offset + 4` fits.
+    fn encrypt_packet(pkt: ptr, pn_offset: uint, pn_len: uint, pt_len: uint, pn: u64) bool {
+        @unsafe
+        let ctx = this.aead ?! return false
+        let aad_len = pn_offset + pn_len
+        let nonce: [u8 x 12] = @undefined
+        this.make_nonce(pn, @ref(nonce))
+        if crypto.EVP_EncryptInit_ex(ctx, null, null, null, @ref(nonce).@cast(ptr)) != 1 : return false
+        let outl: i32 = 0
+        if crypto.EVP_EncryptUpdate(ctx, null, @ref(outl), pkt, aad_len.to(i32)) != 1 : return false
+        let payload_ptr = pkt.@offset(aad_len)
+        let ct_len: i32 = 0
+        if pt_len > 0 {
+            if crypto.EVP_EncryptUpdate(ctx, payload_ptr, @ref(ct_len), payload_ptr, pt_len.to(i32)) != 1 : return false
+        }
+        let fin_len: i32 = 0
+        if crypto.EVP_EncryptFinal_ex(ctx, payload_ptr.@offset(ct_len.to(uint)), @ref(fin_len)) != 1 : return false
+        let tag_ptr = payload_ptr.@offset((ct_len + fin_len).to(uint))
+        if crypto.EVP_CIPHER_CTX_ctrl(ctx, crypto.EVP_CTRL_AEAD_GET_TAG, 16, tag_ptr) != 1 : return false
+
+        // Header protection
+        let mask: [u8 x 16] = @undefined
+        if !this.hp_mask(pkt.@offset(pn_offset + 4), @ref(mask)) : return false
+        let b0 = @ptrv(pkt, u8, 0)
+        if (b0 & 0x80) != 0 {
+            @ptrv(pkt, u8, 0) = b0 ^ (mask[0] & 0x0f)
+        } else {
+            @ptrv(pkt, u8, 0) = b0 ^ (mask[0] & 0x1f)
+        }
+        let i: uint = 0
+        while i < pn_len {
+            @ptrv(pkt, u8, pn_offset + i) = @ptrv(pkt, u8, pn_offset + i) ^ mask[1 + i]
+            i++
+        }
+        return true
+    }
+
+    // Removes header protection in-place. Returns `(ok, pn_len, key_phase, truncated_pn)`.
+    fn unprotect_header(pkt: ptr, pkt_len: uint, pn_offset: uint) (bool, uint, bool, u64) {
+        @unsafe
+        if pn_offset + 20 > pkt_len : return (false, 0, false, 0)
+        let mask: [u8 x 16] = @undefined
+        if !this.hp_mask(pkt.@offset(pn_offset + 4), @ref(mask)) : return (false, 0, false, 0)
+        let b0 = @ptrv(pkt, u8, 0)
+        let is_long = (b0 & 0x80) != 0
+        let first = is_long ? (b0 ^ (mask[0] & 0x0f)) : (b0 ^ (mask[0] & 0x1f))
+        @ptrv(pkt, u8, 0) = first
+        let pn_len: uint = (first & 0x03).to(uint) + 1
+        if pn_offset + pn_len + QUIC_AEAD_TAG_LEN > pkt_len : return (false, 0, false, 0)
+        let trunc: u64 = 0
+        let i: uint = 0
+        while i < pn_len {
+            let b = @ptrv(pkt, u8, pn_offset + i) ^ mask[1 + i]
+            @ptrv(pkt, u8, pn_offset + i) = b
+            trunc = (trunc << 8) | b.to(u64)
+            i++
+        }
+        let key_phase = !is_long && ((first & 0x04) != 0)
+        return (true, pn_len, key_phase, trunc)
+    }
+
+    // Decrypts AEAD payload in-place after header protection has been removed.
+    // Returns `(ok, plaintext_len)`.
+    fn decrypt_payload(pkt: ptr, pkt_len: uint, pn_offset: uint, pn_len: uint, pn: u64) (bool, uint) {
+        @unsafe
+        let ctx = this.aead ?! return (false, 0)
+        let aad_len = pn_offset + pn_len
+        if pkt_len < aad_len + QUIC_AEAD_TAG_LEN : return (false, 0)
+        let ct_len = pkt_len - aad_len - QUIC_AEAD_TAG_LEN
+        let nonce: [u8 x 12] = @undefined
+        this.make_nonce(pn, @ref(nonce))
+        if crypto.EVP_DecryptInit_ex(ctx, null, null, null, @ref(nonce).@cast(ptr)) != 1 : return (false, 0)
+        let outl: i32 = 0
+        if crypto.EVP_DecryptUpdate(ctx, null, @ref(outl), pkt, aad_len.to(i32)) != 1 : return (false, 0)
+        let payload_ptr = pkt.@offset(aad_len)
+        let pt_len: i32 = 0
+        if ct_len > 0 {
+            if crypto.EVP_DecryptUpdate(ctx, payload_ptr, @ref(pt_len), payload_ptr, ct_len.to(i32)) != 1 : return (false, 0)
+        }
+        let tag_ptr = payload_ptr.@offset(ct_len)
+        if crypto.EVP_CIPHER_CTX_ctrl(ctx, crypto.EVP_CTRL_AEAD_SET_TAG, 16, tag_ptr) != 1 : return (false, 0)
+        let fin_len: i32 = 0
+        if crypto.EVP_DecryptFinal_ex(ctx, payload_ptr.@offset(pt_len.to(uint)), @ref(fin_len)) != 1 : return (false, 0)
+        return (true, (pt_len + fin_len).to(uint))
+    }
+}
+
+// Derives server-side Initial RX (client in) and TX (server in) ciphers from the client's DCID.
+fn quic_derive_initial_ciphers(dcid: ptr, dcid_len: uint, rx: QuicCipher, tx: QuicCipher) bool {
+    @unsafe
+    let md = crypto.EVP_sha256()
+    let initial_secret: [u8 x 32] = @undefined
+    let ilen: u32 = 0
+    let ok = crypto.HMAC(md, @ref(quic_v1_initial_salt).@cast(ptr), 20, dcid, dcid_len, @ref(initial_secret).@cast(ptr), @ref(ilen))
+    if !isset(ok) || ilen != 32 : return false
+    let client_in: [u8 x 32] = @undefined
+    let server_in: [u8 x 32] = @undefined
+    if !quic_hkdf_expand_label(md, @ref(initial_secret).@cast(ptr), 32, "client in", @ref(client_in).@cast(ptr), 32) : return false
+    if !quic_hkdf_expand_label(md, @ref(initial_secret).@cast(ptr), 32, "server in", @ref(server_in).@cast(ptr), 32) : return false
+    if !rx.init_from_secret(QUIC_CIPHER_AES_128_GCM, false, @ref(client_in).@cast(ptr), 32) : return false
+    if !tx.init_from_secret(QUIC_CIPHER_AES_128_GCM, true, @ref(server_in).@cast(ptr), 32) : return false
+    return true
+}

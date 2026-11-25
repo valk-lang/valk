@@ -1,5 +1,4 @@
 use net
-use ext
 use coro
 use sync
 use time
@@ -7,29 +6,14 @@ use fs
 use io
 use compress
 
-value H3_READ_CHUNK (16_384)
 value H3_STREAM_SEND_HIGH_WATER (65_536)
 value H3_SERVE_POOL_MAX (16)
 
 global h3_resp_headers: Array[HpackField] (.new(8))
 global h3_qpack_buf: ByteBuffer (.new(256))
-global h3_buf_pool: Array[ByteBuffer] (.{})
 
-fn h3_take_buf(min_cap: uint) ByteBuffer {
-    let buf = h3_buf_pool.pop_last() !? ByteBuffer.new(min_cap)
-    buf.clear()
-    return buf
-}
-
-fn h3_give_buf(buf: ByteBuffer) {
-    buf.clear()
-    if buf.size > 65_536 : buf.shrink_capacity(4096)
-    if h3_buf_pool.length < 128 : h3_buf_pool.append(buf)
-}
-
-class H3UniStream {
-    ssl: net.OSSL
-    buf: ByteBuffer (.new(64))
+class H3ServerUniStream {
+    qst: net.QuicStream
     stream_type: u64 (0)
     type_known: bool (false)
     got_settings: bool (false)
@@ -37,25 +21,18 @@ class H3UniStream {
     frame_type: u64 (0)
     frame_len: u64 (0)
     closed: bool (false)
-
-    fn free_ssl() {
-        @unsafe
-        if this.closed : return
-        this.closed = true
-        net.SSL_free(this.ssl)
-    }
 }
 
 class H3ServerStream {
     conn: H3ServerConn
-    ssl: net.OSSL
-    recv_buf: ByteBuffer (h3_take_buf(256))
-    recv_pos: uint (0)
+    qst: net.QuicStream
     frame_in_progress: bool (false)
     frame_type: u64 (0)
     frame_remaining: u64 (0)
     headers_buf: ?ByteBuffer (null)
     req_fields: ?Array[HpackField] (null)
+    req_method: String ("")
+    req_target: String ("")
     req_body: ?ByteBuffer (null)
     req_body_len: uint (0)
     expected_length: ?uint (null)
@@ -64,54 +41,46 @@ class H3ServerStream {
     expect_continue: bool (false)
     read_done: bool (false)
     dispatched: bool (false)
-    send_buf: ByteBuffer (h3_take_buf(512))
-    send_pos: uint (0)
-    send_body: String ("")
-    send_body_pos: uint (0)
-    send_fin: bool (false)
-    send_concluded: bool (false)
-    write_waker: sync.Waker (.{})
+    write_waker: ?sync.Waker (null)
     cancelled: bool (false)
     closed: bool (false)
-
-    fn pending_send() uint $inline {
-        return (this.send_buf.length - this.send_pos) + (this.send_body.bytes - this.send_body_pos)
-    }
 
     fn reset(code: u64) {
         if this.closed : return
         this.cancelled = true
-        @unsafe
-        let args = net.SslStreamResetArgs { quic_error_code: code }
-        net.SSL_stream_reset(this.ssl, @ref(args), size_of(net.SslStreamResetArgs))
-        this.write_waker.wake()
+        this.qst.reset_send(code)
+        let w = this.write_waker
+        if isset(w) : w.wake()
     }
 
-    fn free_ssl() {
-        @unsafe
+    fn release() {
         if this.closed : return
         this.closed = true
-        this.cancelled = true
-        this.send_body = ""
-        this.send_body_pos = 0
-        this.write_waker.wake()
-        net.SSL_free(this.ssl)
-        h3_give_buf(this.recv_buf)
-        h3_give_buf(this.send_buf)
+        let w = this.write_waker
+        if isset(w) : w.wake()
+        let qst = this.qst
+        let conn = this.conn
+        conn.qconn.release_stream(qst)
+        // Clear references and recycle stream wrapper
+        this.headers_buf = null
+        this.req_fields = null
+        this.req_method = ""
+        this.req_target = ""
+        this.req_body = null
+        this.write_waker = null
+        conn.worker.give_h3_stream(this)
     }
 }
 
 class H3ServerConn {
     worker: H3Worker
-    ssl: net.OSSL
-    ctrl_out: ?net.OSSL (null)
-    ctrl_out_buf: ByteBuffer (.new(32))
-    ctrl_out_pos: uint (0)
+    qconn: net.QuicConn
+    ctrl_out: ?net.QuicStream (null)
     has_peer_control: bool (false)
     has_peer_qpack_enc: bool (false)
     has_peer_qpack_dec: bool (false)
-    uni_streams: Array[H3UniStream] (.new(4))
-    streams: Array[H3ServerStream] (.new(8))
+    uni_streams: HashMap[u64, H3ServerUniStream] (.new(4))
+    bidi_streams: HashMap[u64, H3ServerStream] (.new(16))
     next_goaway_id: u64 (0)
     active_handlers: uint (0)
     last_activity_ms: uint (0)
@@ -122,151 +91,141 @@ class H3ServerConn {
     goaway_sent: bool (false)
     closed: bool (false)
 
-    static fn accept(worker: H3Worker, ssl: net.OSSL) ?SELF {
-        @unsafe
-        if net.SSL_set_blocking_mode(ssl, 0) != 1
-            || net.SSL_set_default_stream_mode(ssl, net.SSL_DEFAULT_STREAM_MODE_NONE) != 1
-            || net.SSL_set_incoming_stream_policy(ssl, net.SSL_INCOMING_STREAM_POLICY_ACCEPT, 0) != 1 {
-            net.SSL_free(ssl)
-            return null
-        }
-        let conn = SELF {
+    static fn create(worker: H3Worker, qconn: net.QuicConn) SELF {
+        return SELF {
             worker: worker,
-            ssl: ssl,
+            qconn: qconn,
             last_activity_ms: time.mono_ms()
         }
-        h3_write_control_settings(conn.ctrl_out_buf, worker.server.max_request_header_size)
-        conn.flush_ctrl_out()
-        return conn
     }
 
-    fn flush_ctrl_out() {
-        @unsafe
-        let ctrl = this.ctrl_out
-        if !isset(ctrl) {
-            ctrl = net.SSL_new_stream(this.ssl, net.SSL_STREAM_FLAG_UNI | net.SSL_STREAM_FLAG_NO_BLOCK)
-            if !isset(ctrl) : return
-            this.ctrl_out = ctrl
-        }
-        if this.ctrl_out_pos >= this.ctrl_out_buf.length : return
-        while this.ctrl_out_pos < this.ctrl_out_buf.length {
-            let rem = this.ctrl_out_buf.length - this.ctrl_out_pos
-            let written: uint = 0
-            let ok = net.SSL_write_ex(ctrl, this.ctrl_out_buf.data.@offset(this.ctrl_out_pos), rem, @ref(written).@cast(ptr))
-            if ok != 1 || written == 0 : break
-            this.ctrl_out_pos += written
-        }
-        if this.ctrl_out_pos == this.ctrl_out_buf.length {
-            this.ctrl_out_buf.clear()
-            this.ctrl_out_pos = 0
-        }
+    fn ensure_ctrl_out() {
+        if isset(this.ctrl_out) || !this.qconn.handshake_done || this.closed : return
+        let ctrl = this.qconn.open_server_uni_stream()
+        h3_write_control_settings(ctrl.send_hdr, this.worker.server.max_request_header_size)
+        this.ctrl_out = ctrl
+        this.qconn.enqueue_send_stream(ctrl)
     }
 
     fn send_goaway() {
         if this.goaway_sent || this.closed : return
         this.goaway_sent = true
         this.draining = true
-        h3_write_goaway(this.ctrl_out_buf, this.next_goaway_id)
-        this.flush_ctrl_out()
+        this.ensure_ctrl_out()
+        let ctrl = this.ctrl_out
+        if isset(ctrl) {
+            let tmp = ByteBuffer.new(16)
+            h3_write_goaway(tmp, this.next_goaway_id)
+            ctrl.queue_tail(tmp.view(0, tmp.length))
+        }
     }
 
     fn close_with_error(code: u64) {
         if this.closed : return
         this.closed = true
-        each this.streams as st : st.free_ssl()
-        this.streams.clear()
-        each this.uni_streams as u : u.free_ssl()
+        each this.bidi_streams as st, _ {
+            st.cancelled = true
+            let w = st.write_waker
+            if isset(w) : w.wake()
+        }
+        this.bidi_streams.clear()
         this.uni_streams.clear()
-        @unsafe
-        let ctrl = this.ctrl_out
-        if isset(ctrl) {
-            this.ctrl_out = null
-            net.SSL_free(ctrl)
-        }
-        let args = net.SslShutdownExArgs { quic_error_code: code, quic_reason: null }
-        net.SSL_shutdown_ex(this.ssl, net.SSL_SHUTDOWN_FLAG_RAPID | net.SSL_SHUTDOWN_FLAG_NO_BLOCK, @ref(args), size_of(net.SslShutdownExArgs))
-        net.SSL_free(this.ssl)
+        this.qconn.close_with_error(code, true)
     }
 
-    fn accept_streams(now: uint) bool {
-        if this.closed : return false
-        let accepted = false
-        @unsafe
-        while true {
-            let s = net.SSL_accept_stream(this.ssl, net.SSL_ACCEPT_STREAM_NO_BLOCK) ?! break
-            accepted = true
-            this.last_activity_ms = now
-            let stype = net.SSL_get_stream_type(s)
-            if stype == net.SSL_STREAM_TYPE_BIDI {
-                let sid = net.SSL_get_stream_id(s)
-                if this.draining {
-                    let args = net.SslStreamResetArgs { quic_error_code: H3_ERR_REQUEST_REJECTED }
-                    net.SSL_stream_reset(s, @ref(args), size_of(net.SslStreamResetArgs))
-                    net.SSL_free(s)
-                    continue
-                }
-                if sid + 4 > this.next_goaway_id : this.next_goaway_id = sid + 4
-                this.streams.append(H3ServerStream { conn: this, ssl: s })
-            } else if stype == net.SSL_STREAM_TYPE_READ {
-                this.uni_streams.append(H3UniStream { ssl: s })
-            } else {
-                net.SSL_free(s)
-            }
-        }
-        return accepted
-    }
+    // Processes only QUIC streams that received data/FIN/reset in this batch.
+    fn pump_ready_rx(now_ms: uint) (bool, bool) {
+        let ready = this.qconn.rx_ready_streams
+        if ready.length == 0 : return (false, false)
+        let progressed = true
+        let dispatched = false
+        this.last_activity_ms = now_ms
 
-    fn pump_uni_streams(now: uint) bool {
-        let progressed = false
         let i: uint = 0
-        let scratch: [u8 x 2048] = @undefined
-        while i < this.uni_streams.length {
-            let u = this.uni_streams[i]
-            let remove = false
-            @unsafe
-            while !this.closed {
-                let nread: uint = 0
-                let ok = net.SSL_read_ex(u.ssl, @ref(scratch).@cast(ptr), 2048, @ref(nread).@cast(ptr))
-                if ok == 1 && nread > 0 {
-                    progressed = true
-                    this.last_activity_ms = now
-                    if !u.type_known || u.stream_type == H3_STREAM_CONTROL {
-                        let view: local &[u8] = &scratch
-                        u.buf.write(view.view(0, nread))
-                        if !this.process_uni_data(u) {
-                            remove = true
-                            break
-                        }
-                    }
-                    continue
+        while i < ready.length && !this.closed {
+            let qst = ready[i]
+            i++
+            let sid = qst.id
+            if (sid & 0x02) != 0 {
+                // Client unidirectional stream
+                let u = this.uni_streams.get(sid) !? null
+                if !isset(u) {
+                    let created = H3ServerUniStream { qst: qst }
+                    this.uni_streams.set(sid, created)
+                    u = created
                 }
-                let err = net.SSL_get_error(u.ssl, ok)
-                if err == net.ERROR.ZERO_RETURN {
-                    // Closing a critical unidirectional stream is a connection error (RFC 9114 §6.2.1)
+                if !this.process_uni_data(u) {
+                    u.closed = true
+                    this.uni_streams.remove(sid)
+                    this.qconn.release_stream(qst)
+                } else if qst.recv_fin || qst.recv_reset {
                     if u.type_known && (u.stream_type == H3_STREAM_CONTROL || u.stream_type == H3_STREAM_QPACK_ENCODER || u.stream_type == H3_STREAM_QPACK_DECODER) {
                         this.close_with_error(H3_ERR_CLOSED_CRITICAL_STREAM)
-                        return true
+                        break
                     }
-                    remove = true
-                } else if err != net.ERROR.WANT_READ && err != net.ERROR.WANT_WRITE {
-                    remove = true
+                    u.closed = true
+                    this.uni_streams.remove(sid)
+                    this.qconn.release_stream(qst)
                 }
-                break
-            }
-            if this.closed : return true
-            if remove {
-                u.free_ssl()
-                this.uni_streams.remove(i)
             } else {
-                i++
+                // Client bidirectional request stream
+                let st: ?H3ServerStream = null
+                if qst.has_partial_app {
+                    st = this.bidi_streams.get(sid) !? null
+                }
+                if !isset(st) {
+                    if this.draining {
+                        qst.reset_send(H3_ERR_REQUEST_REJECTED)
+                        this.qconn.release_stream(qst)
+                        continue
+                    }
+                    if sid + 4 > this.next_goaway_id : this.next_goaway_id = sid + 4
+                    let created = this.worker.take_h3_stream(this, qst)
+                    // Fast path: complete single-packet request skips bidi_streams HashMap entirely!
+                    if !qst.recv_fin && !qst.recv_reset {
+                        qst.has_partial_app = true
+                        this.bidi_streams.set(sid, created)
+                    }
+                    st = created
+                }
+                if qst.recv_reset {
+                    st.cancelled = true
+                    let w = st.write_waker
+                    if isset(w) : w.wake()
+                    if !st.dispatched {
+                        if qst.has_partial_app {
+                            qst.has_partial_app = false
+                            this.bidi_streams.remove(sid)
+                        }
+                        st.release()
+                    }
+                    continue
+                }
+                if !st.read_done && !st.cancelled {
+                    if qst.recv_buf.length > 0 : this.parse_request_frames(st)
+                    if !this.closed && !st.cancelled && qst.recv_fin {
+                        st.read_done = true
+                        if this.finish_request_read(st) : dispatched = true
+                    }
+                }
+                if st.cancelled && !st.dispatched {
+                    if qst.has_partial_app {
+                        qst.has_partial_app = false
+                        this.bidi_streams.remove(sid)
+                    }
+                    st.release()
+                }
             }
         }
-        return progressed
+        ready.clear()
+        return (progressed, dispatched)
     }
 
-    fn process_uni_data(u: H3UniStream) bool {
+    fn process_uni_data(u: H3ServerUniStream) bool {
+        let qst = u.qst
+        let buf = qst.recv_buf
         let pos: uint = 0
-        let view = u.buf.view(0, u.buf.length)
+        let view = buf.view(0, buf.length)
         if !u.type_known {
             let ok, stype, next = h3_varint_try_read(view, pos)
             if !ok : return true
@@ -285,7 +244,9 @@ class H3ServerConn {
                     return false
                 }
                 this.has_peer_qpack_enc = true
-                u.buf.clear()
+                let dropped = buf.length
+                buf.clear()
+                qst.on_recv_consumed(dropped)
                 return true
             } else if stype == H3_STREAM_QPACK_DECODER {
                 if this.has_peer_qpack_dec {
@@ -293,23 +254,26 @@ class H3ServerConn {
                     return false
                 }
                 this.has_peer_qpack_dec = true
-                u.buf.clear()
+                let dropped = buf.length
+                buf.clear()
+                qst.on_recv_consumed(dropped)
                 return true
             } else if stype == H3_STREAM_PUSH {
-                // Clients must not open push streams
                 this.close_with_error(H3_ERR_STREAM_CREATION_ERROR)
                 return false
             } else {
-                // Unknown/GREASE uni stream: ignore
-                u.buf.clear()
+                let dropped = buf.length
+                buf.clear()
+                qst.on_recv_consumed(dropped)
                 return true
             }
         }
         if u.stream_type != H3_STREAM_CONTROL {
-            u.buf.clear()
+            let dropped = buf.length
+            buf.clear()
+            qst.on_recv_consumed(dropped)
             return true
         }
-        // Control stream frame loop
         while pos < view.length {
             if !u.frame_in_progress {
                 let ok1, ftype, p1 = h3_varint_try_read(view, pos)
@@ -349,7 +313,11 @@ class H3ServerConn {
                 this.draining = true
             }
         }
-        if pos > 0 : u.buf.clear_range(0, pos)
+        if pos > 0 {
+            if pos == buf.length : buf.clear()
+            else : buf.clear_range(0, pos)
+            qst.on_recv_consumed(pos)
+        }
         return true
     }
 
@@ -377,142 +345,23 @@ class H3ServerConn {
         return true
     }
 
-    fn pump_reads(now: uint) (bool, bool) {
-        let progressed = false
-        let dispatched = false
-        let i: uint = 0
-        let scratch: [u8 x 16_384] = @undefined
-        while i < this.streams.length {
-            let st = this.streams[i]
-            if !st.read_done && !st.cancelled {
-                @unsafe
-                while !st.read_done && !st.cancelled && !this.closed {
-                    let nread: uint = 0
-                    let ok = net.SSL_read_ex(st.ssl, @ref(scratch).@cast(ptr), H3_READ_CHUNK, @ref(nread).@cast(ptr))
-                    if ok == 1 && nread > 0 {
-                        progressed = true
-                        this.last_activity_ms = now
-                        let view: local &[u8] = &scratch
-                        st.recv_buf.write(view.view(0, nread))
-                        this.parse_request_frames(st)
-                        continue
-                    }
-                    let err = net.SSL_get_error(st.ssl, ok)
-                    if err == net.ERROR.ZERO_RETURN {
-                        progressed = true
-                        st.read_done = true
-                        if this.finish_request_read(st) : dispatched = true
-                    } else if err != net.ERROR.WANT_READ && err != net.ERROR.WANT_WRITE {
-                        st.cancelled = true
-                        st.write_waker.wake()
-                    }
-                    break
-                }
-            }
-            if this.closed : return (true, dispatched)
-            i++
-        }
-        return (progressed, dispatched)
-    }
-
-    fn pump_writes(now: uint) bool {
-        let progressed = false
-        let i: uint = 0
-        while i < this.streams.length {
-            let st = this.streams[i]
-            if !st.cancelled && st.pending_send() > 0 {
-                @unsafe
-                while st.send_pos < st.send_buf.length && !st.cancelled {
-                    let rem = st.send_buf.length - st.send_pos
-                    let conclude = st.send_fin && st.send_body_pos >= st.send_body.bytes
-                    let flags: u64 = conclude ? net.SSL_WRITE_FLAG_CONCLUDE : 0
-                    let written: uint = 0
-                    let ok = net.SSL_write_ex2(st.ssl, st.send_buf.data.@offset(st.send_pos), rem, flags, @ref(written).@cast(ptr))
-                    if ok == 1 && written > 0 {
-                        progressed = true
-                        this.last_activity_ms = now
-                        st.send_pos += written
-                        if conclude && written == rem : st.send_concluded = true
-                        continue
-                    }
-                    let err = net.SSL_get_error(st.ssl, ok)
-                    if err != net.ERROR.WANT_WRITE && err != net.ERROR.WANT_READ {
-                        st.cancelled = true
-                        st.write_waker.wake()
-                    }
-                    break
-                }
-                if st.send_pos == st.send_buf.length && st.send_pos > 0 {
-                    st.send_buf.clear()
-                    st.send_pos = 0
-                }
-                if !st.cancelled && st.send_pos == st.send_buf.length && st.send_body_pos < st.send_body.bytes {
-                    @unsafe
-                    while st.send_body_pos < st.send_body.bytes && !st.cancelled {
-                        let rem = st.send_body.bytes - st.send_body_pos
-                        let conclude = st.send_fin
-                        let flags: u64 = conclude ? net.SSL_WRITE_FLAG_CONCLUDE : 0
-                        let written: uint = 0
-                        let ok = net.SSL_write_ex2(st.ssl, st.send_body.data.@offset(st.send_body_pos), rem, flags, @ref(written).@cast(ptr))
-                        if ok == 1 && written > 0 {
-                            progressed = true
-                            this.last_activity_ms = now
-                            st.send_body_pos += written
-                            if conclude && written == rem : st.send_concluded = true
-                            continue
-                        }
-                        let err = net.SSL_get_error(st.ssl, ok)
-                        if err != net.ERROR.WANT_WRITE && err != net.ERROR.WANT_READ {
-                            st.cancelled = true
-                            st.write_waker.wake()
-                        }
-                        break
-                    }
-                    if st.send_body_pos == st.send_body.bytes {
-                        st.send_body = ""
-                        st.send_body_pos = 0
-                    }
-                }
-                if st.pending_send() < H3_STREAM_SEND_HIGH_WATER {
-                    st.write_waker.wake()
-                }
-            }
-            let finished = false
-            if st.cancelled {
-                finished = !st.dispatched || st.send_fin
-            } else if st.send_fin && st.pending_send() == 0 {
-                if !st.send_concluded {
-                    @unsafe
-                    net.SSL_stream_conclude(st.ssl, 0)
-                    st.send_concluded = true
-                }
-                progressed = true
-                finished = true
-            }
-            if finished {
-                st.free_ssl()
-                this.streams.remove(i)
-            } else {
-                i++
-            }
-        }
-        return progressed
-    }
-
     fn parse_request_frames(st: H3ServerStream) {
+        let qst = st.qst
+        let buf = qst.recv_buf
         let server = this.worker.server
         let header_limit = server.max_request_header_size == 0 ? uint.$max : server.max_request_header_size
         let body_limit = server.max_request_body_size == 0 ? uint.$max : server.max_request_body_size
-        while !st.cancelled && !this.closed {
-            let avail = st.recv_buf.length - st.recv_pos
-            if avail == 0 : break
-            let view = st.recv_buf.view(st.recv_pos, avail)
+        let pos: uint = 0
+        let total = buf.length
+        while pos < total && !st.cancelled && !this.closed {
+            let avail = total - pos
+            let view = buf.view(pos, avail)
             if !st.frame_in_progress {
                 let ok1, ftype, p1 = h3_varint_try_read(view, 0)
                 if !ok1 : break
                 let ok2, flen, p2 = h3_varint_try_read(view, p1)
                 if !ok2 : break
-                st.recv_pos += p2
+                pos += p2
                 if ftype == H3_FRAME_SETTINGS || ftype == H3_FRAME_GOAWAY || ftype == H3_FRAME_CANCEL_PUSH || ftype == H3_FRAME_MAX_PUSH_ID || ftype == H3_FRAME_PUSH_PROMISE {
                     this.close_with_error(H3_ERR_FRAME_UNEXPECTED)
                     return
@@ -538,7 +387,6 @@ class H3ServerConn {
                 if flen == 0 {
                     st.frame_in_progress = false
                     if ftype == H3_FRAME_HEADERS {
-                        // Empty HEADERS frame is missing required QPACK prefix
                         this.close_with_error(H3_ERR_QPACK_DECOMPRESSION_FAILED)
                         return
                     }
@@ -546,8 +394,8 @@ class H3ServerConn {
                 continue
             }
             let take = avail.to(u64) < st.frame_remaining ? avail : st.frame_remaining.to(uint)
-            let chunk = st.recv_buf.view(st.recv_pos, take)
-            st.recv_pos += take
+            let chunk = buf.view(pos, take)
+            pos += take
             st.frame_remaining -= take.to(u64)
 
             if st.frame_type == H3_FRAME_HEADERS {
@@ -597,16 +445,13 @@ class H3ServerConn {
                 st.req_body_len += take
                 if st.frame_remaining == 0 : st.frame_in_progress = false
             } else {
-                // Skip unknown/GREASE frame payload
                 if st.frame_remaining == 0 : st.frame_in_progress = false
             }
         }
-        if st.recv_pos == st.recv_buf.length {
-            st.recv_buf.clear()
-            st.recv_pos = 0
-        } else if st.recv_pos > 4096 {
-            st.recv_buf.clear_range(0, st.recv_pos)
-            st.recv_pos = 0
+        if pos > 0 {
+            if pos == total : buf.clear()
+            else : buf.clear_range(0, pos)
+            qst.on_recv_consumed(pos)
         }
     }
 
@@ -624,11 +469,13 @@ class H3ServerConn {
             }
             st.req_fields = fields
             if st.expect_continue {
-                h3_write_frame_header(st.send_buf, H3_FRAME_HEADERS, 4)
-                st.send_buf.write_byte(0x00)
-                st.send_buf.write_byte(0x00)
-                st.send_buf.write_byte(0xff)
-                st.send_buf.write_byte(0x00)
+                let hdr = st.qst.send_hdr
+                h3_write_frame_header(hdr, H3_FRAME_HEADERS, 4)
+                hdr.write_byte(0x00)
+                hdr.write_byte(0x00)
+                hdr.write_byte(0xff)
+                hdr.write_byte(0x00)
+                this.qconn.enqueue_send_stream(st.qst)
             }
         } else {
             st.got_trailers = true
@@ -641,7 +488,7 @@ class H3ServerConn {
 
     fn finish_request_read(st: H3ServerStream) bool {
         if st.cancelled || st.dispatched : return false
-        if st.frame_in_progress || st.recv_buf.length > st.recv_pos {
+        if st.frame_in_progress || st.qst.recv_buf.length > 0 {
             st.reset(H3_ERR_FRAME_ERROR)
             return false
         }
@@ -656,9 +503,11 @@ class H3ServerConn {
         }
         if !this.peer_cert_loaded {
             this.peer_cert_loaded = true
-            @unsafe
-            this.client_subject = net.quic_peer_subject(this.ssl)
-            this.client_sha256 = net.quic_peer_sha256(this.ssl)
+            if this.worker.endpoint.listener.context.has_client_ca {
+                @unsafe
+                this.client_subject = net.quic_peer_subject(this.qconn.ssl)
+                this.client_sha256 = net.quic_peer_sha256(this.qconn.ssl)
+            }
         }
         st.dispatched = true
         this.active_handlers++
@@ -671,16 +520,19 @@ class H3ServerConn {
         defer {
             this.active_handlers--
             this.worker.total_active_handlers--
-            st.send_fin = true
+            if !st.cancelled && !this.closed {
+                st.qst.finish_send()
+            }
+            if st.qst.has_partial_app {
+                st.qst.has_partial_app = false
+                this.bidi_streams.remove(st.qst.id)
+            }
+            st.release()
             if !this.worker.in_dispatch : this.worker.wake()
         }
         let fields = st.req_fields ?! return
-        let method = ""
-        let target = ""
-        each fields as f {
-            if f.name == ":method" : method = f.value
-            else if f.name == ":path" : target = f.value
-        }
+        let method = st.req_method
+        let target = st.req_target
         let path = target
         let query = ""
         target.index_of_byte('?') -> index: {
@@ -886,62 +738,85 @@ class H3ServerConn {
             headers.append(.{ name: "content-disposition", value: disposition.into_string() })
         }
 
-        // Encode HEADERS frame into stream send buffer
+        // Encode HEADERS frame directly into QuicStream.send_hdr
+        let qst = st.qst
         let qbuf = h3_qpack_buf
         qbuf.clear()
         qpack_encode(headers, qbuf)
-        h3_write_frame_header(st.send_buf, H3_FRAME_HEADERS, qbuf.length.to(u64))
-        st.send_buf.write(qbuf.view(0, qbuf.length))
+        h3_write_frame_header(qst.send_hdr, H3_FRAME_HEADERS, qbuf.length.to(u64))
+        qst.send_hdr.write(qbuf.view(0, qbuf.length))
 
         let no_body = request.method == "HEAD" || status == 204 || status == 304 || (size == 0 && !open_body)
         if !no_body {
             if open_body && isset(source) {
+                let waker = sync.Waker.new() !? null
+                st.write_waker = waker
+                if !qst.has_partial_app {
+                    qst.has_partial_app = true
+                    this.bidi_streams.set(qst.id, st)
+                }
                 let chunk_buf = h2_take_chunk_buf()
                 defer h2_give_chunk_buf(chunk_buf)
+                let fhdr = ByteBuffer.new(16)
                 while !st.cancelled && !this.closed {
                     let read = read_body_piece(source, chunk_buf.view_spare(16_384)) ! throw .protocol
                     if read == 0 : break
-                    h3_write_frame_header(st.send_buf, H3_FRAME_DATA, read.to(u64))
-                    st.send_buf.write(chunk_buf.view_spare(16_384).view(0, read))
+                    fhdr.clear()
+                    h3_write_frame_header(fhdr, H3_FRAME_DATA, read.to(u64))
+                    qst.queue_tail(fhdr.view(0, fhdr.length))
+                    qst.queue_tail(chunk_buf.view_spare(16_384).view(0, read))
                     this.worker.wake()
-                    while st.pending_send() >= H3_STREAM_SEND_HIGH_WATER && !st.cancelled && !this.closed {
-                        st.write_waker.wait(50)
+                    while qst.pending_send_bytes() >= H3_STREAM_SEND_HIGH_WATER && !st.cancelled && !this.closed {
+                        if isset(waker) : waker.wait(25)
+                        else : coro.await_last()
                     }
                 }
             } else if isset(source) {
+                let waker = sync.Waker.new() !? null
+                st.write_waker = waker
+                if !qst.has_partial_app {
+                    qst.has_partial_app = true
+                    this.bidi_streams.set(qst.id, st)
+                }
                 let offset: uint = 0
                 let chunk_buf = h2_take_chunk_buf()
                 defer h2_give_chunk_buf(chunk_buf)
+                let fhdr = ByteBuffer.new(16)
                 while offset < size && !st.cancelled && !this.closed {
                     let amount = size - offset
                     if amount > 16_384 : amount = 16_384
                     let read = source.read(chunk_buf.view_spare(amount)) ! throw .protocol
                     if read == 0 || read > amount : throw .protocol
-                    h3_write_frame_header(st.send_buf, H3_FRAME_DATA, read.to(u64))
-                    st.send_buf.write(chunk_buf.view_spare(amount).view(0, read))
+                    fhdr.clear()
+                    h3_write_frame_header(fhdr, H3_FRAME_DATA, read.to(u64))
+                    qst.queue_tail(fhdr.view(0, fhdr.length))
+                    qst.queue_tail(chunk_buf.view_spare(amount).view(0, read))
                     offset += read
-                    if st.pending_send() >= H3_STREAM_SEND_HIGH_WATER {
+                    if qst.pending_send_bytes() >= H3_STREAM_SEND_HIGH_WATER {
                         this.worker.wake()
-                        while st.pending_send() >= H3_STREAM_SEND_HIGH_WATER && !st.cancelled && !this.closed {
-                            st.write_waker.wait(50)
+                        while qst.pending_send_bytes() >= H3_STREAM_SEND_HIGH_WATER && !st.cancelled && !this.closed {
+                            if isset(waker) : waker.wait(25)
+                            else : coro.await_last()
                         }
                     }
                 }
             } else if size > 0 {
-                h3_write_frame_header(st.send_buf, H3_FRAME_DATA, size.to(u64))
-                if !has_trailers && size > 512 {
-                    st.send_body = body
-                    st.send_body_pos = 0
+                h3_write_frame_header(qst.send_hdr, H3_FRAME_DATA, size.to(u64))
+                if size > 512 {
+                    // Zero-copy: QuicStream encrypts directly out of `body` (cached static file / large response)!
+                    qst.send_body = body
                 } else {
-                    st.send_buf.write(body.view(0, size))
+                    qst.send_hdr.write(body.view(0, size))
                 }
             }
         }
         if isset(trailers) && !st.cancelled && !this.closed {
             qbuf.clear()
             qpack_encode(trailers, qbuf)
-            h3_write_frame_header(st.send_buf, H3_FRAME_HEADERS, qbuf.length.to(u64))
-            st.send_buf.write(qbuf.view(0, qbuf.length))
+            let tf = ByteBuffer.new(qbuf.length + 16)
+            h3_write_frame_header(tf, H3_FRAME_HEADERS, qbuf.length.to(u64))
+            tf.write(qbuf.view(0, qbuf.length))
+            qst.queue_tail(tf.view(0, tf.length))
         }
     }
 }
@@ -1008,6 +883,8 @@ fn h3_validate_request_headers(fields: Array[HpackField], st: H3ServerStream) bo
         if (!path.starts_with("/") && !(method == "OPTIONS" && path == "*")) || path.contains("#") : return false
         if authority.bytes == 0 && (!isset(host) || host == "") : return false
     }
+    st.req_method = method
+    st.req_target = path
     st.expected_length = content_length
     return true
 }
@@ -1022,9 +899,10 @@ fn h3_validate_trailers(fields: Array[HpackField]) bool {
 
 class H3Worker {
     server: atomic ServerWorkerData
-    listener: atomic net.QuicListener
+    endpoint: net.QuicEndpoint
     conns: Array[H3ServerConn] (.new(16))
     ready_streams: Deque[H3ServerStream] (.new())
+    h3_stream_pool: Array[H3ServerStream] (.new(128))
     idle_servers: Array[sync.Waker] (.{})
     servers: uint (0)
     runners: uint (0)
@@ -1034,13 +912,44 @@ class H3Worker {
     watcher_waker: sync.Waker (.{})
     watcher_started: bool (false)
     watcher_armed: bool (false)
-    watcher_want_write: bool (false)
     watcher_timeout_ms: uint (25)
     in_dispatch: bool (false)
     stopped: bool (false)
 
     fn wake() {
         this.waker.wake()
+    }
+
+    fn take_h3_stream(conn: H3ServerConn, qst: net.QuicStream) H3ServerStream {
+        let st = this.h3_stream_pool.pop_last() !? null
+        if isset(st) {
+            st.conn = conn
+            st.qst = qst
+            st.frame_in_progress = false
+            st.frame_type = 0
+            st.frame_remaining = 0
+            st.headers_buf = null
+            st.req_fields = null
+            st.req_method = ""
+            st.req_target = ""
+            st.req_body = null
+            st.req_body_len = 0
+            st.expected_length = null
+            st.got_headers = false
+            st.got_trailers = false
+            st.expect_continue = false
+            st.read_done = false
+            st.dispatched = false
+            st.write_waker = null
+            st.cancelled = false
+            st.closed = false
+            return st
+        }
+        return H3ServerStream { conn: conn, qst: qst }
+    }
+
+    fn give_h3_stream(st: H3ServerStream) {
+        if this.h3_stream_pool.length < 256 : this.h3_stream_pool.append(st)
     }
 
     fn dispatch_ready() {
@@ -1122,9 +1031,8 @@ class H3Worker {
                 this.watcher_waker.wait(50)
                 continue
             }
-            let want_w = this.watcher_want_write
             let tms = this.watcher_timeout_ms
-            net.quic_await_fd(this.listener.fd, true, want_w, tms)
+            net.quic_await_fd(this.endpoint.fd, true, false, tms)
             this.watcher_armed = false
             this.waker.wake()
         }
@@ -1132,48 +1040,42 @@ class H3Worker {
 
     fn run() {
         let draining = false
+        let ep = this.endpoint
         let last_sweep_ms = time.mono_ms()
+        let last_timer_ms = last_sweep_ms
         let zero_wait_spins: uint = 0
         while true {
             if !draining && this.server.stopping != 0 {
                 draining = true
                 each this.conns as c : c.send_goaway()
             }
-            this.listener.handle_events()
 
-            // Accept incoming QUIC connections unless shutting down
-            if !draining {
-                let max_conns = this.server.max_connections
-                while true {
-                    @unsafe
-                    let ssl = this.listener.accept_connection() ?! break
-                    if max_conns > 0 && this.conns.length >= max_conns {
-                        let args = net.SslShutdownExArgs { quic_error_code: H3_ERR_EXCESSIVE_LOAD, quic_reason: null }
-                        net.SSL_shutdown_ex(ssl, net.SSL_SHUTDOWN_FLAG_RAPID | net.SSL_SHUTDOWN_FLAG_NO_BLOCK, @ref(args), size_of(net.SslShutdownExArgs))
-                        net.SSL_free(ssl)
-                        continue
-                    }
-                    let conn = H3ServerConn.accept(this, ssl)
-                    if isset(conn) : this.conns.append(conn)
+            let now_us = time.mono_us().to(u64)
+            let now_ms = (now_us / 1000).to(uint)
+            let got_rx = ep.recv_batch(now_us, !draining)
+
+            // Attach newly accepted QUIC connections
+            if ep.new_conns.length > 0 {
+                each ep.new_conns as qconn {
+                    let c = H3ServerConn.create(this, qconn)
+                    this.conns.append(c)
                 }
+                ep.new_conns.clear()
             }
 
-            let now = time.mono_ms()
-            let progressed = false
             let dispatched_any = false
-            each this.conns as c {
-                if c.closed : continue
-                c.flush_ctrl_out()
-                if c.accept_streams(now) : progressed = true
-                if c.pump_uni_streams(now) : progressed = true
+            let ci: uint = 0
+            while ci < this.conns.length {
+                let c = this.conns[ci]
                 if !c.closed {
-                    let rp, dp = c.pump_reads(now)
-                    if rp : progressed = true
+                    if !isset(c.ctrl_out) && c.qconn.handshake_done : c.ensure_ctrl_out()
+                    let _, dp = c.pump_ready_rx(now_ms)
                     if dp : dispatched_any = true
                 }
+                ci++
             }
 
-            // Yield once so newly dispatched synchronous handlers finish before we flush writes
+            // Run newly dispatched synchronous handlers before flushing QUIC packets
             if dispatched_any {
                 this.in_dispatch = true
                 this.dispatch_ready()
@@ -1181,55 +1083,76 @@ class H3Worker {
                 this.in_dispatch = false
             }
 
-            let do_sweep = draining || (now >= last_sweep_ms && now - last_sweep_ms >= 100)
-            if do_sweep : last_sweep_ms = now
-            let idle_ms = this.server.idle_timeout_ms
-            let ci: uint = 0
-            while ci < this.conns.length {
-                let c = this.conns[ci]
-                if !c.closed && c.pump_writes(now) : progressed = true
-                let drop = c.closed
-                if !drop && c.active_handlers == 0 && c.streams.length == 0 {
-                    if draining {
-                        drop = true
-                    } else if idle_ms > 0 && now >= c.last_activity_ms && now - c.last_activity_ms >= idle_ms {
-                        drop = true
+            // Wake any streaming handlers whose send buffer drained below high water
+            if this.total_active_handlers > 0 {
+                each this.conns as c {
+                    if c.active_handlers > 0 {
+                        each c.bidi_streams as st, _ {
+                            let w = st.write_waker
+                            if isset(w) && st.qst.pending_send_bytes() < H3_STREAM_SEND_HIGH_WATER {
+                                w.wake()
+                            }
+                        }
                     }
-                }
-                if !drop && do_sweep {
-                    let item = net.SslPollItem {
-                        desc: net.BioPollDescriptor { kind: net.BIO_POLL_DESCRIPTOR_TYPE_SSL, value: c.ssl.@cast(ptr) },
-                        events: net.SSL_POLL_EVENT_EC | net.SSL_POLL_EVENT_ECD
-                    }
-                    let tv = ext.libc_timeval { tv_sec: 0, tv_usec: 0 }
-                    let rcount: uint = 0
-                    if net.SSL_poll(@ref(item), 1, size_of(net.SslPollItem), @ref(tv), net.SSL_POLL_FLAG_NO_HANDLE_EVENTS, @ref(rcount)) == 1
-                        && rcount > 0 && (item.revents & (net.SSL_POLL_EVENT_EC | net.SSL_POLL_EVENT_ECD)) != 0 {
-                        drop = true
-                    }
-                }
-                if drop {
-                    c.close_with_error(H3_ERR_NO_ERROR)
-                    this.conns.remove(ci)
-                } else {
-                    ci++
                 }
             }
 
-            // Flush any newly queued QUIC packets
-            this.listener.handle_events()
+            // Periodic timer tick under continuous load so loss/PTO/delayed-ACK timers never starve
+            if now_ms >= last_timer_ms && now_ms - last_timer_ms >= 5 {
+                last_timer_ms = now_ms
+                ep.process_timers(now_us, 25)
+            }
+
+            // Flush all dirty QUIC connections (GSO bursts + sendmmsg batch)
+            let more_dirty = ep.flush_all(time.mono_us().to(u64))
+
+            // Periodic idle / closed connection sweep
+            let do_sweep = draining || (now_ms >= last_sweep_ms && now_ms - last_sweep_ms >= 100)
+            if do_sweep {
+                last_sweep_ms = now_ms
+                let idle_ms = this.server.idle_timeout_ms
+                ci = 0
+                while ci < this.conns.length {
+                    let c = this.conns[ci]
+                    let drop = c.closed || c.qconn.closed || (c.qconn.closing && c.qconn.close_sent)
+                    if !drop && c.active_handlers == 0 && c.bidi_streams.length == 0 {
+                        if draining {
+                            drop = true
+                        } else if idle_ms > 0 && now_ms >= c.last_activity_ms && now_ms - c.last_activity_ms >= idle_ms {
+                            drop = true
+                        }
+                    }
+                    if drop {
+                        c.close_with_error(H3_ERR_NO_ERROR)
+                        ep.drop_conn(c.qconn)
+                        this.conns.swap_remove(ci)
+                        // Also remove from ep.conns
+                        let ei: uint = 0
+                        while ei < ep.conns.length {
+                            if ep.conns[ei] == c.qconn {
+                                ep.conns.swap_remove(ei)
+                                break
+                            }
+                            ei++
+                        }
+                    } else {
+                        ci++
+                    }
+                }
+            }
 
             if draining {
                 if this.conns.length == 0 : break
                 if time.mono_ms() >= this.server.deadline_ms : break
             }
-            if progressed {
+
+            if got_rx || more_dirty {
                 zero_wait_spins = 0
                 continue
             }
 
             let max_wait: uint = draining ? 10 : 25
-            let wait_ms = this.listener.event_timeout_ms(max_wait)
+            let wait_ms = ep.process_timers(time.mono_us().to(u64), max_wait)
             if wait_ms == 0 {
                 if zero_wait_spins < 4 {
                     zero_wait_spins++
@@ -1240,8 +1163,9 @@ class H3Worker {
             } else {
                 zero_wait_spins = 0
             }
+
             if this.total_active_handlers == 0 && !this.watcher_armed {
-                net.quic_await_fd(this.listener.fd, true, this.listener.write_desired(), wait_ms)
+                net.quic_await_fd(ep.fd, true, false, wait_ms)
                 continue
             }
             if !this.watcher_started {
@@ -1249,7 +1173,6 @@ class H3Worker {
                 co this.watcher_loop()
             }
             if !this.watcher_armed {
-                this.watcher_want_write = this.listener.write_desired()
                 this.watcher_timeout_ms = wait_ms
                 this.watcher_armed = true
                 this.watcher_waker.wake()
@@ -1265,7 +1188,7 @@ class H3Worker {
         }
         each this.conns as c : c.close_with_error(H3_ERR_NO_ERROR)
         this.conns.clear()
-        this.listener.close()
+        ep.close()
     }
 }
 
@@ -1275,7 +1198,8 @@ fn h3_worker_on_yield(arg: ptr) {
 }
 
 fn h3_worker(server: atomic ServerWorkerData, listener: atomic net.QuicListener) {
-    let w = H3Worker { server: server, listener: listener }
+    let ep = net.QuicEndpoint.new(listener, server.max_connections)
+    let w = H3Worker { server: server, endpoint: ep }
     await co w.run()
     if --server.workers == 0 : server.done.unlock()
 }
