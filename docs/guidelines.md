@@ -29,4 +29,4 @@ Note: on methods, `this` counts as the input argument.
 ### Naming & defaults
 
 - Prefer `?T (null)` over empty-string (`""`) for optional values.
-- Use clear, descriptive parameter names e.g. `route_prefix` over `prefix`
+- Use clear, descriptive parameter names e.g. `route_prefix` over `prefix` when it's not clear what the prefix is for
