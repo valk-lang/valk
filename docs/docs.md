@@ -669,7 +669,7 @@ that hook may throw. The handler then follows the assignment: `deque[i] = v
 error passes to the caller like any other. When the right-hand side itself
 throws, the handler belongs to that value; parenthesize it to give the
 assignment its own: `deque[i] = (compute() !? 0) !!`. `Type{ v x n }` builds
-any class with a `static fn fill(count, value)`, as `Array` has.
+any class with a `static fn fill(value, amount)`, as `Array` has.
 
 A compound assignment such as `values[i] += 1` reads the element through
 `$offset` and stores it back through `$offset_assign`, evaluating `values` and
@@ -2123,7 +2123,7 @@ use valk.time
 // Init
 let now = time.DateTime.now()
 let datetime = time.DateTime.new(2026, 8, 8, 19, 7, 6, 123_456) ! panic("Invalid date")
-let from_str = time.DateTime.from_format("Y-m-d H:i:s.u", text) ! panic("Invalid date")
+let from_str = time.DateTime.from_format(text, "Y-m-d H:i:s.u") ! panic("Invalid date")
 
 // Change
 let changed = datetime.add_days(1) !? datetime // Returns a new DateTime
@@ -2846,12 +2846,12 @@ on first use. `json()` gives an empty object for a body that is not JSON;
 `html`, `json`, `json_of` (encodes any value), `redirect`, `file`, `stream`,
 `empty` and the general `Response.new(body, code, content_type)`.
 
-`s.add_static_dir("public")` serves the files in `public` before a request
-reaches the handler (`prefix: "/static"` mounts them under a URL prefix). A
-directory path serves its `index.html`, so `/` shows `public/index.html`; pass
-`index: ""` to leave directory paths to the handler. Files (also `Response.file`)
-carry an `ETag` and `Last-Modified`, answer 304 when the browser's copy is
-current, and serve a `Range` of bytes for resumed downloads and video.
+`s.add_static_dir("/static", "public")` serves the files in `public` under `/static`
+before a request reaches the handler (use `"/"` or `""` for the root). Pass an optional
+third argument such as `"index.html"` to serve an index file for directory paths (default
+`null`, leaving directories to the handler). Files (also `Response.file`) carry an `ETag`
+and `Last-Modified`, answer 304 when the browser's copy is current, and serve a `Range`
+of bytes for resumed downloads and video.
 
 Cookies are read from the request by name and set on the response:
 
@@ -3151,7 +3151,7 @@ port)` looks a name up; `parse` only accepts numeric addresses.
 
 The constructors take the same arguments as their TCP twins, plus:
 
-- `udp_client(host, port, timeout_ms, local_port, local_host)` and
+- `udp_client(host, port, timeout_ms, local_host, local_port)` and
   `tcp_client(...)` bind their own end when a protocol needs a fixed source
   port or a specific interface; 0 and `""` let the system choose.
 - `udp_server(host, port, timeout_ms, reuse_address)` lets several sockets
@@ -3354,8 +3354,8 @@ and tokens with `verify` or `constant_time_equals`, never with `==`:
 ```rust
 use valk.crypto
 
-let signature = crypto.Hmac.sign_hex(crypto.HashAlgorithm.sha256, "secret", payload)
-if !crypto.Hmac.verify(crypto.HashAlgorithm.sha256, "secret", payload, received) {
+let signature = crypto.Hmac.sign_hex(payload, crypto.HashAlgorithm.sha256, "secret")
+if !crypto.Hmac.verify(payload, received, crypto.HashAlgorithm.sha256, "secret") {
     println("bad signature")
 }
 ```
@@ -3366,8 +3366,8 @@ from material that already has entropy, such as a shared secret:
 ```rust
 use valk.crypto
 
-let key = crypto.pbkdf2(crypto.HashAlgorithm.sha256, password, salt, 600000, 32) ! panic("bad input")
-let session = crypto.hkdf(crypto.HashAlgorithm.sha256, secret, "", "session v1", 32) ! panic("bad input")
+let key = crypto.pbkdf2(password, crypto.HashAlgorithm.sha256, salt, 600000, 32) ! panic("bad input")
+let session = crypto.hkdf(secret, crypto.HashAlgorithm.sha256, "", "session v1", 32) ! panic("bad input")
 ```
 
 Password hashing/verify example:
@@ -3394,8 +3394,8 @@ fn main() {
 use valk.crypto
 
 let key = crypto.random_bytes(32)
-let sealed = crypto.seal(key, "user=17") ! panic("Bad key")
-let text = crypto.unseal(key, sealed) ! panic("Altered or wrong key")
+let sealed = crypto.seal("user=17", key) ! panic("Bad key")
+let text = crypto.unseal(sealed, key) ! panic("Altered or wrong key")
 ```
 
 `PrivateKey` signs and `PublicKey` verifies, with Ed25519, ECDSA or RSA keys.
@@ -3405,10 +3405,10 @@ Keys are generated, or read from PEM, DER or JSON Web Key text:
 use valk.crypto
 
 let key = crypto.PrivateKey.generate_ed25519() ! panic("Failed")
-let signature = key.sign(crypto.SignatureAlgorithm.ed25519, message) ! panic("Failed")
+let signature = key.sign(message, crypto.SignatureAlgorithm.ed25519) ! panic("Failed")
 
 let public = crypto.PublicKey.from_pem(pem) ! panic("Not a public key")
-if !public.verify(crypto.SignatureAlgorithm.rsa_pkcs1_sha256, message, signature) {
+if !public.verify(message, signature, crypto.SignatureAlgorithm.rsa_pkcs1_sha256) {
     println("bad signature")
 }
 ```

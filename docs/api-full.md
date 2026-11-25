@@ -65,13 +65,13 @@ A compressed data format.
 // Returns `data` compressed into `format` at `level` (0 stores, 1 is fastest, 9 is smallest).
 + fn compress(data: local &[u8], format: Format, level: uint (COMPRESS_DEFAULT_LEVEL)) String
 // Writes `data` compressed into `format` at `level` to `out` and returns the bytes written.
-+ fn compress_into(data: local &[u8], out: Writer, format: Format, level: uint (COMPRESS_DEFAULT_LEVEL)) uint !io:IoError
++ fn compress_into(data: local &[u8], format: Format, out: Writer, level: uint (COMPRESS_DEFAULT_LEVEL)) uint !io:IoError
 // Returns the CRC-32 (IEEE 802.3, as in gzip, zip and PNG) of `data`.
 + fn crc32(data: local &[u8], crc: u32 (0)) u32
 // Returns the decompressed contents of `data`, which must be in `format`.
 + fn decompress(data: local &[u8], format: Format, max_size: uint (0)) String !CompressError
 // Writes the decompressed contents of `data` to `out` and returns the bytes written.
-+ fn decompress_into(data: local &[u8], out: Writer, format: Format, max_size: uint (0)) uint !CompressError
++ fn decompress_into(data: local &[u8], format: Format, out: Writer, max_size: uint (0)) uint !CompressError
 // Returns `data` compressed as raw DEFLATE; see `compress`.
 + fn deflate(data: local &[u8], level: uint (COMPRESS_DEFAULT_LEVEL)) String
 // Writes `data` compressed as raw DEFLATE to `out`; see `compress_into`.
@@ -426,7 +426,7 @@ How `Process.start` connects one standard stream of a child.
 // Registers a callback to run in reverse registration order when the current OS thread finishes.
 + fn on_thread_exit(hook: fn()()) void
 // Prints `msg` to stderr and ends the process with exit code 1.
-+ fn panic(msg: String, location: String ("")) void
++ fn panic(msg: String, location: ?String (null)) void
 // Returns the id of this process.
 + fn process_id() uint
 // Sends signal `code` to the current process.
@@ -442,9 +442,9 @@ How `Process.start` connects one standard stream of a child.
 // Removes the environment variable `var`; removing a variable that is not set succeeds.
 + fn unsetenv(var: String) void !SystemError
 // Writes the low `bytes` bytes of `v` to `to`, most significant byte first.
-+ fn write_big_endian(to: *[u8], v: uint, bytes: uint) void
++ fn write_big_endian(v: uint, to: *[u8], bytes: uint) void
 // Writes the low `bytes` bytes of `v` to `to`, least significant byte first.
-+ fn write_little_endian(to: *[u8], v: uint, bytes: uint) void
++ fn write_little_endian(v: uint, to: *[u8], bytes: uint) void
 ```
 
 ### cleanup_warning
@@ -991,8 +991,8 @@ Returns the items as a slice, in the order they were added.
     + fn equals_ignore_order(array: Array[T]) bool
     // Removes the elements for which `func` returns true and returns them in their original order.
     + fn extract(func: ?fn(T)(bool) (null)) Array[T]
-    // Creates an array holding `count` copies of `value`; backs `Array[T]{ value x count }`.
-    + static fn fill(count: uint, value: T) Array[T]
+    // Creates an array holding `amount` copies of `value`; backs `Array[T]{ value x amount }`.
+    + static fn fill(value: T, amount: uint) Array[T]
     // Returns a new array of the elements for which `func` returns true; this array is unchanged.
     + fn filter(func: ?fn(T)(bool) (null)) Array[T]
     // Returns the first element for which `func` returns true.
@@ -1172,7 +1172,7 @@ Follows the same rules as `remove_where`, including the default without `func`.
 
 #### fill
 
-Creates an array holding `count` copies of `value`; backs `Array[T]{ value x count }`.
+Creates an array holding `amount` copies of `value`; backs `Array[T]{ value x amount }`.
 
 For a reference type every slot holds the same object, not a copy.
 
@@ -3993,10 +3993,10 @@ Throws `write` when the child closed its end, for example because it exited, and
     + fn octal_to_int() int !SyntaxError
     // Parses the string as an octal unsigned integer: optional `+`, optional `0c`, digits.
     + fn octal_to_uint() uint !SyntaxError
-    // Returns the string prefixed with the byte `char` until it is `length` bytes long.
-    + fn pad_left(char: u8, length: uint) String
-    // Returns the string followed by the byte `char` until it is `length` bytes long.
-    + fn pad_right(char: u8, length: uint) String
+    // Returns the string prefixed with the byte `char` (space by default) until it is `length` bytes long.
+    + fn pad_left(length: uint, char: u8 (' ')) String
+    // Returns the string followed by the byte `char` (space by default) until it is `length` bytes long.
+    + fn pad_right(length: uint, char: u8 (' ')) String
     // Returns `len` random bytes, each drawn uniformly from the bytes of `characters`.
     + static fn random(len: uint, characters: String ("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")) String
     // Returns a substring of `length` bytes from `start_index`; backs `str[start .. length]`.
@@ -4345,14 +4345,14 @@ prefix (`-` included) or on overflow.
 
 #### pad_left
 
-Returns the string prefixed with the byte `char` until it is `length` bytes long.
+Returns the string prefixed with the byte `char` (space by default) until it is `length` bytes long.
 
 A string already at least `length` bytes long is returned unchanged. Lengths count
 bytes, not characters.
 
 #### pad_right
 
-Returns the string followed by the byte `char` until it is `length` bytes long.
+Returns the string followed by the byte `char` (space by default) until it is `length` bytes long.
 
 A string already at least `length` bytes long is returned unchanged. Lengths count
 bytes, not characters.
@@ -5221,7 +5221,7 @@ The text is built on the stack, so nothing is allocated. Throws when `out` fails
     // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: i16) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
-    + fn to_base_in(buf: local mut &[u8], base: i16, lowercase: bool (false)) uint
+    + fn to_base_in(base: i16, buf: local mut &[u8], lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i16, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -5418,7 +5418,7 @@ u32.write_little_endian(0x01020304, &buf)
     // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: i32) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
-    + fn to_base_in(buf: local mut &[u8], base: i32, lowercase: bool (false)) uint
+    + fn to_base_in(base: i32, buf: local mut &[u8], lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i32, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -5615,7 +5615,7 @@ u32.write_little_endian(0x01020304, &buf)
     // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: i64) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
-    + fn to_base_in(buf: local mut &[u8], base: i64, lowercase: bool (false)) uint
+    + fn to_base_in(base: i64, buf: local mut &[u8], lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i64, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -5812,7 +5812,7 @@ u32.write_little_endian(0x01020304, &buf)
     // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: i8) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
-    + fn to_base_in(buf: local mut &[u8], base: i8, lowercase: bool (false)) uint
+    + fn to_base_in(base: i8, buf: local mut &[u8], lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i8, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -6009,7 +6009,7 @@ u32.write_little_endian(0x01020304, &buf)
     // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: int) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
-    + fn to_base_in(buf: local mut &[u8], base: int, lowercase: bool (false)) uint
+    + fn to_base_in(base: int, buf: local mut &[u8], lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: int, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -6669,7 +6669,7 @@ Writes `v` as `size_of(uint)` little-endian bytes to this address.
     // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: u16) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
-    + fn to_base_in(buf: local mut &[u8], base: u16, lowercase: bool (false)) uint
+    + fn to_base_in(base: u16, buf: local mut &[u8], lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u16, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -6866,7 +6866,7 @@ u32.write_little_endian(0x01020304, &buf)
     // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: u32) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
-    + fn to_base_in(buf: local mut &[u8], base: u32, lowercase: bool (false)) uint
+    + fn to_base_in(base: u32, buf: local mut &[u8], lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u32, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -7065,7 +7065,7 @@ u32.write_little_endian(0x01020304, &buf)
     // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: u64) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
-    + fn to_base_in(buf: local mut &[u8], base: u64, lowercase: bool (false)) uint
+    + fn to_base_in(base: u64, buf: local mut &[u8], lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u64, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -7298,7 +7298,7 @@ u32.write_little_endian(0x01020304, &buf)
     // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: u8) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
-    + fn to_base_in(buf: local mut &[u8], base: u8, lowercase: bool (false)) uint
+    + fn to_base_in(base: u8, buf: local mut &[u8], lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u8, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -7575,7 +7575,7 @@ u32.write_little_endian(0x01020304, &buf)
     // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: uint) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
-    + fn to_base_in(buf: local mut &[u8], base: uint, lowercase: bool (false)) uint
+    + fn to_base_in(base: uint, buf: local mut &[u8], lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: uint, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -7933,7 +7933,7 @@ verifies any salt length, so signatures made with the largest salt (Python's
 // Returns `data` encoded as URL-safe base64 (`-` and `_`) without `=` padding, the form JWT, JWK and WebAuthn use.
 + fn base64url_encode(data: local &[u8]) String
 // Computes the bcrypt hash of `password` with the given `cost` and `salt` into `output`.
-+ fn bcrypt(cost: uint, salt: local &[u8], password: local &[u8], output: ByteBuffer) void !CryptoError
++ fn bcrypt(password: local &[u8], salt: local &[u8], cost: uint, output: ByteBuffer) void !CryptoError
 // Hashes `password` with bcrypt and a fresh random salt, for storing credentials.
 + fn bcrypt_hash(password: local &[u8], cost: uint (12)) String !CryptoError
 // Returns whether `password` matches the bcrypt `hash` string.
@@ -7943,7 +7943,7 @@ verifies any salt length, so signatures made with the largest salt (Python's
 // Returns whether `a` and `b` hold the same bytes, in time that depends only on their length.
 + fn constant_time_equals(a: local &[u8], b: local &[u8]) bool
 // Decrypts `ciphertext`, as returned by `encrypt`, with the same `key`, `nonce` and `aad`.
-+ fn decrypt(cipher: Cipher, key: local &[u8], nonce: local &[u8], ciphertext: local &[u8], aad: local &[u8] ("")) String !CipherError
++ fn decrypt(ciphertext: local &[u8], cipher: Cipher, key: local &[u8], nonce: local &[u8], aad: local &[u8] ("")) String !CipherError
 // Returns the digest size in bytes of `algorithm`.
 + fn digest_size(algorithm: HashAlgorithm) uint
 // Converts a fixed-size ECDSA signature (`r` and `s` side by side, as in JWT) into the DER form `verify` takes.
@@ -7951,19 +7951,19 @@ verifies any salt length, so signatures made with the largest salt (Python's
 // Converts a DER encoded ECDSA signature, as `sign` returns it, into the fixed-size form JWT and WebCrypto use: `r` and `s` side by side, each as long as the curve's size.
 + fn ecdsa_signature_to_raw(der: local &[u8], curve: Curve) String !KeyError
 // Encrypts `plaintext` with `key` and the 12-byte `nonce`, and returns the ciphertext with the 16-byte tag appended.
-+ fn encrypt(cipher: Cipher, key: local &[u8], nonce: local &[u8], plaintext: local &[u8], aad: local &[u8] ("")) String !CipherError
++ fn encrypt(plaintext: local &[u8], cipher: Cipher, key: local &[u8], nonce: local &[u8], aad: local &[u8] ("")) String !CipherError
 // Returns the raw digest of `data` as binary bytes (not text).
-+ fn hash(algorithm: HashAlgorithm, data: local &[u8]) String
++ fn hash(data: local &[u8], algorithm: HashAlgorithm) String
 // Returns the digest of `data` as lowercase hex.
-+ fn hash_hex(algorithm: HashAlgorithm, data: local &[u8]) String
++ fn hash_hex(data: local &[u8], algorithm: HashAlgorithm) String
 // Writes the digest of `data` as lowercase hex into `out` and returns the bytes written.
-+ fn hash_hex_in(algorithm: HashAlgorithm, data: local &[u8], out: local mut &[u8]) uint
++ fn hash_hex_in(data: local &[u8], algorithm: HashAlgorithm, out: local mut &[u8]) uint
 // Writes the digest of `data` as lowercase hex to `out` and returns the bytes written.
-+ fn hash_hex_into(algorithm: HashAlgorithm, data: local &[u8], out: Writer) uint !io:IoError
++ fn hash_hex_into(data: local &[u8], algorithm: HashAlgorithm, out: Writer) uint !io:IoError
 // Writes the raw digest of `data` into `out` and returns the bytes written.
-+ fn hash_in(algorithm: HashAlgorithm, data: local &[u8], out: local mut &[u8]) uint
++ fn hash_in(data: local &[u8], algorithm: HashAlgorithm, out: local mut &[u8]) uint
 // Writes the raw digest of `data` to `out` and returns the bytes written.
-+ fn hash_into(algorithm: HashAlgorithm, data: local &[u8], out: Writer) uint !io:IoError
++ fn hash_into(data: local &[u8], algorithm: HashAlgorithm, out: Writer) uint !io:IoError
 // Returns a fresh `Hasher` for `algorithm`.
 + fn hasher(algorithm: HashAlgorithm) Hasher
 // Decodes hex text (either case) into the raw bytes it represents.
@@ -7979,11 +7979,11 @@ verifies any salt length, so signatures made with the largest salt (Python's
 // Writes `data` as lowercase hex to `out` and returns the bytes written.
 + fn hex_encode_into(data: local &[u8], out: Writer) uint !io:IoError
 // Derives `length` bytes from `ikm` with HKDF (RFC 5869): extract with `salt`, expand with `info`.
-+ fn hkdf(algorithm: HashAlgorithm, ikm: local &[u8], salt: local &[u8], info: local &[u8], length: uint) String !CryptoError
++ fn hkdf(ikm: local &[u8], algorithm: HashAlgorithm, salt: local &[u8], info: local &[u8], length: uint) String !CryptoError
 // Returns `length` bytes of HKDF-Expand (RFC 5869) output from the pseudorandom key `prk`.
-+ fn hkdf_expand(algorithm: HashAlgorithm, prk: local &[u8], info: local &[u8], length: uint) String !CryptoError
++ fn hkdf_expand(prk: local &[u8], algorithm: HashAlgorithm, info: local &[u8], length: uint) String !CryptoError
 // Returns the HKDF-Extract (RFC 5869) pseudorandom key of `ikm` under `salt`.
-+ fn hkdf_extract(algorithm: HashAlgorithm, salt: local &[u8], ikm: local &[u8]) String
++ fn hkdf_extract(ikm: local &[u8], algorithm: HashAlgorithm, salt: local &[u8]) String
 // Returns the MD5 digest of `data` as lowercase hex.
 + fn md5_hex(data: local &[u8]) String
 // Writes the MD5 digest of `data` as hex into `out`; see `hash_hex_in`.
@@ -7991,7 +7991,7 @@ verifies any salt length, so signatures made with the largest salt (Python's
 // Writes the MD5 digest of `data` as lowercase hex to `out`; returns the bytes written.
 + fn md5_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 // Derives `length` bytes from `password` and `salt` with PBKDF2-HMAC (RFC 8018).
-+ fn pbkdf2(algorithm: HashAlgorithm, password: local &[u8], salt: local &[u8], iterations: uint, length: uint) String !CryptoError
++ fn pbkdf2(password: local &[u8], algorithm: HashAlgorithm, salt: local &[u8], iterations: uint, length: uint) String !CryptoError
 // Returns a string of `length` cryptographically secure random bytes.
 + fn random_bytes(length: uint) String
 // Fills all of `out` with cryptographically secure random bytes and returns its length.
@@ -7999,7 +7999,7 @@ verifies any salt length, so signatures made with the largest salt (Python's
 // Writes `length` cryptographically secure random bytes to `out`; returns the bytes written.
 + fn random_bytes_into(length: uint, out: Writer) uint !io:IoError
 // Encrypts `plaintext` with AES-256-GCM under the 32-byte `key` and a random nonce, and returns the nonce, ciphertext and tag together, ready for `unseal`.
-+ fn seal(key: local &[u8], plaintext: local &[u8], aad: local &[u8] ("")) String !CipherError
++ fn seal(plaintext: local &[u8], key: local &[u8], aad: local &[u8] ("")) String !CipherError
 // Returns the SHA-1 digest of `data` as lowercase hex.
 + fn sha1_hex(data: local &[u8]) String
 // Writes the SHA-1 digest of `data` as hex into `out`; see `hash_hex_in`.
@@ -8033,7 +8033,7 @@ verifies any salt length, so signatures made with the largest salt (Python's
 // Writes the SHA-512 digest of `data` as lowercase hex to `out`; returns the bytes written.
 + fn sha512_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 // Decrypts what `seal` returned, with the same `key` and `aad`.
-+ fn unseal(key: local &[u8], sealed: local &[u8], aad: local &[u8] ("")) String !CipherError
++ fn unseal(sealed: local &[u8], key: local &[u8], aad: local &[u8] ("")) String !CipherError
 // Overwrites every byte of `buf` with zero in a way the compiler will not optimize away.
 + fn zero_bytes(buf: local mut &[u8]) void
 ```
@@ -8553,13 +8553,13 @@ Feeds more input into the hash.
     // Discards all input and starts a new MAC with the same key.
     + fn reset() void
     // Returns the raw MAC of `data` under `key` as binary bytes (not text).
-    + static fn sign(algorithm: HashAlgorithm, key: local &[u8], data: local &[u8]) String
+    + static fn sign(data: local &[u8], algorithm: HashAlgorithm, key: local &[u8]) String
     // Returns the MAC of `data` under `key` as lowercase hex.
-    + static fn sign_hex(algorithm: HashAlgorithm, key: local &[u8], data: local &[u8]) String
+    + static fn sign_hex(data: local &[u8], algorithm: HashAlgorithm, key: local &[u8]) String
     // Feeds more input into the MAC.
     + fn update(data: local &[u8]) void
     // Returns whether `mac` is the raw MAC of `data` under `key`, compared in constant time.
-    + static fn verify(algorithm: HashAlgorithm, key: local &[u8], data: local &[u8], mac: local &[u8]) bool
+    + static fn verify(data: local &[u8], mac: local &[u8], algorithm: HashAlgorithm, key: local &[u8]) bool
 }
 ```
 
@@ -8687,7 +8687,7 @@ Feeds more input into the hash.
     // Returns the Ed25519 key whose 32-byte private seed is `seed`.
     + static fn from_ed25519_seed(seed: local &[u8]) PrivateKey !KeyError
     // Reads a PEM private key: PKCS#8 (`BEGIN PRIVATE KEY`, or `ENCRYPTED PRIVATE KEY` with `password`) or the older RSA and EC forms.
-    + static fn from_pem(pem: String, password: String ("")) PrivateKey !KeyError
+    + static fn from_pem(pem: String, password: ?String (null)) PrivateKey !KeyError
     // Generates an ECDSA key on `curve`.
     + static fn generate_ec(curve: Curve (Curve.p256)) PrivateKey !KeyError
     // Generates an Ed25519 key.
@@ -8699,7 +8699,7 @@ Feeds more input into the hash.
     // Returns the public half of the key.
     + fn public_key() PublicKey !KeyError
     // Signs `data` with `algorithm` and returns the signature.
-    + fn sign(algorithm: SignatureAlgorithm, data: local &[u8]) String !KeyError
+    + fn sign(data: local &[u8], algorithm: SignatureAlgorithm) String !KeyError
     // Returns the key as unencrypted PKCS#8 PEM text (`BEGIN PRIVATE KEY`).
     + fn to_pem() String !KeyError
 }
@@ -8796,7 +8796,7 @@ Returns the key as unencrypted PKCS#8 PEM text (`BEGIN PRIVATE KEY`).
     // Returns the key as PEM text (`BEGIN PUBLIC KEY`).
     + fn to_pem() String !KeyError
     // Returns whether `signature` is a valid signature of `data` by this key with `algorithm`.
-    + fn verify(algorithm: SignatureAlgorithm, data: local &[u8], signature: local &[u8]) bool
+    + fn verify(data: local &[u8], signature: local &[u8], algorithm: SignatureAlgorithm) bool
 }
 ```
 
@@ -10045,7 +10045,7 @@ How `open` treats the contents of a file it opens for writing.
 
 ```js
 // Joins `dir` and `fn` with exactly one separator between them.
-+ fn add(dir: String, fn: String) String
++ fn add(dir: String, part: String) String
 // Returns the last component of `path`, ignoring trailing separators.
 + fn basename(path: String) String
 // Changes the current working directory of the process to `path`.
@@ -10151,8 +10151,8 @@ Joins `dir` and `fn` with exactly one separator between them.
 Either platform's separator is recognized at the joint; a missing one is added as
 `PATH_DIV`. A run of separators at the joint is collapsed to one separator: `PATH_DIV`
 when the run holds it, otherwise the run's own last byte, so a run of the other kind
-comes through as written. An empty `dir` gives `fn` unchanged, and a `dir` of nothing but
-separators is kept whole so a root stays a root (`//` and `C:\` keep every separator
+comes through as written. An empty `dir` gives `part` unchanged, and a `dir` of nothing
+but separators is kept whole so a root stays a root (`//` and `C:\` keep every separator
 they have).
 
 ### basename
@@ -11386,7 +11386,7 @@ The kind of a WebSocket message.
 // Sends a DELETE request; see `request`.
 + fn delete(url: String, options: ?Options (null)) ClientResponse !HttpError
 // Sends a request and writes the response body to the file at `to_path`.
-+ fn download(url: String, to_path: String, method: String ("GET"), options: ?Options (null)) void !HttpError
++ fn download(url: String, to_path: String, options: ?Options (null), method: String ("GET")) void !HttpError
 // Returns `date` as an HTTP date: `Sun, 06 Nov 1994 08:49:37 GMT`.
 + fn format_date(date: DateTime) String
 // Sends a GET request; see `request`.
@@ -12460,8 +12460,8 @@ Returns an empty form with a random boundary.
     + fn clear_headers() void
     // Returns `headers`, creating an empty set first when it is `null`.
     + fn get_headers() Headers
-    // Sets the header `key` to `value`, replacing every existing value for that name.
-    + fn set_header(key: String, value: String) void
+    // Sets the header `name` to `value`, replacing every existing value for that name.
+    + fn set_header(name: String, value: String) void
     // Copies every header in `headers` into this request's headers.
     + fn set_headers(headers: Headers) void
 }
@@ -12665,7 +12665,7 @@ Returns `headers`, creating an empty set first when it is `null`.
 
 #### set_header
 
-Sets the header `key` to `value`, replacing every existing value for that name.
+Sets the header `name` to `value`, replacing every existing value for that name.
 
 #### set_headers
 
@@ -13027,11 +13027,11 @@ Trailing headers sent after the response body over HTTP/2 and HTTP/3, created em
     // Responds with status `code`, `content_type` and `body`.
     + fn send(body: local &[u8], code: u16 (200), content_type: String ("text/plain; charset=utf-8"), headers: ?Headers (null)) void
     // Responds with status `code` and the file at `path`; responds 404 when it cannot be opened.
-    + fn send_file(path: String, filename: ?String (null), headers: ?Headers (null), code: u16 (200)) void
+    + fn send_file(path: String, code: u16 (200), filename: ?String (null), headers: ?Headers (null)) void
     // Responds with `status_code` and an empty `text/plain` body.
     + fn send_status(status_code: u16) void
     // Responds with status `code` and a body streamed from `reader`.
-    + fn send_stream(reader: Reader, size: ?uint, content_type: String ("application/octet-stream"), filename: ?String (null), headers: ?Headers (null), code: u16 (200)) void
+    + fn send_stream(reader: Reader, size: ?uint (null), code: u16 (200), content_type: String ("application/octet-stream"), filename: ?String (null), headers: ?Headers (null)) void
     // Answers with the WebSocket upgrade and runs `handler` on the connection once the response is sent; the fast-handler form of `WebSocket.upgrade`.
     + fn send_websocket(context: Context, handler: fn(WebSocket)(), compression: ?bool (null), protocol: ?String (null), headers: ?Headers (null)) void
 }
@@ -13153,14 +13153,14 @@ missing leading `/` do not shift the values; missing parts are left out.
 ```js
 // Maps a method and a URL path to a handler of type `T`.
 + class Router[T] {
-    // Registers `handler` for `method` and the path pattern `url`.
-    + fn add(method: String, url: String, handler: T) void
-    // Returns the methods with a route for the path `url`, sorted.
-    + fn allowed_methods(url: String) Array[String]
+    // Registers `handler` for `method` and the path pattern `path`.
+    + fn add(method: String, path: String, handler: T) void
+    // Returns the methods with a route for `path`, sorted.
+    + fn allowed_methods(path: String) Array[String]
     // Returns an independent copy of the router and its routes.
     + fn clone() Router[T]
-    // Returns the route that matches `method` and the path `url`.
-    + fn find(method: String, url: String) Route[T] !LookupError
+    // Returns the route that matches `method` and `path`.
+    + fn find(method: String, path: String) Route[T] !LookupError
     // Creates an empty router; also backs `Router[T]{}` and default construction.
     + static fn new() Router[T]
 }
@@ -13185,7 +13185,7 @@ let id = route.param(req.path, "id") !? ""
 
 #### add
 
-Registers `handler` for `method` and the path pattern `url`.
+Registers `handler` for `method` and the path pattern `path`.
 
 The method is compared case-sensitively. A leading `/` is optional and empty
 parts are ignored. Adding the same pattern again replaces the handler; patterns
@@ -13194,7 +13194,7 @@ never reached by `find`.
 
 #### allowed_methods
 
-Returns the methods with a route for the path `url`, sorted.
+Returns the methods with a route for `path`, sorted.
 
 For a request whose method `find` did not match: an empty list means 404, anything
 else 405 with these methods in its `Allow` header.
@@ -13210,9 +13210,9 @@ Returns an independent copy of the router and its routes.
 
 #### find
 
-Returns the route that matches `method` and the path `url`.
+Returns the route that matches `method` and `path`.
 
-Throws `missing` when no route matches. `url` must not contain the query string.
+Throws `missing` when no route matches. `path` must not contain the query string.
 
 #### new
 
@@ -13276,8 +13276,8 @@ Creates an empty router; also backs `Router[T]{}` and default construction.
 
     // Wraps the handler in `middleware`, which runs for every request that reaches the handler.
     + fn add_middleware(middleware: atomic fn(Request, atomic fn(Request)(Response))(Response)) void
-    // Serves files from the directory `path` before a request reaches the handler.
-    + fn add_static_dir(path: String, index: String ("index.html"), prefix: String ("")) void !io:IoError
+    // Serves files from the directory `dir` under `route_prefix` before a request reaches the handler.
+    + fn add_static_dir(route_prefix: String, dir: String, index: ?String (null)) void !io:IoError
     // Sets a fast handler, which is used instead of the regular one.
     + fn fast(handler: atomic fn(Context, ResponseWriter)()) void
     // Sets the handler that answers each request.
@@ -13492,19 +13492,19 @@ server.add_middleware(fn(req: http.Request, next: atomic fn(http.Request)(http.R
 
 #### add_static_dir
 
-Serves files from the directory `path` before a request reaches the handler.
+Serves files from the directory `dir` under `route_prefix` before a request reaches the handler.
 
-Throws `open` when `path` is not a directory. A request whose path names a file
-inside the directory gets that file whatever the method (over HTTP/2 and HTTP/3: except
-`CONNECT`). With `prefix` (such as `"/static"`), only paths under that URL prefix
-are matched and the prefix is stripped before resolving inside `path`. The path is
-percent-decoded first (`+` stays `+`); paths containing `..` are never served. The
-directory added last is searched first.
+Throws `open` when `dir` is not a directory. Pass `""` or `"/"` for `route_prefix` to
+mount at the root, or a path such as `"/static"` to match only requests under that
+prefix (stripped before resolving inside `dir`). A request whose path names a file
+inside `dir` gets that file whatever the method (over HTTP/2 and HTTP/3: except
+`CONNECT`). The path is percent-decoded first (`+` stays `+`); paths containing `..`
+are never served. The directory added last is searched first.
 
-A path naming a directory that holds an `index` file gets that file, so `/` serves
-`index.html`. Without the trailing slash (`/docs`) the answer is a 301 redirect to
-`/docs/` first, so relative links in the page resolve inside the directory. Pass
-`index: ""` to let directory paths reach the handler.
+By default (`index: null`), directory paths fall through to the handler. Pass a
+filename such as `"index.html"` for `index` to serve that file for matching
+directories (redirecting `/docs` to `/docs/` with 301 first so relative links resolve
+inside the directory).
 
 Files are sent like `Response.file`: with `ETag` and `Last-Modified`, 304 for a
 current copy and 206 for a `Range`.
@@ -13587,7 +13587,7 @@ cannot be read.
     ~ protocol: String
 
     // Performs the closing handshake and closes the socket.
-    + fn close(code: u16 (1000), reason: String (""), timeout_ms: uint (1000)) void !WebSocketError
+    + fn close(code: u16 (1000), reason: ?String (null), timeout_ms: uint (1000)) void !WebSocketError
     // Connects to a `ws://` or `wss://` server and completes the opening handshake.
     + static fn connect(url: String, options: ?Options (null)) WebSocket !WebSocketError
     // Whether the connection is closed, from either side.
@@ -16058,7 +16058,7 @@ Returns `value` with its fractional part removed, rounding toward zero.
 // Returns the byte index of the first `ch` in `view`.
 + fn find_char(view: local &[u8], ch: u8) uint !LookupError
 // Returns the byte index of the first `ch` in the `length` bytes at `adr`.
-+ fn find_char_bytes(adr: ptr, ch: u8, length: uint) uint !LookupError
++ fn find_char_bytes(adr: ptr, length: uint, ch: u8) uint !LookupError
 // Releases memory obtained from `alloc`, `calloc`, `new` or `resize`.
 + fn free(value: ptr) void
 // Returns a number that names the object `object` points at: the same for one object, different for two that exist together. The number is not a reference: it keeps nothing alive, and it is only good for telling objects apart.
@@ -16253,23 +16253,23 @@ A TLS protocol version, for the minimum and maximum version settings.
 
 ```js
 // Queries DNS records of `record_type` for `name`.
-+ fn dns_lookup(name: String, record_type: DnsType, server: String (""), timeout_ms: uint (5000)) Array[DnsRecord] !NetError
++ fn dns_lookup(name: String, record_type: DnsType, server: ?String (null), timeout_ms: uint (5000)) Array[DnsRecord] !NetError
 // Looks up `CNAME` targets for `name`.
-+ fn lookup_cname(name: String, server: String (""), timeout_ms: uint (5000)) Array[String] !NetError
++ fn lookup_cname(name: String, server: ?String (null), timeout_ms: uint (5000)) Array[String] !NetError
 // Looks up `MX` records for `name`, sorted by ascending `priority`.
-+ fn lookup_mx(name: String, server: String (""), timeout_ms: uint (5000)) Array[DnsRecord] !NetError
++ fn lookup_mx(name: String, server: ?String (null), timeout_ms: uint (5000)) Array[DnsRecord] !NetError
 // Looks up `SRV` records for `name`, sorted by ascending `priority`.
-+ fn lookup_srv(name: String, server: String (""), timeout_ms: uint (5000)) Array[DnsRecord] !NetError
++ fn lookup_srv(name: String, server: ?String (null), timeout_ms: uint (5000)) Array[DnsRecord] !NetError
 // Looks up `TXT` records for `name` and returns each record's text value.
-+ fn lookup_txt(name: String, server: String (""), timeout_ms: uint (5000)) Array[String] !NetError
++ fn lookup_txt(name: String, server: ?String (null), timeout_ms: uint (5000)) Array[String] !NetError
 // Receives once from the socket `fd` into `buf` and returns the number of bytes read.
 + fn recv(fd: i32, buf: local mut &[u8], timeout_ms: uint (5000)) uint !io:IoError
 // Connects to a TCP server; the same as `TcpConnection.new`.
-+ fn tcp_client(host: String, port: u16, timeout_ms: uint (5000), local_port: u16 (0), local_host: String ("")) TcpConnection !NetError
++ fn tcp_client(host: String, port: u16, timeout_ms: uint (5000), local_host: ?String (null), local_port: u16 (0)) TcpConnection !NetError
 // Opens a listening TCP socket; the same as `TcpServer.new`.
 + fn tcp_server(host: String, port: u16, timeout_ms: uint (5000), reuse_port: bool (false)) atomic TcpServer !NetError
 // Opens a UDP socket that talks to one server; the same as `UdpClient.new`.
-+ fn udp_client(host: String, port: u16, timeout_ms: uint (5000), local_port: u16 (0), local_host: String ("")) UdpClient !NetError
++ fn udp_client(host: String, port: u16, timeout_ms: uint (5000), local_host: ?String (null), local_port: u16 (0)) UdpClient !NetError
 // Binds a UDP socket to your own address; the same as `UdpServer.new`.
 + fn udp_server(host: String, port: u16, timeout_ms: uint (5000), reuse_address: bool (false)) UdpServer !NetError
 // Connects to a Unix domain stream socket at `path`.
@@ -16284,7 +16284,7 @@ A TLS protocol version, for the minimum and maximum version settings.
 
 Queries DNS records of `record_type` for `name`.
 
-When `server` is empty, reads the system nameserver from `/etc/resolv.conf` on Unix (falling
+When `server` is `null`, reads the system nameserver from `/etc/resolv.conf` on Unix (falling
 back to `1.1.1.1:53`). Pass `"host"` or `"host:port"` (or `"[::1]:5353"`) to query a
 specific resolver. Sends a UDP query and automatically retries over TCP if the server sets
 the truncation (`TC`) flag. Throws `invalid_host` when `name` is invalid or `NXDOMAIN`,
@@ -16806,7 +16806,7 @@ Writes `to_string()` into `buf` and returns the byte count.
     // Trusts the CA directory `dir` (OpenSSL `c_rehash` layout) and stores it as `cert_dir`.
     + fn set_ca_cert_dir(dir: ?String) void !NetError
     // Presents a certificate to the server during the handshake, for servers that ask clients to prove who they are (mutual TLS).
-    + fn set_certificate(certificate_file: String, private_key_file: String, password: String ("")) void !NetError
+    + fn set_certificate(certificate_file: String, private_key_file: String, password: ?String (null)) void !NetError
     // Sets the TLS 1.2 and older ciphers as an OpenSSL cipher string.
     + fn set_cipher_list(ciphers: String) void !NetError
     // Sets the TLS 1.3 cipher suites as colon-separated names.
@@ -17099,7 +17099,7 @@ the file.
     // Returns the address of this end of the connection.
     + fn local_address() SocketAddress !NetError
     // Resolves `host` and connects to it and `port` over TCP; also `net.tcp_client`.
-    + static fn new(host: String, port: u16, timeout_ms: uint (5000), local_port: u16 (0), local_host: String ("")) TcpConnection !NetError
+    + static fn new(host: String, port: u16, timeout_ms: uint (5000), local_host: ?String (null), local_port: u16 (0)) TcpConnection !NetError
     // Returns the address of the peer.
     + fn peer_address() SocketAddress !NetError
     // Reads up to `buf.length` bytes into `buf` and returns the count.
@@ -17183,7 +17183,7 @@ Resolves `host` and connects to it and `port` over TCP; also `net.tcp_client`.
 
 `timeout_ms` covers the lookup and the connect together; 0 waits without limit. The
 connection's `host` is set to `host`, which `ssl_connect` uses as the TLS server
-name. `local_port` and `local_host` bind the connection's own end; 0 and `""` (the
+name. `local_host` and `local_port` bind the connection's own end; `null` and 0 (the
 defaults) let the system choose. Throws `invalid_host`, `timeout`, `init`,
 `port_in_use` or `access` when the local end cannot be bound, and `connect`.
 
@@ -17359,7 +17359,7 @@ listening fails for another reason.
     // Returns the local address the system bound this socket to.
     + fn local_address() SocketAddress !NetError
     // Opens a socket to the server at `host` and `port`; also `net.udp_client`.
-    + static fn new(host: String, port: u16, timeout_ms: uint (5000), local_port: u16 (0), local_host: String ("")) UdpClient !NetError
+    + static fn new(host: String, port: u16, timeout_ms: uint (5000), local_host: ?String (null), local_port: u16 (0)) UdpClient !NetError
     // Returns the server's address.
     + fn peer_address() SocketAddress !NetError
     // Receives one datagram from the server into `buf` and returns its byte count.
@@ -17422,7 +17422,7 @@ Throws `closed` after `close` and `os` when the system cannot report it.
 
 Opens a socket to the server at `host` and `port`; also `net.udp_client`.
 
-`local_port` and `local_host` bind the socket's own end; 0 and `""` (the defaults)
+`local_host` and `local_port` bind the socket's own end; `null` and 0 (the defaults)
 let the system choose (see `local_address`). Nothing is sent yet: the first `write`
 shows whether anyone listens, and even that only when the network reports it. Throws
 `invalid_host` or `timeout` when resolving fails, `init` when the socket cannot be
@@ -17886,7 +17886,7 @@ Restarts the sequence as if the generator was created with `seed`.
 // Returns `text` with every regex metacharacter escaped, so the result matches `text` literally.
 + fn escape(text: String) String
 // Returns whether `pattern` matches anywhere in `text`, compiling the pattern on every call.
-+ fn is_match(pattern: String, text: String) bool !RegexError
++ fn is_match(text: String, pattern: String) bool !RegexError
 ```
 
 ### escape
@@ -19646,9 +19646,9 @@ Throws `invalid` when the data is malformed.
     // Returns the most bytes `format(pattern)` can write for any date.
     + static fn format_size(pattern: String) uint
     // Parses `value` laid out by `pattern`, using the tokens of `format`.
-    + static fn from_format(pattern: String, value: String) DateTime !SyntaxError
+    + static fn from_format(value: String, pattern: String) DateTime !SyntaxError
     // Parses `value` laid out by `pattern` as wall-clock time in `zone`; see `from_format` and, for times around a daylight saving change, `new_in`. An offset in the value wins over `zone`.
-    + static fn from_format_in(zone: Zone, pattern: String, value: String) DateTime !SyntaxError
+    + static fn from_format_in(value: String, pattern: String, zone: Zone) DateTime !SyntaxError
     // Parses ISO 8601 text as written by `to_iso8601`, such as `2024-03-05T14:07:09Z`, `2024-03-05 15:07:09.25+01:00` or `2024-03-05`.
     + static fn from_iso8601(value: String) DateTime !SyntaxError
     // Reads a DateTime from a JSON string in ISO 8601 form (see `from_iso8601`).

@@ -4,7 +4,9 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.9.4
+- Release 0.10.0
++ Breaking (stdlib API): standardized argument order (`input` → `essential spec` → `target/out` → `remaining required` → `optional by frequency`), parameter names, and `?String (null)` optional defaults across `core` (`Array.fill`, `to_base_in`, `write_big_endian`/`write_little_endian`, `String.pad_left`/`pad_right` with default `' '`, `panic`), `mem` (`find_char_bytes`), `compress` (`compress_into`, `decompress_into`), `crypto` (`encrypt`/`decrypt`, `seal`/`unseal`, `hash*`, `Hmac.sign*`/`verify`, `PrivateKey.from_pem`/`sign`, `PublicKey.verify`, `pbkdf2`, `hkdf*`, `bcrypt`), `fs` (`add`), `http` (`Server.add_static_dir(route_prefix, dir, index: ?String (null))`, `download`, `ResponseWriter.send_file`/`send_stream`, `Router.add`/`find`/`allowed_methods`, `Options.set_header`, `WebSocket.close`), `net` (`tcp_client`/`udp_client`/`TcpConnection.new`/`UdpClient.new`, `dns_lookup`/`lookup_*`, `Ssl.set_certificate`), `regex` (`is_match`), and `time` (`DateTime.from_format`/`from_format_in`)
++ Docs: documented the standard library API argument-order, naming, and nullable-default conventions in `docs/guidelines.md`
 
 + Release 0.9.3
 + HTTP/3 & QUIC: replaced the OpenSSL QUIC server transport with a pure-Valk QUIC v1 engine over OpenSSL 3.5 `SSL_set_quic_tls_cbs` and `libcrypto` AEAD (UDP GSO/GRO, CUBIC congestion control, DPLPMTUD, PTO retransmit, Version Negotiation, stateless reset, and 3xPTO closing/draining state), delivering ~10x higher HTTP/3 throughput with flat memory usage; added automatic `Alt-Svc` header advertisement (`Server.alt_svc`), `curl --http3-only` + `h2load` interop tests, RFC 9114 `GOAWAY`/`Expect: 100-continue`/coroutine-safe trailer fixes, and faster `H3Client` event loop (4.6x sequential / +35% multiplexed throughput)
