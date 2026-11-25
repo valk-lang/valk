@@ -417,12 +417,20 @@ How `Process.start` connects one standard stream of a child.
 + fn exit(code: i32) void
 // Formats floating-point `value` using format specifier `spec` (e.g. `".2f"`, `"08.2f"`, `".3e"`).
 + fn format_float(value: f64, spec: String) String !SyntaxError
+// Formats floating-point `value` using format specifier `spec` to `out` and returns the bytes written.
++ fn format_float_into(value: f64, spec: String, out: Writer) uint !FormatError
 // Formats signed integer `value` using format specifier `spec` (e.g. `"05"`, `"#06x"`, `"+>8"`).
 + fn format_int(value: int, spec: String) String !SyntaxError
+// Formats signed integer `value` using format specifier `spec` to `out` and returns the bytes written.
++ fn format_int_into(value: int, spec: String, out: Writer) uint !FormatError
 // Formats string `value` using format specifier `spec` (e.g. `">10"`, `"*^12"`, `".5"`).
 + fn format_string(value: String, spec: String) String !SyntaxError
+// Formats string `value` using format specifier `spec` to `out` and returns the bytes written.
++ fn format_string_into(value: String, spec: String, out: Writer) uint !FormatError
 // Formats unsigned integer `value` using format specifier `spec` (e.g. `"05"`, `"#08x"`, `"b"`).
 + fn format_uint(value: uint, spec: String) String !SyntaxError
+// Formats unsigned integer `value` using format specifier `spec` to `out` and returns the bytes written.
++ fn format_uint_into(value: uint, spec: String, out: Writer) uint !FormatError
 // Returns the value of the environment variable `var`.
 + fn getenv(var: String) String !LookupError
 // Returns the host name of this machine.
@@ -528,11 +536,23 @@ Formats floating-point `value` using format specifier `spec` (e.g. `".2f"`, `"08
 
 Throws `invalid` when `spec` is not a valid float format specifier.
 
+### format_float_into
+
+Formats floating-point `value` using format specifier `spec` to `out` and returns the bytes written.
+
+Throws `syntax` for an invalid specifier and `io` when `out` fails.
+
 ### format_int
 
 Formats signed integer `value` using format specifier `spec` (e.g. `"05"`, `"#06x"`, `"+>8"`).
 
 Throws `invalid` when `spec` is not a valid integer format specifier.
+
+### format_int_into
+
+Formats signed integer `value` using format specifier `spec` to `out` and returns the bytes written.
+
+Throws `syntax` for an invalid specifier and `io` when `out` fails.
 
 ### format_string
 
@@ -540,11 +560,23 @@ Formats string `value` using format specifier `spec` (e.g. `">10"`, `"*^12"`, `"
 
 Throws `invalid` when `spec` is not a valid string format specifier.
 
+### format_string_into
+
+Formats string `value` using format specifier `spec` to `out` and returns the bytes written.
+
+Throws `syntax` for an invalid specifier and `io` when `out` fails.
+
 ### format_uint
 
 Formats unsigned integer `value` using format specifier `spec` (e.g. `"05"`, `"#08x"`, `"b"`).
 
 Throws `invalid` when `spec` is not a valid integer format specifier.
+
+### format_uint_into
+
+Formats unsigned integer `value` using format specifier `spec` to `out` and returns the bytes written.
+
+Throws `syntax` for an invalid specifier and `io` when `out` fails.
 
 ### getenv
 
@@ -1027,6 +1059,8 @@ Returns the items as a slice, in the order they were added.
     + fn items() *[T]
     // Converts each element to a `String` and joins them with `divider` between each pair.
     + fn join(divider: String) String
+    // Writes each element converted to `String` separated by `divider` to `out` and returns the bytes written.
+    + fn join_into(divider: String, out: Writer) uint !io:IoError
     // Returns the last element without removing it.
     + fn last() T !LookupError
     // Returns a new array holding `func` applied to each element, in order.
@@ -1263,6 +1297,12 @@ it skip the bounds and presence checks of `[]`.
 #### join
 
 Converts each element to a `String` and joins them with `divider` between each pair.
+
+Null elements are skipped and get no divider.
+
+#### join_into
+
+Writes each element converted to `String` separated by `divider` to `out` and returns the bytes written.
 
 Null elements are skipped and get no divider.
 
@@ -2970,6 +3010,20 @@ Reorders the entries so iteration, `keys` and `values` follow ascending key orde
 #### values
 
 Returns a new array of the values, in entry order.
+
+```js
+// Thrown by `format_*_into`: `syntax` for an invalid format specifier, `io` when writing fails.
++ union FormatError {
+    syntax
+    io(IoError) $auto
+
+    + fn to_string() String
+}
+```
+
+### FormatError
+
+Thrown by `format_*_into`: `syntax` for an invalid format specifier, `io` when writing fails.
 
 ```js
 // A general-purpose error with the single variant `error`.
@@ -7910,6 +7964,12 @@ verifies any salt length, so signatures made with the largest salt (Python's
 + fn argon2id(password: local &[u8], salt: local &[u8], memory_kib: uint (65536), iterations: uint (3), parallelism: uint (1), length: uint (32)) String !CryptoError
 // Hashes `password` with Argon2id and a fresh 16-byte random salt in PHC string format.
 + fn argon2id_hash(password: local &[u8], memory_kib: uint (19456), iterations: uint (2), parallelism: uint (1)) String !CryptoError
+// Hashes `password` with Argon2id in PHC string format to `out` and returns the bytes written.
++ fn argon2id_hash_into(password: local &[u8], out: Writer, memory_kib: uint (19456), iterations: uint (2), parallelism: uint (1)) uint !CryptoError
+// Derives `length` raw bytes using Argon2id into `out` and returns `length`.
++ fn argon2id_in(password: local &[u8], salt: local &[u8], out: local mut &[u8], memory_kib: uint (65536), iterations: uint (3), parallelism: uint (1), length: uint (32)) uint !CryptoError
+// Derives `length` raw bytes using Argon2id to `out` and returns `length`.
++ fn argon2id_into(password: local &[u8], salt: local &[u8], out: Writer, memory_kib: uint (65536), iterations: uint (3), parallelism: uint (1), length: uint (32)) uint !CryptoError
 // Returns whether `password` matches an Argon2id PHC string (`$argon2id$v=19$...`).
 + fn argon2id_verify(password: local &[u8], encoded: local &[u8]) bool
 // Decodes standard base64 (`+` and `/`) into the raw bytes it represents.
@@ -7932,8 +7992,16 @@ verifies any salt length, so signatures made with the largest salt (Python's
 + fn base64url_decode(text: local &[u8]) String !CryptoError
 // Decodes URL-safe base64 into `out` and returns the bytes written, like `base64url_decode` without allocating.
 + fn base64url_decode_in(text: local &[u8], out: local mut &[u8]) uint !CryptoError
+// Decodes URL-safe base64 to `out` and returns the bytes written.
++ fn base64url_decode_into(text: local &[u8], out: Writer) uint !CryptoError
 // Returns `data` encoded as URL-safe base64 (`-` and `_`) without `=` padding, the form JWT, JWK and WebAuthn use.
 + fn base64url_encode(data: local &[u8]) String
+// Writes `data` encoded as URL-safe base64 (`-` and `_`) without `=` padding into `out` and returns the bytes written.
++ fn base64url_encode_in(data: local &[u8], out: local mut &[u8]) uint
+// Writes `data` encoded as URL-safe base64 without `=` padding to `out` and returns the bytes written.
++ fn base64url_encode_into(data: local &[u8], out: Writer) uint !io:IoError
+// Returns the number of URL-safe unpadded base64 characters that encode `length` bytes.
++ fn base64url_encoded_size(length: uint) uint
 // Computes the 60-character `$2a$` bcrypt hash of `password` with the given `salt` and `cost`.
 + fn bcrypt(password: local &[u8], salt: local &[u8], cost: uint) String !CryptoError
 // Hashes `password` with bcrypt and a fresh random salt, for storing credentials.
@@ -7992,8 +8060,20 @@ verifies any salt length, so signatures made with the largest salt (Python's
 + fn hkdf(ikm: local &[u8], algorithm: HashAlgorithm, salt: local &[u8], info: local &[u8], length: uint) String !CryptoError
 // Returns `length` bytes of HKDF-Expand (RFC 5869) output from the pseudorandom key `prk`.
 + fn hkdf_expand(prk: local &[u8], algorithm: HashAlgorithm, info: local &[u8], length: uint) String !CryptoError
+// Writes `length` bytes of HKDF-Expand output into `out` and returns `length`.
++ fn hkdf_expand_in(prk: local &[u8], algorithm: HashAlgorithm, info: local &[u8], out: local mut &[u8], length: uint) uint !CryptoError
+// Writes `length` bytes of HKDF-Expand output to `out` and returns `length`.
++ fn hkdf_expand_into(prk: local &[u8], algorithm: HashAlgorithm, info: local &[u8], out: Writer, length: uint) uint !CryptoError
 // Returns the HKDF-Extract (RFC 5869) pseudorandom key of `ikm` under `salt`.
 + fn hkdf_extract(ikm: local &[u8], algorithm: HashAlgorithm, salt: local &[u8]) String
+// Writes the HKDF-Extract pseudorandom key of `ikm` under `salt` into `out` and returns its size.
++ fn hkdf_extract_in(ikm: local &[u8], algorithm: HashAlgorithm, salt: local &[u8], out: local mut &[u8]) uint
+// Writes the HKDF-Extract pseudorandom key of `ikm` under `salt` to `out` and returns its size.
++ fn hkdf_extract_into(ikm: local &[u8], algorithm: HashAlgorithm, salt: local &[u8], out: Writer) uint !io:IoError
+// Derives `length` bytes from `ikm` with HKDF into `out` and returns `length`.
++ fn hkdf_in(ikm: local &[u8], algorithm: HashAlgorithm, salt: local &[u8], info: local &[u8], out: local mut &[u8], length: uint) uint !CryptoError
+// Derives `length` bytes from `ikm` with HKDF to `out` and returns `length`.
++ fn hkdf_into(ikm: local &[u8], algorithm: HashAlgorithm, salt: local &[u8], info: local &[u8], out: Writer, length: uint) uint !CryptoError
 // Returns the MD5 digest of `data` as lowercase hex.
 + fn md5_hex(data: local &[u8]) String
 // Writes the MD5 digest of `data` as hex into `out`; see `hash_hex_in`.
@@ -8002,6 +8082,10 @@ verifies any salt length, so signatures made with the largest salt (Python's
 + fn md5_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 // Derives `length` bytes from `password` and `salt` with PBKDF2-HMAC (RFC 8018).
 + fn pbkdf2(password: local &[u8], algorithm: HashAlgorithm, salt: local &[u8], iterations: uint, length: uint) String !CryptoError
+// Derives `length` bytes with PBKDF2-HMAC into `out` and returns `length`.
++ fn pbkdf2_in(password: local &[u8], algorithm: HashAlgorithm, salt: local &[u8], iterations: uint, out: local mut &[u8], length: uint) uint !CryptoError
+// Derives `length` bytes with PBKDF2-HMAC to `out` and returns `length`.
++ fn pbkdf2_into(password: local &[u8], algorithm: HashAlgorithm, salt: local &[u8], iterations: uint, out: Writer, length: uint) uint !CryptoError
 // Returns a string of `length` cryptographically secure random bytes.
 + fn random_bytes(length: uint) String
 // Fills all of `out` with cryptographically secure random bytes and returns its length.
@@ -8032,10 +8116,26 @@ verifies any salt length, so signatures made with the largest salt (Python's
 + fn sha3_256(data: local &[u8]) String
 // Returns the SHA3-256 digest of `data` as 64 lowercase hex characters.
 + fn sha3_256_hex(data: local &[u8]) String
+// Writes the SHA3-256 digest of `data` as 64 lowercase hex characters into `out` and returns 64.
++ fn sha3_256_hex_in(data: local &[u8], out: local mut &[u8]) uint
+// Writes the SHA3-256 digest of `data` as 64 lowercase hex characters to `out` and returns 64.
++ fn sha3_256_hex_into(data: local &[u8], out: Writer) uint !io:IoError
+// Writes the raw 32-byte SHA3-256 digest of `data` into `out` and returns 32.
++ fn sha3_256_in(data: local &[u8], out: local mut &[u8]) uint
+// Writes the raw 32-byte SHA3-256 digest of `data` to `out` and returns 32.
++ fn sha3_256_into(data: local &[u8], out: Writer) uint !io:IoError
 // Returns the raw 64-byte SHA3-512 digest of `data`.
 + fn sha3_512(data: local &[u8]) String
 // Returns the SHA3-512 digest of `data` as 128 lowercase hex characters.
 + fn sha3_512_hex(data: local &[u8]) String
+// Writes the SHA3-512 digest of `data` as 128 lowercase hex characters into `out` and returns 128.
++ fn sha3_512_hex_in(data: local &[u8], out: local mut &[u8]) uint
+// Writes the SHA3-512 digest of `data` as 128 lowercase hex characters to `out` and returns 128.
++ fn sha3_512_hex_into(data: local &[u8], out: Writer) uint !io:IoError
+// Writes the raw 64-byte SHA3-512 digest of `data` into `out` and returns 64.
++ fn sha3_512_in(data: local &[u8], out: local mut &[u8]) uint
+// Writes the raw 64-byte SHA3-512 digest of `data` to `out` and returns 64.
++ fn sha3_512_into(data: local &[u8], out: Writer) uint !io:IoError
 // Returns the SHA-512 digest of `data` as lowercase hex.
 + fn sha512_hex(data: local &[u8]) String
 // Writes the SHA-512 digest of `data` as hex into `out`; see `hash_hex_in`.
@@ -8063,6 +8163,25 @@ Hashes `password` with Argon2id and a fresh 16-byte random salt in PHC string fo
 Defaults follow OWASP recommendations (`memory_kib: 19456` = 19 MiB, `iterations: 2`,
 `parallelism: 1`). Verify passwords against the returned `$argon2id$v=19$...` string
 with `argon2id_verify`.
+
+### argon2id_hash_into
+
+Hashes `password` with Argon2id in PHC string format to `out` and returns the bytes written.
+
+Throws `invalid_input` on invalid parameters and `write` when `out` fails.
+
+### argon2id_in
+
+Derives `length` raw bytes using Argon2id into `out` and returns `length`.
+
+`out` must hold at least `length` bytes; a shorter buffer panics. Throws `invalid_input`
+on invalid parameters.
+
+### argon2id_into
+
+Derives `length` raw bytes using Argon2id to `out` and returns `length`.
+
+Throws `invalid_input` on invalid parameters and `write` when `out` fails.
 
 ### argon2id_verify
 
@@ -8132,10 +8251,31 @@ without allocating.
 
 `out` must hold at least `base64_decoded_size(text.length)` bytes; a shorter buffer panics.
 
+### base64url_decode_into
+
+Decodes URL-safe base64 to `out` and returns the bytes written.
+
+Throws `invalid_input` on invalid input and `write` when `out` fails.
+
 ### base64url_encode
 
 Returns `data` encoded as URL-safe base64 (`-` and `_`) without `=` padding, the form JWT,
 JWK and WebAuthn use.
+
+### base64url_encode_in
+
+Writes `data` encoded as URL-safe base64 (`-` and `_`) without `=` padding into `out` and
+returns the bytes written.
+
+`out` must hold at least `base64url_encoded_size(data.length)` bytes; a shorter buffer panics.
+
+### base64url_encode_into
+
+Writes `data` encoded as URL-safe base64 without `=` padding to `out` and returns the bytes written.
+
+### base64url_encoded_size
+
+Returns the number of URL-safe unpadded base64 characters that encode `length` bytes.
 
 ### bcrypt
 
@@ -8314,11 +8454,49 @@ Returns `length` bytes of HKDF-Expand (RFC 5869) output from the pseudorandom ke
 
 Throws `invalid_input` when `length` is zero or more than 255 digests long.
 
+### hkdf_expand_in
+
+Writes `length` bytes of HKDF-Expand output into `out` and returns `length`.
+
+`out` must hold at least `length` bytes; a shorter buffer panics. Throws `invalid_input`
+when `length` is zero or more than 255 digests long.
+
+### hkdf_expand_into
+
+Writes `length` bytes of HKDF-Expand output to `out` and returns `length`.
+
+Throws `invalid_input` when `length` is zero or more than 255 digests long, and `write`
+when `out` fails.
+
 ### hkdf_extract
 
 Returns the HKDF-Extract (RFC 5869) pseudorandom key of `ikm` under `salt`.
 
 An empty `salt` is allowed. The result is raw bytes, one digest long.
+
+### hkdf_extract_in
+
+Writes the HKDF-Extract pseudorandom key of `ikm` under `salt` into `out` and returns its size.
+
+`out` must hold at least `digest_size(algorithm)` bytes; a shorter buffer panics.
+
+### hkdf_extract_into
+
+Writes the HKDF-Extract pseudorandom key of `ikm` under `salt` to `out` and returns its size.
+
+### hkdf_in
+
+Derives `length` bytes from `ikm` with HKDF into `out` and returns `length`.
+
+`out` must hold at least `length` bytes; a shorter buffer panics. Throws `invalid_input`
+when `length` is zero or more than 255 digests long.
+
+### hkdf_into
+
+Derives `length` bytes from `ikm` with HKDF to `out` and returns `length`.
+
+Throws `invalid_input` when `length` is zero or more than 255 digests long, and `write`
+when `out` fails.
 
 ### md5_hex
 
@@ -8338,6 +8516,19 @@ Derives `length` bytes from `password` and `salt` with PBKDF2-HMAC (RFC 8018).
 
 Throws `invalid_input` when `iterations` or `length` is zero. For storing passwords
 prefer `bcrypt_hash`; PBKDF2 is for interoperability and for turning a password into a key.
+
+### pbkdf2_in
+
+Derives `length` bytes with PBKDF2-HMAC into `out` and returns `length`.
+
+`out` must hold at least `length` bytes; a shorter buffer panics. Throws `invalid_input`
+when `iterations` or `length` is zero.
+
+### pbkdf2_into
+
+Derives `length` bytes with PBKDF2-HMAC to `out` and returns `length`.
+
+Throws `invalid_input` when `iterations` or `length` is zero, and `write` when `out` fails.
 
 ### random_bytes
 
@@ -8410,6 +8601,26 @@ Returns the raw 32-byte SHA3-256 digest of `data`.
 
 Returns the SHA3-256 digest of `data` as 64 lowercase hex characters.
 
+### sha3_256_hex_in
+
+Writes the SHA3-256 digest of `data` as 64 lowercase hex characters into `out` and returns 64.
+
+`out` must hold at least 64 bytes; a shorter buffer panics.
+
+### sha3_256_hex_into
+
+Writes the SHA3-256 digest of `data` as 64 lowercase hex characters to `out` and returns 64.
+
+### sha3_256_in
+
+Writes the raw 32-byte SHA3-256 digest of `data` into `out` and returns 32.
+
+`out` must hold at least 32 bytes; a shorter buffer panics.
+
+### sha3_256_into
+
+Writes the raw 32-byte SHA3-256 digest of `data` to `out` and returns 32.
+
 ### sha3_512
 
 Returns the raw 64-byte SHA3-512 digest of `data`.
@@ -8417,6 +8628,26 @@ Returns the raw 64-byte SHA3-512 digest of `data`.
 ### sha3_512_hex
 
 Returns the SHA3-512 digest of `data` as 128 lowercase hex characters.
+
+### sha3_512_hex_in
+
+Writes the SHA3-512 digest of `data` as 128 lowercase hex characters into `out` and returns 128.
+
+`out` must hold at least 128 bytes; a shorter buffer panics.
+
+### sha3_512_hex_into
+
+Writes the SHA3-512 digest of `data` as 128 lowercase hex characters to `out` and returns 128.
+
+### sha3_512_in
+
+Writes the raw 64-byte SHA3-512 digest of `data` into `out` and returns 64.
+
+`out` must hold at least 64 bytes; a shorter buffer panics.
+
+### sha3_512_into
+
+Writes the raw 64-byte SHA3-512 digest of `data` to `out` and returns 64.
 
 ### sha512_hex
 
@@ -8452,6 +8683,10 @@ Use to clear keys, passwords, and other secret buffers once they are no longer n
     + fn finish(out: local mut &[u8]) uint
     // Returns the 64-byte BLAKE2b digest of `data` as 128 hex characters.
     + static fn hash_hex(data: local &[u8], key: ?String (null), lowercase: bool (true)) String !CryptoError
+    // Writes the 64-byte BLAKE2b digest of `data` as 128 hex characters into `out` and returns 128.
+    + static fn hash_hex_in(data: local &[u8], out: local mut &[u8], key: ?String (null), lowercase: bool (true)) uint !CryptoError
+    // Writes the 64-byte BLAKE2b digest of `data` as 128 hex characters to `out` and returns 128.
+    + static fn hash_hex_into(data: local &[u8], out: Writer, key: ?String (null), lowercase: bool (true)) uint !CryptoError
     // Returns a BLAKE2b hasher producing `hash_size` bytes, keyed with `key` when given.
     + static fn new(hash_size: uint, key: ?String (null)) Blake2b !CryptoError
     // Feeds more input into the hash.
@@ -8479,6 +8714,19 @@ Returns the 64-byte BLAKE2b digest of `data` as 128 hex characters.
 
 `key` switches to keyed (MAC) mode; `lowercase` picks the hex case. Throws
 `invalid_input` when `key` is longer than 64 bytes.
+
+#### hash_hex_in
+
+Writes the 64-byte BLAKE2b digest of `data` as 128 hex characters into `out` and returns 128.
+
+`out` must hold at least 128 bytes; a shorter buffer panics. Throws `invalid_input`
+when `key` is longer than 64 bytes.
+
+#### hash_hex_into
+
+Writes the 64-byte BLAKE2b digest of `data` as 128 hex characters to `out` and returns 128.
+
+Throws `invalid_input` when `key` is longer than 64 bytes, and `write` when `out` fails.
 
 #### new
 
@@ -8527,7 +8775,7 @@ Thrown by the decoders, password hashes and key derivation functions of `crypto`
 - `invalid_input`: malformed base64, radix-64 or hex input, or a parameter out of range
   (bcrypt cost or salt length, a zero or too large pbkdf2/hkdf output length, a BLAKE2b
   hash size or key over 64 bytes, an empty blowfish key).
-- `write`: the `io.Writer` given to `base64_decode_into`, `hex_decode_into`, `bcrypt_into` or `bcrypt_hash_into` failed.
+- `write`: the `io.Writer` given to an `*_into` function failed.
 
 ```js
 // A streaming hash function: feed input with `update`, then read the digest with `finish`.
@@ -8591,6 +8839,14 @@ Feeds more input into the hash.
     + static fn sign(data: local &[u8], algorithm: HashAlgorithm, key: local &[u8]) String
     // Returns the MAC of `data` under `key` as lowercase hex.
     + static fn sign_hex(data: local &[u8], algorithm: HashAlgorithm, key: local &[u8]) String
+    // Writes the MAC of `data` under `key` as lowercase hex into `out` and returns the bytes written.
+    + static fn sign_hex_in(data: local &[u8], algorithm: HashAlgorithm, key: local &[u8], out: local mut &[u8]) uint
+    // Writes the MAC of `data` under `key` as lowercase hex to `out` and returns the bytes written.
+    + static fn sign_hex_into(data: local &[u8], algorithm: HashAlgorithm, key: local &[u8], out: Writer) uint !io:IoError
+    // Writes the raw MAC of `data` under `key` into `out` and returns the bytes written.
+    + static fn sign_in(data: local &[u8], algorithm: HashAlgorithm, key: local &[u8], out: local mut &[u8]) uint
+    // Writes the raw MAC of `data` under `key` to `out` and returns the bytes written.
+    + static fn sign_into(data: local &[u8], algorithm: HashAlgorithm, key: local &[u8], out: Writer) uint !io:IoError
     // Feeds more input into the MAC.
     + fn update(data: local &[u8]) void
     // Returns whether `mac` is the raw MAC of `data` under `key`, compared in constant time.
@@ -8634,6 +8890,26 @@ Returns the raw MAC of `data` under `key` as binary bytes (not text).
 #### sign_hex
 
 Returns the MAC of `data` under `key` as lowercase hex.
+
+#### sign_hex_in
+
+Writes the MAC of `data` under `key` as lowercase hex into `out` and returns the bytes written.
+
+`out` must hold at least `2 * digest_size(algorithm)` bytes; a shorter buffer panics.
+
+#### sign_hex_into
+
+Writes the MAC of `data` under `key` as lowercase hex to `out` and returns the bytes written.
+
+#### sign_in
+
+Writes the raw MAC of `data` under `key` into `out` and returns the bytes written.
+
+`out` must hold at least `digest_size(algorithm)` bytes; a shorter buffer panics.
+
+#### sign_into
+
+Writes the raw MAC of `data` under `key` to `out` and returns the bytes written.
 
 #### update
 
@@ -11310,6 +11586,8 @@ Set at startup: `true` in `GC_DEBUG` builds (such as `make test`), `false` other
 + fn escape_into(code: local &[u8], out: Writer, options: ?EscapeOptions (null)) uint !io:IoError
 // Returns `code` with the value of every URL attribute whose scheme is not allowed emptied.
 + fn sanitize_url_attributes(code: String, allowed_schemes: Array[String] (.{ "http", "https", "mailto" })) String
+// Writes `sanitize_url_attributes(code, allowed_schemes)` to `out` and returns the bytes written.
++ fn sanitize_url_attributes_into(code: String, out: Writer, allowed_schemes: Array[String] (.{ "http", "https", "mailto" })) uint !io:IoError
 // Returns whether a URL taken from an HTML attribute uses a scheme in `allowed_schemes`.
 + fn url_is_allowed(url: String, allowed_schemes: Array[String] (.{ "http", "https", "mailto" })) bool
 ```
@@ -11342,6 +11620,10 @@ values and raw text elements such as `<script>`, so tag-like text there can chan
 Nothing else is changed: event handler attributes such as `onclick` and `<script>`
 elements pass through, so this is not a full HTML sanitizer. Input built to make this
 check very slow gets every `<` escaped instead.
+
+### sanitize_url_attributes_into
+
+Writes `sanitize_url_attributes(code, allowed_schemes)` to `out` and returns the bytes written.
 
 ### url_is_allowed
 
@@ -11396,6 +11678,17 @@ Replaces `'` with `&#39;`.
 
 # http
 
+## Aliases for 'http'
+
+```js
+// Length in bytes of an HTTP date string (`Sun, 06 Nov 1994 08:49:37 GMT`, 29 bytes).
++ value HTTP_DATE_SIZE (29)
+```
+
+### HTTP_DATE_SIZE
+
+Length in bytes of an HTTP date string (`Sun, 06 Nov 1994 08:49:37 GMT`, 29 bytes).
+
 ## Enums for 'http'
 
 ```js
@@ -11424,6 +11717,10 @@ The kind of a WebSocket message.
 + fn download(url: String, to_path: String, options: ?Options (null), method: String ("GET")) void !HttpError
 // Returns `date` as an HTTP date: `Sun, 06 Nov 1994 08:49:37 GMT`.
 + fn format_date(date: DateTime) String
+// Writes `date` as an HTTP date into `out` and returns the bytes written (29).
++ fn format_date_in(date: DateTime, out: local mut &[u8]) uint
+// Writes `date` as an HTTP date to `out` and returns the bytes written (29).
++ fn format_date_into(date: DateTime, out: Writer) uint !io:IoError
 // Sends a GET request; see `request`.
 + fn get(url: String, options: ?Options (null)) ClientResponse !HttpError
 // Sends a HEAD request; see `request`.
@@ -11473,6 +11770,16 @@ the usual 10. Failing to close the file throws `write`.
 Returns `date` as an HTTP date: `Sun, 06 Nov 1994 08:49:37 GMT`.
 
 The value is read as UTC, which is the only zone HTTP dates are written in.
+
+### format_date_in
+
+Writes `date` as an HTTP date into `out` and returns the bytes written (29).
+
+`out` must hold at least `HTTP_DATE_SIZE` (29) bytes; a shorter buffer panics.
+
+### format_date_into
+
+Writes `date` as an HTTP date to `out` and returns the bytes written (29).
 
 ### get
 
@@ -12008,6 +12315,8 @@ wins. Throws `LookupError` when the query string has no such parameter.
     + static fn parse(header: String) Cookie !SyntaxError
     // Returns the `Set-Cookie` field value for this cookie.
     + fn to_header() String
+    // Writes the `Set-Cookie` field value for this cookie to `out` and returns the bytes written.
+    + fn to_header_into(out: Writer) uint !io:IoError
 }
 ```
 
@@ -12090,6 +12399,12 @@ Returns the `Set-Cookie` field value for this cookie.
 
 Attributes left null are not written. An invalid name or value gives an empty
 string, which the server leaves out of the response.
+
+#### to_header_into
+
+Writes the `Set-Cookie` field value for this cookie to `out` and returns the bytes written.
+
+Writes nothing and returns 0 when the cookie name or value is invalid.
 
 ```js
 // The cookies a `Client` received, sent back on later requests as a browser does (RFC 6265).
@@ -12361,6 +12676,8 @@ Thrown by `parse_http` when HTTP/1.x bytes are not a valid request or response.
     + fn apply(options: Options) void
     // Returns the complete body.
     + fn body() String
+    // Writes the complete multipart body to `out` and returns the bytes written.
+    + fn body_into(out: Writer) uint !io:IoError
     // Returns an independent copy with the parts added so far.
     + fn clone() Multipart
     // The `Content-Type` header for this form: `multipart/form-data` with its boundary.
@@ -12402,6 +12719,10 @@ Sets `options.body` to this form and its `Content-Type` header.
 #### body
 
 Returns the complete body.
+
+#### body_into
+
+Writes the complete multipart body to `out` and returns the bytes written.
 
 #### clone
 
@@ -15283,6 +15604,8 @@ and `$tag(omitempty)` allows missing/`null` values when the field has a default.
     + fn bool_value() bool !LookupError
     // Returns the value encoded as JSON text; see `json.encode`.
     + fn encode(pretty: bool (false)) String
+    // Writes the value encoded as JSON text to `out` and returns the bytes written.
+    + fn encode_into(out: Writer, pretty: bool (false)) uint !io:IoError
     // Returns the number held as a float, or `0.0` when the value is not a number.
     + get float: float
     // Returns the number held as a float; an integer is converted.
@@ -15387,6 +15710,10 @@ Throws `.missing` when the value is not a bool.
 #### encode
 
 Returns the value encoded as JSON text; see `json.encode`.
+
+#### encode_into
+
+Writes the value encoded as JSON text to `out` and returns the bytes written.
 
 #### float
 
@@ -16464,6 +16791,10 @@ Returns a pointer to the C `sockaddr` of the chosen entry; valid while this obje
     + static fn parse(text: String) Cidr !NetError
     // Formats the CIDR as `"<network>/<prefix>"`.
     + fn to_string() String
+    // Writes the formatted CIDR (`"<network>/<prefix>"`) into `buf` and returns the bytes written.
+    + fn to_string_in(buf: local mut &[u8]) uint
+    // Writes the formatted CIDR (`"<network>/<prefix>"`) to `out` and returns the bytes written.
+    + fn to_string_into(out: Writer) uint !io:IoError
 }
 ```
 
@@ -16507,6 +16838,16 @@ Throws `invalid_host` on malformed input or an out-of-range prefix length.
 #### to_string
 
 Formats the CIDR as `"<network>/<prefix>"`.
+
+#### to_string_in
+
+Writes the formatted CIDR (`"<network>/<prefix>"`) into `buf` and returns the bytes written.
+
+`buf` must hold at least `ADDRESS_TEXT_SIZE` (64) bytes; a shorter buffer panics.
+
+#### to_string_into
+
+Writes the formatted CIDR (`"<network>/<prefix>"`) to `out` and returns the bytes written.
 
 ```js
 // A parsed DNS resource record returned by `dns_lookup`.
@@ -16567,6 +16908,10 @@ or concatenated text (`txt`). `priority`, `weight`, and `port` are populated for
     + fn to_socket_address(port: u16 (0)) SocketAddress
     // Formats the address as `"127.0.0.1"` or RFC 5952 IPv6 (`"::1"`).
     + fn to_string() String
+    // Writes the formatted address into `buf` and returns the bytes written.
+    + fn to_string_in(buf: local mut &[u8]) uint
+    // Writes the formatted address to `out` and returns the bytes written.
+    + fn to_string_into(out: Writer) uint !io:IoError
 }
 ```
 
@@ -16656,6 +17001,16 @@ Combines this IP address with `port` into a `SocketAddress`.
 
 Formats the address as `"127.0.0.1"` or RFC 5952 IPv6 (`"::1"`).
 
+#### to_string_in
+
+Writes the formatted address into `buf` and returns the bytes written.
+
+`buf` must hold at least `ADDRESS_TEXT_SIZE` (64) bytes; a shorter buffer panics.
+
+#### to_string_into
+
+Writes the formatted address to `out` and returns the bytes written.
+
 ```js
 // Thrown by address resolution, sockets, connections and TLS.
 + union NetError {
@@ -16706,6 +17061,8 @@ Thrown by address resolution, sockets, connections and TLS.
     + fn ip_addr() IpAddr
     // Writes `ip()` into `buf` and returns the byte count.
     + fn ip_in(buf: local mut &[u8]) uint
+    // Writes the address (without port) to `out` and returns the bytes written.
+    + fn ip_into(out: Writer) uint !io:IoError
     // Returns the IPv4 address `a.b.c.d` with `port`.
     + static fn ipv4(a: u8, b: u8, c: u8, d: u8, port: u16 (0)) SocketAddress
     // Parses a numeric host such as `"127.0.0.1"`, `"::1"` or `"[::1]"`; never does a DNS lookup.
@@ -16716,6 +17073,8 @@ Thrown by address resolution, sockets, connections and TLS.
     + fn to_string() String
     // Writes `to_string()` into `buf` and returns the byte count.
     + fn to_string_in(buf: local mut &[u8]) uint
+    // Writes the address with its port (`"127.0.0.1:80"` or `"[::1]:80"`) to `out` and returns the bytes written.
+    + fn to_string_into(out: Writer) uint !io:IoError
 }
 ```
 
@@ -16756,6 +17115,10 @@ Writes `ip()` into `buf` and returns the byte count.
 
 `buf` must hold at least `ADDRESS_TEXT_SIZE` (64) bytes; a shorter buffer panics.
 
+#### ip_into
+
+Writes the address (without port) to `out` and returns the bytes written.
+
 #### ipv4
 
 Returns the IPv4 address `a.b.c.d` with `port`.
@@ -16783,6 +17146,10 @@ Returns the address with its port, as `"127.0.0.1:80"` or `"[::1]:80"`.
 Writes `to_string()` into `buf` and returns the byte count.
 
 `buf` must hold at least `ADDRESS_TEXT_SIZE` (64) bytes; a shorter buffer panics.
+
+#### to_string_into
+
+Writes the address with its port (`"127.0.0.1:80"` or `"[::1]:80"`) to `out` and returns the bytes written.
 
 ```js
 // One TLS session over one socket, either client or server side.
@@ -17914,6 +18281,8 @@ Restarts the sequence as if the generator was created with `seed`.
 ```js
 // Returns `text` with every regex metacharacter escaped, so the result matches `text` literally.
 + fn escape(text: String) String
+// Writes `text` with every regex metacharacter escaped to `out` and returns the bytes written.
++ fn escape_into(text: String, out: Writer) uint !io:IoError
 // Returns whether `pattern` matches anywhere in `text`, compiling the pattern on every call.
 + fn is_match(text: String, pattern: String) bool !RegexError
 ```
@@ -17921,6 +18290,10 @@ Restarts the sequence as if the generator was created with `seed`.
 ### escape
 
 Returns `text` with every regex metacharacter escaped, so the result matches `text` literally.
+
+### escape_into
+
+Writes `text` with every regex metacharacter escaped to `out` and returns the bytes written.
 
 ### is_match
 
@@ -17944,6 +18317,8 @@ Throws `RegexError` when the pattern does not compile; see `Regex.new`.
     + get end: uint
     // Returns `template` with group references replaced by the group texts of this match.
     + fn expand(template: String) String
+    // Writes `template` with group references expanded to `out` and returns the bytes written.
+    + fn expand_into(template: String, out: Writer) uint !io:IoError
     // Returns the text of group `index`.
     + fn get(index: uint) ?String
     // Returns the text of the group called `name`.
@@ -17986,6 +18361,10 @@ match and `$$` a dollar sign. An unbraced reference takes all following word
 characters, so `$1st` looks up a group named `1st`; write `${1}st` instead. Unknown
 groups and groups that did not take part insert nothing. A `$` not followed by a
 reference is copied as is.
+
+#### expand_into
+
+Writes `template` with group references expanded to `out` and returns the bytes written.
 
 #### get
 
@@ -18039,8 +18418,12 @@ Returns the text of the whole match.
     + static fn new(pattern: String, flags: String ("")) Regex !RegexError
     // Returns `text` with the matches replaced by `replacement`, at most `limit` (0 means all).
     + fn replace(text: String, replacement: String, limit: uint (0)) String
+    // Writes `text` with matches replaced by `replacement` to `out` and returns the bytes written.
+    + fn replace_into(text: String, replacement: String, out: Writer, limit: uint (0)) uint !io:IoError
     // Returns `text` with each match replaced by what `func` returns for it.
     + fn replace_with(text: String, func: fn(Match)(String), limit: uint (0)) String
+    // Writes `text` with each match replaced by `func(m)` to `out` and returns the bytes written.
+    + fn replace_with_into(text: String, func: fn(Match)(String), out: Writer, limit: uint (0)) uint !io:IoError
     // Splits `text` at the matches into at most `limit` pieces (0 means all).
     + fn split(text: String, limit: uint (0)) Array[String]
 }
@@ -18126,11 +18509,19 @@ Returns `text` with the matches replaced by `replacement`, at most `limit` (0 me
 The replacement is expanded per match like `Match.expand`: `$1`, `${1}` and `${name}`
 insert a group, `$0` the whole match and `$$` a dollar sign.
 
+#### replace_into
+
+Writes `text` with matches replaced by `replacement` to `out` and returns the bytes written.
+
 #### replace_with
 
 Returns `text` with each match replaced by what `func` returns for it.
 
 Replaces at most `limit` matches (0 means all); the rest of the text is copied as is.
+
+#### replace_with_into
+
+Writes `text` with each match replaced by `func(m)` to `out` and returns the bytes written.
 
 #### split
 
@@ -19492,11 +19883,17 @@ sleeps is not lost. Panics when the OS wait fails.
 ## Aliases for 'time'
 
 ```js
+// The buffer size `Duration.to_string_in` requires.
++ value DURATION_TEXT_SIZE (32)
 // The buffer size `DateTime.to_iso8601_in` requires for a UTC value: `YYYY-MM-DDTHH:MM:SS.uuuuuuZ`.
 + value ISO8601_TEXT_SIZE (27)
 // The buffer size `DateTime.to_iso8601_in` requires for a value in a time zone: `YYYY-MM-DDTHH:MM:SS.uuuuuu+hh:mm:ss`.
 + value ISO8601_ZONED_TEXT_SIZE (35)
 ```
+
+### DURATION_TEXT_SIZE
+
+The buffer size `Duration.to_string_in` requires.
 
 ### ISO8601_TEXT_SIZE
 
@@ -20244,6 +20641,10 @@ Returns the zone's abbreviation at this instant, such as `CET`, or `UTC`.
     + fn times(factor: int) Duration
     // Returns the duration as text such as `2d3h`, `1h30m`, `4.5s`, `250ms`, `15us` or `0s`.
     + fn to_string() String
+    // Writes the duration text into `buf` and returns the bytes written.
+    + fn to_string_in(buf: local mut &[u8]) uint
+    // Writes the duration text to `out` and returns the bytes written.
+    + fn to_string_into(out: Writer) uint !io:IoError
 }
 ```
 
@@ -20352,6 +20753,16 @@ Returns the duration as text such as `2d3h`, `1h30m`, `4.5s`, `250ms`, `15us` or
 
 Units that are zero are left out; seconds carry their fraction.
 
+#### to_string_in
+
+Writes the duration text into `buf` and returns the bytes written.
+
+`buf` must hold at least `DURATION_TEXT_SIZE` (32) bytes; a shorter buffer panics.
+
+#### to_string_into
+
+Writes the duration text to `out` and returns the bytes written.
+
 ```js
 // A time zone: the UTC offsets, daylight saving time and abbreviations of a region through its history.
 + class Zone {
@@ -20444,6 +20855,10 @@ space.
 + fn build_query(params: Map[String]) String
 // Builds a query string like `build_query`, with one `key=value` part per value of a key.
 + fn build_query_grouped(params: Map[Array[String]]) String
+// Writes the grouped query string for `params` to `out` and returns the bytes written.
++ fn build_query_grouped_into(params: Map[Array[String]], out: Writer) uint !io:IoError
+// Writes the encoded query string for `params` to `out` and returns the bytes written.
++ fn build_query_into(params: Map[String], out: Writer) uint !io:IoError
 // Decodes `%XX` escapes and turns every `+` into a space.
 + fn decode(str: String) String
 // Writes `str` decoded as `decode` does to `out` and returns the bytes written.
@@ -20475,6 +20890,14 @@ Keys and values are encoded with `encode`, in the map's order.
 ### build_query_grouped
 
 Builds a query string like `build_query`, with one `key=value` part per value of a key.
+
+### build_query_grouped_into
+
+Writes the grouped query string for `params` to `out` and returns the bytes written.
+
+### build_query_into
+
+Writes the encoded query string for `params` to `out` and returns the bytes written.
 
 ### decode
 
@@ -20584,6 +21007,8 @@ Removes the `.` and `..` segments from a URL path, as RFC 3986 section 5.2.4 des
     + fn resolve(reference: String) Url
     // Returns the URL as text: `scheme://user:password@host:port/path?query#fragment`.
     + fn to_string() String
+    // Writes the URL as text to `out` and returns the bytes written.
+    + fn to_string_into(out: Writer) uint !io:IoError
 }
 ```
 
@@ -20650,6 +21075,10 @@ Returns the URL as text: `scheme://user:password@host:port/path?query#fragment`.
 Empty parts are left out, and the parts are written as they are, so they must already
 be encoded. A `file` URL keeps its `//` without a host. Marked `$auto`: a `Url`
 converts to `String` where one is expected.
+
+#### to_string_into
+
+Writes the URL as text to `out` and returns the bytes written.
 
 # validate
 

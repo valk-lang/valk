@@ -165,12 +165,20 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 + fn exit(code: i32) void
 // Formats floating-point `value` using format specifier `spec` (e.g. `".2f"`, `"08.2f"`, `".3e"`).
 + fn format_float(value: f64, spec: String) String !SyntaxError
+// Formats floating-point `value` using format specifier `spec` to `out` and returns the bytes written.
++ fn format_float_into(value: f64, spec: String, out: Writer) uint !FormatError
 // Formats signed integer `value` using format specifier `spec` (e.g. `"05"`, `"#06x"`, `"+>8"`).
 + fn format_int(value: int, spec: String) String !SyntaxError
+// Formats signed integer `value` using format specifier `spec` to `out` and returns the bytes written.
++ fn format_int_into(value: int, spec: String, out: Writer) uint !FormatError
 // Formats string `value` using format specifier `spec` (e.g. `">10"`, `"*^12"`, `".5"`).
 + fn format_string(value: String, spec: String) String !SyntaxError
+// Formats string `value` using format specifier `spec` to `out` and returns the bytes written.
++ fn format_string_into(value: String, spec: String, out: Writer) uint !FormatError
 // Formats unsigned integer `value` using format specifier `spec` (e.g. `"05"`, `"#08x"`, `"b"`).
 + fn format_uint(value: uint, spec: String) String !SyntaxError
+// Formats unsigned integer `value` using format specifier `spec` to `out` and returns the bytes written.
++ fn format_uint_into(value: uint, spec: String, out: Writer) uint !FormatError
 // Returns the value of the environment variable `var`.
 + fn getenv(var: String) String !LookupError
 // Returns the host name of this machine.
@@ -368,6 +376,8 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn items() *[T]
     // Converts each element to a `String` and joins them with `divider` between each pair.
     + fn join(divider: String) String
+    // Writes each element converted to `String` separated by `divider` to `out` and returns the bytes written.
+    + fn join_into(divider: String, out: Writer) uint !io:IoError
     // Returns the last element without removing it.
     + fn last() T !LookupError
     // Returns a new array holding `func` applied to each element, in order.
@@ -880,6 +890,16 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn sort_keys() void
     // Returns a new array of the values, in entry order.
     + fn values() Array[T]
+}
+```
+
+```js
+// Thrown by `format_*_into`: `syntax` for an invalid format specifier, `io` when writing fails.
++ union FormatError {
+    syntax
+    io(IoError) $auto
+
+    + fn to_string() String
 }
 ```
 
@@ -2281,6 +2301,12 @@ type c_long (int)
 + fn argon2id(password: local &[u8], salt: local &[u8], memory_kib: uint (65536), iterations: uint (3), parallelism: uint (1), length: uint (32)) String !CryptoError
 // Hashes `password` with Argon2id and a fresh 16-byte random salt in PHC string format.
 + fn argon2id_hash(password: local &[u8], memory_kib: uint (19456), iterations: uint (2), parallelism: uint (1)) String !CryptoError
+// Hashes `password` with Argon2id in PHC string format to `out` and returns the bytes written.
++ fn argon2id_hash_into(password: local &[u8], out: Writer, memory_kib: uint (19456), iterations: uint (2), parallelism: uint (1)) uint !CryptoError
+// Derives `length` raw bytes using Argon2id into `out` and returns `length`.
++ fn argon2id_in(password: local &[u8], salt: local &[u8], out: local mut &[u8], memory_kib: uint (65536), iterations: uint (3), parallelism: uint (1), length: uint (32)) uint !CryptoError
+// Derives `length` raw bytes using Argon2id to `out` and returns `length`.
++ fn argon2id_into(password: local &[u8], salt: local &[u8], out: Writer, memory_kib: uint (65536), iterations: uint (3), parallelism: uint (1), length: uint (32)) uint !CryptoError
 // Returns whether `password` matches an Argon2id PHC string (`$argon2id$v=19$...`).
 + fn argon2id_verify(password: local &[u8], encoded: local &[u8]) bool
 // Decodes standard base64 (`+` and `/`) into the raw bytes it represents.
@@ -2303,8 +2329,16 @@ type c_long (int)
 + fn base64url_decode(text: local &[u8]) String !CryptoError
 // Decodes URL-safe base64 into `out` and returns the bytes written, like `base64url_decode` without allocating.
 + fn base64url_decode_in(text: local &[u8], out: local mut &[u8]) uint !CryptoError
+// Decodes URL-safe base64 to `out` and returns the bytes written.
++ fn base64url_decode_into(text: local &[u8], out: Writer) uint !CryptoError
 // Returns `data` encoded as URL-safe base64 (`-` and `_`) without `=` padding, the form JWT, JWK and WebAuthn use.
 + fn base64url_encode(data: local &[u8]) String
+// Writes `data` encoded as URL-safe base64 (`-` and `_`) without `=` padding into `out` and returns the bytes written.
++ fn base64url_encode_in(data: local &[u8], out: local mut &[u8]) uint
+// Writes `data` encoded as URL-safe base64 without `=` padding to `out` and returns the bytes written.
++ fn base64url_encode_into(data: local &[u8], out: Writer) uint !io:IoError
+// Returns the number of URL-safe unpadded base64 characters that encode `length` bytes.
++ fn base64url_encoded_size(length: uint) uint
 // Computes the 60-character `$2a$` bcrypt hash of `password` with the given `salt` and `cost`.
 + fn bcrypt(password: local &[u8], salt: local &[u8], cost: uint) String !CryptoError
 // Hashes `password` with bcrypt and a fresh random salt, for storing credentials.
@@ -2363,8 +2397,20 @@ type c_long (int)
 + fn hkdf(ikm: local &[u8], algorithm: HashAlgorithm, salt: local &[u8], info: local &[u8], length: uint) String !CryptoError
 // Returns `length` bytes of HKDF-Expand (RFC 5869) output from the pseudorandom key `prk`.
 + fn hkdf_expand(prk: local &[u8], algorithm: HashAlgorithm, info: local &[u8], length: uint) String !CryptoError
+// Writes `length` bytes of HKDF-Expand output into `out` and returns `length`.
++ fn hkdf_expand_in(prk: local &[u8], algorithm: HashAlgorithm, info: local &[u8], out: local mut &[u8], length: uint) uint !CryptoError
+// Writes `length` bytes of HKDF-Expand output to `out` and returns `length`.
++ fn hkdf_expand_into(prk: local &[u8], algorithm: HashAlgorithm, info: local &[u8], out: Writer, length: uint) uint !CryptoError
 // Returns the HKDF-Extract (RFC 5869) pseudorandom key of `ikm` under `salt`.
 + fn hkdf_extract(ikm: local &[u8], algorithm: HashAlgorithm, salt: local &[u8]) String
+// Writes the HKDF-Extract pseudorandom key of `ikm` under `salt` into `out` and returns its size.
++ fn hkdf_extract_in(ikm: local &[u8], algorithm: HashAlgorithm, salt: local &[u8], out: local mut &[u8]) uint
+// Writes the HKDF-Extract pseudorandom key of `ikm` under `salt` to `out` and returns its size.
++ fn hkdf_extract_into(ikm: local &[u8], algorithm: HashAlgorithm, salt: local &[u8], out: Writer) uint !io:IoError
+// Derives `length` bytes from `ikm` with HKDF into `out` and returns `length`.
++ fn hkdf_in(ikm: local &[u8], algorithm: HashAlgorithm, salt: local &[u8], info: local &[u8], out: local mut &[u8], length: uint) uint !CryptoError
+// Derives `length` bytes from `ikm` with HKDF to `out` and returns `length`.
++ fn hkdf_into(ikm: local &[u8], algorithm: HashAlgorithm, salt: local &[u8], info: local &[u8], out: Writer, length: uint) uint !CryptoError
 // Returns the MD5 digest of `data` as lowercase hex.
 + fn md5_hex(data: local &[u8]) String
 // Writes the MD5 digest of `data` as hex into `out`; see `hash_hex_in`.
@@ -2373,6 +2419,10 @@ type c_long (int)
 + fn md5_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 // Derives `length` bytes from `password` and `salt` with PBKDF2-HMAC (RFC 8018).
 + fn pbkdf2(password: local &[u8], algorithm: HashAlgorithm, salt: local &[u8], iterations: uint, length: uint) String !CryptoError
+// Derives `length` bytes with PBKDF2-HMAC into `out` and returns `length`.
++ fn pbkdf2_in(password: local &[u8], algorithm: HashAlgorithm, salt: local &[u8], iterations: uint, out: local mut &[u8], length: uint) uint !CryptoError
+// Derives `length` bytes with PBKDF2-HMAC to `out` and returns `length`.
++ fn pbkdf2_into(password: local &[u8], algorithm: HashAlgorithm, salt: local &[u8], iterations: uint, out: Writer, length: uint) uint !CryptoError
 // Returns a string of `length` cryptographically secure random bytes.
 + fn random_bytes(length: uint) String
 // Fills all of `out` with cryptographically secure random bytes and returns its length.
@@ -2403,10 +2453,26 @@ type c_long (int)
 + fn sha3_256(data: local &[u8]) String
 // Returns the SHA3-256 digest of `data` as 64 lowercase hex characters.
 + fn sha3_256_hex(data: local &[u8]) String
+// Writes the SHA3-256 digest of `data` as 64 lowercase hex characters into `out` and returns 64.
++ fn sha3_256_hex_in(data: local &[u8], out: local mut &[u8]) uint
+// Writes the SHA3-256 digest of `data` as 64 lowercase hex characters to `out` and returns 64.
++ fn sha3_256_hex_into(data: local &[u8], out: Writer) uint !io:IoError
+// Writes the raw 32-byte SHA3-256 digest of `data` into `out` and returns 32.
++ fn sha3_256_in(data: local &[u8], out: local mut &[u8]) uint
+// Writes the raw 32-byte SHA3-256 digest of `data` to `out` and returns 32.
++ fn sha3_256_into(data: local &[u8], out: Writer) uint !io:IoError
 // Returns the raw 64-byte SHA3-512 digest of `data`.
 + fn sha3_512(data: local &[u8]) String
 // Returns the SHA3-512 digest of `data` as 128 lowercase hex characters.
 + fn sha3_512_hex(data: local &[u8]) String
+// Writes the SHA3-512 digest of `data` as 128 lowercase hex characters into `out` and returns 128.
++ fn sha3_512_hex_in(data: local &[u8], out: local mut &[u8]) uint
+// Writes the SHA3-512 digest of `data` as 128 lowercase hex characters to `out` and returns 128.
++ fn sha3_512_hex_into(data: local &[u8], out: Writer) uint !io:IoError
+// Writes the raw 64-byte SHA3-512 digest of `data` into `out` and returns 64.
++ fn sha3_512_in(data: local &[u8], out: local mut &[u8]) uint
+// Writes the raw 64-byte SHA3-512 digest of `data` to `out` and returns 64.
++ fn sha3_512_into(data: local &[u8], out: Writer) uint !io:IoError
 // Returns the SHA-512 digest of `data` as lowercase hex.
 + fn sha512_hex(data: local &[u8]) String
 // Writes the SHA-512 digest of `data` as hex into `out`; see `hash_hex_in`.
@@ -2428,6 +2494,10 @@ type c_long (int)
     + fn finish(out: local mut &[u8]) uint
     // Returns the 64-byte BLAKE2b digest of `data` as 128 hex characters.
     + static fn hash_hex(data: local &[u8], key: ?String (null), lowercase: bool (true)) String !CryptoError
+    // Writes the 64-byte BLAKE2b digest of `data` as 128 hex characters into `out` and returns 128.
+    + static fn hash_hex_in(data: local &[u8], out: local mut &[u8], key: ?String (null), lowercase: bool (true)) uint !CryptoError
+    // Writes the 64-byte BLAKE2b digest of `data` as 128 hex characters to `out` and returns 128.
+    + static fn hash_hex_into(data: local &[u8], out: Writer, key: ?String (null), lowercase: bool (true)) uint !CryptoError
     // Returns a BLAKE2b hasher producing `hash_size` bytes, keyed with `key` when given.
     + static fn new(hash_size: uint, key: ?String (null)) Blake2b !CryptoError
     // Feeds more input into the hash.
@@ -2489,6 +2559,14 @@ type c_long (int)
     + static fn sign(data: local &[u8], algorithm: HashAlgorithm, key: local &[u8]) String
     // Returns the MAC of `data` under `key` as lowercase hex.
     + static fn sign_hex(data: local &[u8], algorithm: HashAlgorithm, key: local &[u8]) String
+    // Writes the MAC of `data` under `key` as lowercase hex into `out` and returns the bytes written.
+    + static fn sign_hex_in(data: local &[u8], algorithm: HashAlgorithm, key: local &[u8], out: local mut &[u8]) uint
+    // Writes the MAC of `data` under `key` as lowercase hex to `out` and returns the bytes written.
+    + static fn sign_hex_into(data: local &[u8], algorithm: HashAlgorithm, key: local &[u8], out: Writer) uint !io:IoError
+    // Writes the raw MAC of `data` under `key` into `out` and returns the bytes written.
+    + static fn sign_in(data: local &[u8], algorithm: HashAlgorithm, key: local &[u8], out: local mut &[u8]) uint
+    // Writes the raw MAC of `data` under `key` to `out` and returns the bytes written.
+    + static fn sign_into(data: local &[u8], algorithm: HashAlgorithm, key: local &[u8], out: Writer) uint !io:IoError
     // Feeds more input into the MAC.
     + fn update(data: local &[u8]) void
     // Returns whether `mac` is the raw MAC of `data` under `key`, compared in constant time.
@@ -3424,6 +3502,8 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 + fn escape_into(code: local &[u8], out: Writer, options: ?EscapeOptions (null)) uint !io:IoError
 // Returns `code` with the value of every URL attribute whose scheme is not allowed emptied.
 + fn sanitize_url_attributes(code: String, allowed_schemes: Array[String] (.{ "http", "https", "mailto" })) String
+// Writes `sanitize_url_attributes(code, allowed_schemes)` to `out` and returns the bytes written.
++ fn sanitize_url_attributes_into(code: String, out: Writer, allowed_schemes: Array[String] (.{ "http", "https", "mailto" })) uint !io:IoError
 // Returns whether a URL taken from an HTML attribute uses a scheme in `allowed_schemes`.
 + fn url_is_allowed(url: String, allowed_schemes: Array[String] (.{ "http", "https", "mailto" })) bool
 ```
@@ -3448,6 +3528,13 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 
 # http
 
+## Aliases for 'http'
+
+```js
+// Length in bytes of an HTTP date string (`Sun, 06 Nov 1994 08:49:37 GMT`, 29 bytes).
++ value HTTP_DATE_SIZE (29)
+```
+
 ## Enums for 'http'
 
 ```js
@@ -3468,6 +3555,10 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 + fn download(url: String, to_path: String, options: ?Options (null), method: String ("GET")) void !HttpError
 // Returns `date` as an HTTP date: `Sun, 06 Nov 1994 08:49:37 GMT`.
 + fn format_date(date: DateTime) String
+// Writes `date` as an HTTP date into `out` and returns the bytes written (29).
++ fn format_date_in(date: DateTime, out: local mut &[u8]) uint
+// Writes `date` as an HTTP date to `out` and returns the bytes written (29).
++ fn format_date_into(date: DateTime, out: Writer) uint !io:IoError
 // Sends a GET request; see `request`.
 + fn get(url: String, options: ?Options (null)) ClientResponse !HttpError
 // Sends a HEAD request; see `request`.
@@ -3646,6 +3737,8 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     + static fn parse(header: String) Cookie !SyntaxError
     // Returns the `Set-Cookie` field value for this cookie.
     + fn to_header() String
+    // Writes the `Set-Cookie` field value for this cookie to `out` and returns the bytes written.
+    + fn to_header_into(out: Writer) uint !io:IoError
 }
 ```
 
@@ -3760,6 +3853,8 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     + fn apply(options: Options) void
     // Returns the complete body.
     + fn body() String
+    // Writes the complete multipart body to `out` and returns the bytes written.
+    + fn body_into(out: Writer) uint !io:IoError
     // Returns an independent copy with the parts added so far.
     + fn clone() Multipart
     // The `Content-Type` header for this form: `multipart/form-data` with its boundary.
@@ -4610,6 +4705,8 @@ alias Fd for i32
     + fn bool_value() bool !LookupError
     // Returns the value encoded as JSON text; see `json.encode`.
     + fn encode(pretty: bool (false)) String
+    // Writes the value encoded as JSON text to `out` and returns the bytes written.
+    + fn encode_into(out: Writer, pretty: bool (false)) uint !io:IoError
     // Returns the number held as a float, or `0.0` when the value is not a number.
     + get float: float
     // Returns the number held as a float; an integer is converted.
@@ -5011,6 +5108,10 @@ type c_long (int)
     + static fn parse(text: String) Cidr !NetError
     // Formats the CIDR as `"<network>/<prefix>"`.
     + fn to_string() String
+    // Writes the formatted CIDR (`"<network>/<prefix>"`) into `buf` and returns the bytes written.
+    + fn to_string_in(buf: local mut &[u8]) uint
+    // Writes the formatted CIDR (`"<network>/<prefix>"`) to `out` and returns the bytes written.
+    + fn to_string_into(out: Writer) uint !io:IoError
 }
 ```
 
@@ -5065,6 +5166,10 @@ type c_long (int)
     + fn to_socket_address(port: u16 (0)) SocketAddress
     // Formats the address as `"127.0.0.1"` or RFC 5952 IPv6 (`"::1"`).
     + fn to_string() String
+    // Writes the formatted address into `buf` and returns the bytes written.
+    + fn to_string_in(buf: local mut &[u8]) uint
+    // Writes the formatted address to `out` and returns the bytes written.
+    + fn to_string_into(out: Writer) uint !io:IoError
 }
 ```
 
@@ -5101,6 +5206,8 @@ type c_long (int)
     + fn ip_addr() IpAddr
     // Writes `ip()` into `buf` and returns the byte count.
     + fn ip_in(buf: local mut &[u8]) uint
+    // Writes the address (without port) to `out` and returns the bytes written.
+    + fn ip_into(out: Writer) uint !io:IoError
     // Returns the IPv4 address `a.b.c.d` with `port`.
     + static fn ipv4(a: u8, b: u8, c: u8, d: u8, port: u16 (0)) SocketAddress
     // Parses a numeric host such as `"127.0.0.1"`, `"::1"` or `"[::1]"`; never does a DNS lookup.
@@ -5111,6 +5218,8 @@ type c_long (int)
     + fn to_string() String
     // Writes `to_string()` into `buf` and returns the byte count.
     + fn to_string_in(buf: local mut &[u8]) uint
+    // Writes the address with its port (`"127.0.0.1:80"` or `"[::1]:80"`) to `out` and returns the bytes written.
+    + fn to_string_into(out: Writer) uint !io:IoError
 }
 ```
 
@@ -5431,6 +5540,8 @@ type c_long (int)
 ```js
 // Returns `text` with every regex metacharacter escaped, so the result matches `text` literally.
 + fn escape(text: String) String
+// Writes `text` with every regex metacharacter escaped to `out` and returns the bytes written.
++ fn escape_into(text: String, out: Writer) uint !io:IoError
 // Returns whether `pattern` matches anywhere in `text`, compiling the pattern on every call.
 + fn is_match(text: String, pattern: String) bool !RegexError
 ```
@@ -5451,6 +5562,8 @@ type c_long (int)
     + get end: uint
     // Returns `template` with group references replaced by the group texts of this match.
     + fn expand(template: String) String
+    // Writes `template` with group references expanded to `out` and returns the bytes written.
+    + fn expand_into(template: String, out: Writer) uint !io:IoError
     // Returns the text of group `index`.
     + fn get(index: uint) ?String
     // Returns the text of the group called `name`.
@@ -5490,8 +5603,12 @@ type c_long (int)
     + static fn new(pattern: String, flags: String ("")) Regex !RegexError
     // Returns `text` with the matches replaced by `replacement`, at most `limit` (0 means all).
     + fn replace(text: String, replacement: String, limit: uint (0)) String
+    // Writes `text` with matches replaced by `replacement` to `out` and returns the bytes written.
+    + fn replace_into(text: String, replacement: String, out: Writer, limit: uint (0)) uint !io:IoError
     // Returns `text` with each match replaced by what `func` returns for it.
     + fn replace_with(text: String, func: fn(Match)(String), limit: uint (0)) String
+    // Writes `text` with each match replaced by `func(m)` to `out` and returns the bytes written.
+    + fn replace_with_into(text: String, func: fn(Match)(String), out: Writer, limit: uint (0)) uint !io:IoError
     // Splits `text` at the matches into at most `limit` pieces (0 means all).
     + fn split(text: String, limit: uint (0)) Array[String]
 }
@@ -5948,6 +6065,8 @@ type Loader (fn(String)(?String))
 ## Aliases for 'time'
 
 ```js
+// The buffer size `Duration.to_string_in` requires.
++ value DURATION_TEXT_SIZE (32)
 // The buffer size `DateTime.to_iso8601_in` requires for a UTC value: `YYYY-MM-DDTHH:MM:SS.uuuuuuZ`.
 + value ISO8601_TEXT_SIZE (27)
 // The buffer size `DateTime.to_iso8601_in` requires for a value in a time zone: `YYYY-MM-DDTHH:MM:SS.uuuuuu+hh:mm:ss`.
@@ -6193,6 +6312,10 @@ type Loader (fn(String)(?String))
     + fn times(factor: int) Duration
     // Returns the duration as text such as `2d3h`, `1h30m`, `4.5s`, `250ms`, `15us` or `0s`.
     + fn to_string() String
+    // Writes the duration text into `buf` and returns the bytes written.
+    + fn to_string_in(buf: local mut &[u8]) uint
+    // Writes the duration text to `out` and returns the bytes written.
+    + fn to_string_into(out: Writer) uint !io:IoError
 }
 ```
 
@@ -6239,6 +6362,10 @@ type Loader (fn(String)(?String))
 + fn build_query(params: Map[String]) String
 // Builds a query string like `build_query`, with one `key=value` part per value of a key.
 + fn build_query_grouped(params: Map[Array[String]]) String
+// Writes the grouped query string for `params` to `out` and returns the bytes written.
++ fn build_query_grouped_into(params: Map[Array[String]], out: Writer) uint !io:IoError
+// Writes the encoded query string for `params` to `out` and returns the bytes written.
++ fn build_query_into(params: Map[String], out: Writer) uint !io:IoError
 // Decodes `%XX` escapes and turns every `+` into a space.
 + fn decode(str: String) String
 // Writes `str` decoded as `decode` does to `out` and returns the bytes written.
@@ -6289,6 +6416,8 @@ type Loader (fn(String)(?String))
     + fn resolve(reference: String) Url
     // Returns the URL as text: `scheme://user:password@host:port/path?query#fragment`.
     + fn to_string() String
+    // Writes the URL as text to `out` and returns the bytes written.
+    + fn to_string_into(out: Writer) uint !io:IoError
 }
 ```
 
