@@ -254,7 +254,7 @@ if [[ "$stdlib_markdown" != *'+ value collect (ext.valk_gc_collect)'* ]] \
     exit 1
 fi
 if [[ "$stdlib_markdown" != *'+ extend &[T] {'* ]] \
-    || [[ "$stdlib_markdown" != *'+ fn view(start_index: uint (0), length: uint (uint.$max)) &[u8]'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn view(offset: uint (0), length: uint (uint.$max)) &[u8]'* ]] \
     || [[ "$stdlib_markdown" != *'+ extend &[u8] {'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn has_ascii_control(allow_tab: bool (false)) bool'* ]] \
     || [[ "$stdlib_markdown" != *'+ extend HashMap[String, T] {'* ]] \
@@ -264,10 +264,10 @@ if [[ "$stdlib_markdown" != *'+ extend &[T] {'* ]] \
     || [[ "$stdlib_markdown" != *'+ get utf8.length: uint'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn ansi.red(bold: bool (false)) String'* ]] \
     || [[ "$stdlib_markdown" != *'+ static fn copy_from_ptr(data: ptr, length: uint) String'* ]] \
-    || [[ "$stdlib_markdown" != *'+ fn read(fd: i32, buf: local mut &[u8], offset: uint (uint.$max)) uint !IoError'* ]] \
-    || [[ "$stdlib_markdown" != *'+ fn read_sync(fd: i32, buf: local mut &[u8], offset: uint (uint.$max)) uint !IoError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn read(fd: i32, buf: local mut &[u8], offset: ?uint (null)) uint !IoError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn read_sync(fd: i32, buf: local mut &[u8], offset: ?uint (null)) uint !IoError'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn read(buf: local mut &[u8]) uint !io:IoError'* ]] \
-    || [[ "$stdlib_markdown" != *'+ fn write(fd: i32, data: local &[u8], offset: uint (uint.$max)) uint !IoError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn write(fd: i32, data: local &[u8], offset: ?uint (null)) uint !IoError'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn recv(fd: i32, buf: local mut &[u8], timeout_ms: uint (5000)) uint !io:IoError'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn write(fd: i32, data: local &[u8], timeout_ms: uint (5000)) uint !io:IoError'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn read(buf: local mut &[u8]) uint !io:IoError'* ]] \

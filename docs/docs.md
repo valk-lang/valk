@@ -301,15 +301,15 @@ use valk.regex
 
 let re = regex.Regex.new("(?P<user>\\w+)@(?P<host>[\\w.]+)") ! panic("bad pattern")
 let m = re.find("mail me@example.com today") ?! return
-println(m.str())                       // me@example.com
+println(m.to_string())                 // me@example.com
 println(m.named("host") ?? "")         // example.com
 println(m.get(1) ?? "")                // me
 println(m.start)                       // 5
 
-each re.find_all("a@b.c x@y.z") as found : println(found.str())
+each re.find_all("a@b.c x@y.z") as found : println(found.to_string())
 re.is_match("nothing here")           // false
 re.replace("me@home you@work", "${host}:${user}")   // home:me work:you
-re.replace_with(text, fn(m: regex.Match) String { return m.str().upper() })
+re.replace_with(text, fn(m: regex.Match) String { return m.to_string().upper() })
 let comma = regex.Regex.new("\\s*,\\s*") ! panic("bad pattern")
 comma.split("a , b,c")                 // ["a", "b", "c"]
 regex.escape("1+1=2")                  // 1\+1=2
@@ -2952,7 +2952,7 @@ s.tls("certificate.pem", "private-key.pem") !!
 s.tls_client_ca("clients-ca.pem") !!
 
 fn handler(req: http.Request) http.Response {
-    return http.Response.text("Hello " + req.client_subject) // CN=alice,O=Example
+    return http.Response.text("Hello " + (req.client_subject ?? "anonymous")) // CN=alice,O=Example
 }
 ```
 
@@ -3328,7 +3328,7 @@ RSA).
 ```rust
 use valk.crypto
 
-let hash = crypto.Blake2b.hash_string("test") ! panic("Failed to hash")
+let hash = crypto.Blake2b.hash_hex("test") ! panic("Failed to hash")
 let hex = crypto.sha512_hex("test")
 ```
 

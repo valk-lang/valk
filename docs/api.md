@@ -23,6 +23,8 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 ```js
 // The compression level used when none is given, a balance of speed and size.
 + value COMPRESS_DEFAULT_LEVEL (6)
+// Default Zstandard compression level used when none is given.
++ value ZSTD_DEFAULT_LEVEL (3)
 ```
 
 ## Enums for 'compress'
@@ -38,9 +40,9 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 // Returns the Adler-32 checksum (as in zlib) of `data`.
 + fn adler32(data: local &[u8], adler: u32 (1)) u32
 // Returns `data` compressed into `format` at `level` (0 stores, 1 is fastest, 9 is smallest).
-+ fn compress(data: local &[u8], format: Format, level: uint (COMPRESS_DEFAULT_LEVEL)) String
++ fn compress(data: local &[u8], format: Format, level: ?uint (null)) String
 // Writes `data` compressed into `format` at `level` to `out` and returns the bytes written.
-+ fn compress_into(data: local &[u8], format: Format, out: Writer, level: uint (COMPRESS_DEFAULT_LEVEL)) uint !io:IoError
++ fn compress_into(data: local &[u8], format: Format, out: Writer, level: ?uint (null)) uint !io:IoError
 // Returns the CRC-32 (IEEE 802.3, as in gzip, zip and PNG) of `data`.
 + fn crc32(data: local &[u8], crc: u32 (0)) u32
 // Returns the decompressed contents of `data`, which must be in `format`.
@@ -102,7 +104,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Compresses the remaining input and writes the final block and trailer to `out`.
     + fn close() void !io:IoError
     // Returns a compressor writing `format` data to `out` at `level` (0 stores, 9 is smallest).
-    + static fn new(out: Writer, format: Format, level: uint (COMPRESS_DEFAULT_LEVEL)) Compressor
+    + static fn new(out: Writer, format: Format, level: ?uint (null)) Compressor
     // Compresses `data` and returns its length, the number of input bytes accepted.
     + fn write(data: local &[u8]) uint !io:IoError
 }
@@ -183,8 +185,8 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 + fn panic(msg: String, location: ?String (null)) void
 // Returns the id of this process.
 + fn process_id() uint
-// Sends signal `code` to the current process.
-+ fn raise(code: i32) void
+// Sends signal `sig` to the current process.
++ fn raise(sig: i32) void
 // Reads a `bytes`-long big-endian unsigned integer from `from`.
 + fn read_big_endian(from: *[u8], bytes: uint) uint
 // Reads a `bytes`-long little-endian unsigned integer from `from`.
@@ -192,13 +194,13 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 // Sets or replaces the environment variable `var` for this process and the children it starts.
 + fn setenv(var: String, value: String) void !SystemError
 // Makes the process ignore signal number `sig` (`SIG_IGN`).
-+ fn signal_ignore(sig: int) void
++ fn signal_ignore(sig: i32) void
 // Removes the environment variable `var`; removing a variable that is not set succeeds.
 + fn unsetenv(var: String) void !SystemError
-// Writes the low `bytes` bytes of `v` to `to`, most significant byte first.
-+ fn write_big_endian(v: uint, to: *[u8], bytes: uint) void
-// Writes the low `bytes` bytes of `v` to `to`, least significant byte first.
-+ fn write_little_endian(v: uint, to: *[u8], bytes: uint) void
+// Writes the low `bytes` bytes of `value` to `to`, most significant byte first.
++ fn write_big_endian(value: uint, to: *[u8], bytes: uint) void
+// Writes the low `bytes` bytes of `value` to `to`, least significant byte first.
++ fn write_little_endian(value: uint, to: *[u8], bytes: uint) void
 ```
 
 ## Classes for 'core'
@@ -225,7 +227,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Stores `value` in every element.
     + fn set_all(value: T) void
     // Returns a view of `length` elements from `offset` that shares this slice's storage.
-    + fn view(offset: uint, length: uint) mut &[T]
+    + fn view(offset: uint (0), length: uint (uint.$max)) mut &[T]
 }
 ```
 
@@ -275,8 +277,8 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + get length: uint
     // Returns the link to the item at `index`.
     + fn link(index: uint) Link[T]
-    // Creates an empty arena with room for `start_size` items before it has to grow.
-    + static fn new(start_size: uint (0)) Arena[T]
+    // Creates an empty arena with room for `capacity` items before it has to grow.
+    + static fn new(capacity: uint (0)) Arena[T]
     // Returns the link the next `add` will return, for an item that refers to itself.
     + fn next_link() Link[T]
     // Returns a borrow of the item behind `link`, to change its fields in place.
@@ -376,8 +378,8 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn merge(items: Array[T]) Array[T]
     // Returns the element with the smallest key; on a tie, the first of them.
     + fn min_by[K](key: fn(T)(K)) T !LookupError
-    // Creates an empty array with room for `start_size` elements before it has to grow.
-    + static fn new(start_size: uint (0)) Array[T]
+    // Creates an empty array with room for `capacity` elements before it has to grow.
+    + static fn new(capacity: uint (0)) Array[T]
     // Removes and returns the first element, shifting the rest down (O(n)).
     + fn pop_first() T !LookupError
     // Removes and returns the last element.
@@ -387,7 +389,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Inserts the elements of `items` at the front, keeping their order.
     + fn prepend_many(items: Array[T], unique: bool (false)) void
     // Returns a new array with a copy of up to `amount` elements starting at `start`.
-    + fn range(start: uint, amount: uint) Array[T]
+    + fn range(offset: uint, length: uint) Array[T]
     // Folds the elements left to right into one value, starting from `init`.
     + fn reduce[R](init: R, func: fn(R, T)(R)) R
     // Removes the element at `index` and shifts the following elements down.
@@ -427,7 +429,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Returns a copy without duplicates; see `remove_duplicates`.
     + fn unique() Array[T]
     // Returns a writable view of up to `amount` elements starting at `start`, without copying.
-    + fn view(start: uint (0), amount: uint (uint.$max)) mut &[T]
+    + fn view(offset: uint (0), length: uint (uint.$max)) mut &[T]
 }
 ```
 
@@ -625,8 +627,8 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn clear() void
     // Zeroes the `amount` bytes after the contents, reserving room first.
     + fn clear_next_bytes(amount: uint) void
-    // Removes `len` bytes starting at `index` and moves the later bytes down.
-    + fn clear_range(index: uint, len: uint) void
+    // Removes `length` bytes starting at `offset` and moves the later bytes down.
+    + fn clear_range(offset: uint, length: uint) void
     // Removes the first `index` bytes and moves the rest to the front.
     + fn clear_until(index: uint) void
     // Returns an independent copy with the same contents and capacity.
@@ -647,22 +649,22 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn into_string() String
     // Removes leading bytes for which `filter` returns true and moves the rest to the front.
     + fn ltrim(filter: fnptr(u8)(bool)) void
-    // Creates an empty buffer with room for `start_size` bytes (at least 32). A `start_size` of 0 allocates nothing until the first write.
-    + static fn new(start_size: uint (128)) ByteBuffer
-    // Returns a copy of `length` bytes starting at `start_index`, clamped to the contents.
-    + fn range(start_index: uint, length: uint) String
+    // Creates an empty buffer with room for `capacity` bytes (at least 32). A `capacity` of 0 allocates nothing until the first write.
+    + static fn new(capacity: uint (128)) ByteBuffer
+    // Returns a copy of `length` bytes starting at `offset`, clamped to the contents.
+    + fn range(offset: uint, length: uint) String
     // Returns a `ByteReader` over the current contents.
     + fn reader() ByteReader
     // Empties the buffer and lets go of its storage without allocating; the next write allocates new storage. Views taken before keep the old bytes.
     + fn release_storage() void
-    // Ensures room for `length` more bytes after the contents, growing the capacity if needed.
-    + fn reserve(length: uint) void
+    // Ensures room for `amount` more bytes after the contents, growing the capacity if needed.
+    + fn reserve(amount: uint) void
     // Sets the length to `length`, growing the capacity when needed.
     + fn resize(length: uint) void
     // Removes trailing bytes for which `filter` returns true.
     + fn rtrim(filter: fnptr(u8)(bool)) void
-    // Replaces the byte at `index`; backs `buffer[index] = v` (`$offset_assign`).
-    + fn set(index: uint, v: u8) void
+    // Replaces the byte at `index`; backs `buffer[index] = value` (`$offset_assign`).
+    + fn set(index: uint, value: u8) void
     // Reduces the capacity to `size` bytes, but never below the length or 32.
     + fn shrink_capacity(size: uint) void
     // Grows the length by `amount` bytes without writing them.
@@ -686,37 +688,37 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Appends the low `bytes` bytes of `value`, most significant first.
     + fn write_big_endian(value: uint, bytes: uint) void
     // Appends one byte.
-    + fn write_byte(v: u8) void
+    + fn write_byte(value: u8) void
     // Appends the bytes of the C string `str`, plus its zero terminator when `include_zero_byte`.
     + fn write_cstring(str: cstring, include_zero_byte: bool (true)) void
-    // Appends `v` in fixed notation with `decimals` digits after the point.
-    + fn write_f64_ascii(v: f64, decimals: uint, trim_zeros: bool (false)) void
-    // Appends `v` in exponent form with `decimals` digits after the point, e.g. `1.234567e6`.
-    + fn write_f64_ascii_scientific(v: f64, decimals: uint (6), trim_zeros: bool (false)) void
-    // Appends `v` with the fewest digits that parse back to the same value.
-    + fn write_f64_ascii_shortest(v: f64, force_exponent: bool (false)) void
-    // Appends the IEEE 754 bits of `v` as 8 bytes, most significant first.
-    + fn write_f64_be(v: f64) void
-    // Appends the IEEE 754 bits of `v` as 8 bytes, least significant first.
-    + fn write_f64_le(v: f64) void
-    // Appends `v` as text in `base`, with a leading `-` when negative.
-    + fn write_int_ascii(v: int, base: u8 (10), lowercase: bool (false)) void
+    // Appends `value` in fixed notation with `decimals` digits after the point.
+    + fn write_f64_ascii(value: f64, decimals: uint, trim_zeros: bool (false)) void
+    // Appends `value` in exponent form with `decimals` digits after the point, e.g. `1.234567e6`.
+    + fn write_f64_ascii_scientific(value: f64, decimals: uint (6), trim_zeros: bool (false)) void
+    // Appends `value` with the fewest digits that parse back to the same value.
+    + fn write_f64_ascii_shortest(value: f64, force_exponent: bool (false)) void
+    // Appends the IEEE 754 bits of `value` as 8 bytes, most significant first.
+    + fn write_f64_be(value: f64) void
+    // Appends the IEEE 754 bits of `value` as 8 bytes, least significant first.
+    + fn write_f64_le(value: f64) void
+    // Appends `value` as text in `base`, with a leading `-` when negative.
+    + fn write_int_ascii(value: int, base: u8 (10), lowercase: bool (false)) void
     // Appends the low `bytes` bytes of `value`, least significant first.
     + fn write_little_endian(value: uint, bytes: uint) void
-    // Appends `v` as 2 bytes, most significant first.
-    + fn write_u16_be(v: u16) void
-    // Appends `v` as 2 bytes, least significant first.
-    + fn write_u16_le(v: u16) void
-    // Appends `v` as 4 bytes, most significant first.
-    + fn write_u32_be(v: u32) void
-    // Appends `v` as 4 bytes, least significant first.
-    + fn write_u32_le(v: u32) void
-    // Appends `v` as 8 bytes, most significant first.
-    + fn write_u64_be(v: u64) void
-    // Appends `v` as 8 bytes, least significant first.
-    + fn write_u64_le(v: u64) void
-    // Appends `v` as text in `base`, using uppercase digits above 9 unless `lowercase` is set.
-    + fn write_uint_ascii(v: uint, base: u8 (10), lowercase: bool (false)) void
+    // Appends `value` as 2 bytes, most significant first.
+    + fn write_u16_be(value: u16) void
+    // Appends `value` as 2 bytes, least significant first.
+    + fn write_u16_le(value: u16) void
+    // Appends `value` as 4 bytes, most significant first.
+    + fn write_u32_be(value: u32) void
+    // Appends `value` as 4 bytes, least significant first.
+    + fn write_u32_le(value: u32) void
+    // Appends `value` as 8 bytes, most significant first.
+    + fn write_u64_be(value: u64) void
+    // Appends `value` as 8 bytes, least significant first.
+    + fn write_u64_le(value: u64) void
+    // Appends `value` as text in `base`, using uppercase digits above 9 unless `lowercase` is set.
+    + fn write_uint_ascii(value: uint, base: u8 (10), lowercase: bool (false)) void
 }
 ```
 
@@ -860,7 +862,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + get length: uint
     // Returns a new map with the entries of this map and of `map`; `map` wins on shared keys.
     + fn merge(map: FlatMap[K, T]) FlatMap[K, T]
-    // Copies every entry of `map` into this map; the same as `set_many`.
+    // Copies every entry of `map` into this map, replacing values of keys both maps have.
     + fn merge_in_place(map: FlatMap[K, T]) void
     // Creates an empty map.
     + static fn new() FlatMap[K, T]
@@ -872,8 +874,6 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn retain(func: fn(T, K)(bool)) void
     // Stores `value` under `key`, replacing the value of an existing entry in place.
     + fn set(key: K, value: T) void
-    // Copies every entry of `map` into this map, replacing values of keys both maps have.
-    + fn set_many(map: FlatMap[K, T]) void
     // Adds a new entry for `key` at the end.
     + fn set_unique(key: K, value: T) void !LookupError
     // Reorders the entries so iteration, `keys` and `values` follow ascending key order.
@@ -1094,8 +1094,8 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 + mode Map[T] for HashMap[String, T] {
     // Returns a deep copy as a `Map`: every key and value is cloned.
     + fn clone() Map[T]
-    // Creates an empty map.
-    + static fn new() Map[T]
+    // Creates an empty map with room for `capacity` entries before it has to grow.
+    + static fn new(capacity: uint (0)) Map[T]
 }
 ```
 
@@ -1125,8 +1125,8 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn add(item: T) void
     // Removes and returns the most recently added item.
     + fn get() T !LookupError
-    // Creates an empty pool with room for `start_size` items (at least 2).
-    + static fn new(start_size: uint (2)) Pool[T]
+    // Creates an empty pool with room for `capacity` items (at least 2).
+    + static fn new(capacity: uint (2)) Pool[T]
 }
 ```
 
@@ -1297,8 +1297,8 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn pad_right(length: uint, char: u8 (' ')) String
     // Returns `len` random bytes, each drawn uniformly from the bytes of `characters`.
     + static fn random(len: uint, characters: String ("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")) String
-    // Returns a substring of `length` bytes from `start_index`; backs `str[start .. length]`.
-    + fn range(start_index: uint, length: uint) String
+    // Returns a substring of `length` bytes from `offset`; backs `str[offset .. length]`.
+    + fn range(offset: uint, length: uint) String
     // Returns a `ByteReader` that reads the string's bytes from the start without copying them.
     + fn reader() ByteReader
     // Returns the string `count` times in a row; an empty string for 0.
@@ -1337,12 +1337,12 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn utf8.index_of(part: String, start_index: uint (0)) uint !LookupError
     // The number of UTF-8 characters, counted by walking the string from the start.
     + get utf8.length: uint
-    // Returns a substring of `length` characters starting at character index `start_index`.
-    + fn utf8.range(start_index: uint, length: uint) String
+    // Returns a substring of `length` characters starting at character index `offset`.
+    + fn utf8.range(offset: uint, length: uint) String
     // Splits the string on every occurrence of `on` that starts on a character boundary.
     + fn utf8.split(on: String, limit: uint (0)) Array[String]
-    // Returns a read-only view of `length` bytes from `start_index`, sharing the storage.
-    + fn view(start_index: uint (0), length: uint (uint.$max)) &[u8]
+    // Returns a read-only view of `length` bytes from `offset`, sharing the storage.
+    + fn view(offset: uint (0), length: uint (uint.$max)) &[u8]
     // Returns an iterator over the words, for `each`: the parts between ASCII whitespace, empty ones skipped. Unlike `split`, nothing is allocated.
     + fn words() StringWords
 }
@@ -1575,7 +1575,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: i16) i16
     // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
-    + fn to_base(base: i16) String
+    + fn to_base(base: i16, lowercase: bool (false)) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(base: i16, buf: local mut &[u8], lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
@@ -1586,10 +1586,10 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn to_string() String
     // Returns how many zero bits come after the lowest one bit; the bit width for 0.
     + fn trailing_zeros() uint
-    // Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
-    + static fn write_big_endian(v: i16, to: local mut &[u8]) void
-    // Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
-    + static fn write_little_endian(v: i16, to: local mut &[u8]) void
+    // Writes `value` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
+    + static fn write_big_endian(value: i16, to: local mut &[u8]) void
+    // Writes `value` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
+    + static fn write_little_endian(value: i16, to: local mut &[u8]) void
 }
 ```
 
@@ -1625,7 +1625,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: i32) i32
     // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
-    + fn to_base(base: i32) String
+    + fn to_base(base: i32, lowercase: bool (false)) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(base: i32, buf: local mut &[u8], lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
@@ -1636,10 +1636,10 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn to_string() String
     // Returns how many zero bits come after the lowest one bit; the bit width for 0.
     + fn trailing_zeros() uint
-    // Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
-    + static fn write_big_endian(v: i32, to: local mut &[u8]) void
-    // Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
-    + static fn write_little_endian(v: i32, to: local mut &[u8]) void
+    // Writes `value` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
+    + static fn write_big_endian(value: i32, to: local mut &[u8]) void
+    // Writes `value` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
+    + static fn write_little_endian(value: i32, to: local mut &[u8]) void
 }
 ```
 
@@ -1675,7 +1675,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: i64) i64
     // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
-    + fn to_base(base: i64) String
+    + fn to_base(base: i64, lowercase: bool (false)) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(base: i64, buf: local mut &[u8], lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
@@ -1686,10 +1686,10 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn to_string() String
     // Returns how many zero bits come after the lowest one bit; the bit width for 0.
     + fn trailing_zeros() uint
-    // Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
-    + static fn write_big_endian(v: i64, to: local mut &[u8]) void
-    // Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
-    + static fn write_little_endian(v: i64, to: local mut &[u8]) void
+    // Writes `value` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
+    + static fn write_big_endian(value: i64, to: local mut &[u8]) void
+    // Writes `value` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
+    + static fn write_little_endian(value: i64, to: local mut &[u8]) void
 }
 ```
 
@@ -1725,7 +1725,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: i8) i8
     // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
-    + fn to_base(base: i8) String
+    + fn to_base(base: i8, lowercase: bool (false)) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(base: i8, buf: local mut &[u8], lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
@@ -1736,10 +1736,10 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn to_string() String
     // Returns how many zero bits come after the lowest one bit; the bit width for 0.
     + fn trailing_zeros() uint
-    // Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
-    + static fn write_big_endian(v: i8, to: local mut &[u8]) void
-    // Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
-    + static fn write_little_endian(v: i8, to: local mut &[u8]) void
+    // Writes `value` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
+    + static fn write_big_endian(value: i8, to: local mut &[u8]) void
+    // Writes `value` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
+    + static fn write_little_endian(value: i8, to: local mut &[u8]) void
 }
 ```
 
@@ -1775,7 +1775,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: int) int
     // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
-    + fn to_base(base: int) String
+    + fn to_base(base: int, lowercase: bool (false)) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(base: int, buf: local mut &[u8], lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
@@ -1786,10 +1786,10 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn to_string() String
     // Returns how many zero bits come after the lowest one bit; the bit width for 0.
     + fn trailing_zeros() uint
-    // Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
-    + static fn write_big_endian(v: int, to: local mut &[u8]) void
-    // Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
-    + static fn write_little_endian(v: int, to: local mut &[u8]) void
+    // Writes `value` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
+    + static fn write_big_endian(value: int, to: local mut &[u8]) void
+    // Writes `value` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
+    + static fn write_little_endian(value: int, to: local mut &[u8]) void
 }
 ```
 
@@ -1798,8 +1798,6 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 + class ptr {
     // Sets `amount` bytes starting at this address to zero.
     + fn clear_bytes(amount: uint) void
-    // Returns a new `String` holding a copy of the first `length` bytes.
-    + fn create_string(length: uint) String
     // Returns the length of the float text at this address, up to `max_bytes`.
     + fn determine_float_length(max_bytes: uint) uint
     // Returns the length of an optional `-` or `+` sign, `0x`/`0X` prefix and hex digits, up to `max_bytes`.
@@ -1860,8 +1858,8 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn read_octal_uint(len: uint) uint !SyntaxError
     // Parses an octal `uint` like `read_octal_uint`, stopping at the first byte not part of it.
     + fn read_octal_uint_dynamic(max_bytes: uint) (uint, uint)
-    // Returns a new `String` holding a copy of the first `len` bytes.
-    + fn read_string(len: uint) String
+    // Returns a new `String` holding a copy of the first `length` bytes.
+    + fn read_string(length: uint) String
     // Reads a big-endian `u16` from this address.
     + fn read_u16_be() u16
     // Reads a little-endian `u16` from this address.
@@ -1888,34 +1886,34 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn write(data: local &[u8]) void
     // Writes the low `bytes` bytes of `value` to this address, most significant first.
     + fn write_big_endian(value: uint, bytes: uint) void
-    // Copies `len` bytes from `from` to this address.
-    + fn write_bytes(from: ptr, len: uint) void
+    // Copies `length` bytes from `from` to this address.
+    + fn write_bytes(from: ptr, length: uint) void
     // Copies the bytes of `str` here, plus its zero byte when `include_zero_byte` is true.
     + fn write_cstring(str: cstring, include_zero_byte: bool (true)) void
-    // Writes `v` as text in `base` (2 to 16) to this address and returns the byte count.
-    + fn write_int_ascii(v: int, base: u8 (10), lowercase: bool (false)) uint
+    // Writes `value` as text in `base` (2 to 16) to this address and returns the byte count.
+    + fn write_int_ascii(value: int, base: u8 (10), lowercase: bool (false)) uint
     // Writes the low `bytes` bytes of `value` to this address, least significant first.
     + fn write_little_endian(value: uint, bytes: uint) void
-    // Writes `v` as 2 big-endian bytes to this address.
-    + fn write_u16_be(v: u16) void
-    // Writes `v` as 2 little-endian bytes to this address.
-    + fn write_u16_le(v: u16) void
-    // Writes `v` as 4 big-endian bytes to this address.
-    + fn write_u32_be(v: u32) void
-    // Writes `v` as 4 little-endian bytes to this address.
-    + fn write_u32_le(v: u32) void
-    // Writes `v` as 8 big-endian bytes to this address.
-    + fn write_u64_be(v: u64) void
-    // Writes `v` as 8 little-endian bytes to this address.
-    + fn write_u64_le(v: u64) void
-    // Stores the byte `v` at this address.
-    + fn write_u8(v: u8) void
-    // Writes `v` as text in `base` (2 to 16) to this address and returns the byte count.
-    + fn write_uint_ascii(v: uint, base: u8 (10), lowercase: bool (false)) uint
-    // Writes `v` as `size_of(uint)` big-endian bytes to this address.
-    + fn write_uint_be(v: uint) void
-    // Writes `v` as `size_of(uint)` little-endian bytes to this address.
-    + fn write_uint_le(v: uint) void
+    // Writes `value` as 2 big-endian bytes to this address.
+    + fn write_u16_be(value: u16) void
+    // Writes `value` as 2 little-endian bytes to this address.
+    + fn write_u16_le(value: u16) void
+    // Writes `value` as 4 big-endian bytes to this address.
+    + fn write_u32_be(value: u32) void
+    // Writes `value` as 4 little-endian bytes to this address.
+    + fn write_u32_le(value: u32) void
+    // Writes `value` as 8 big-endian bytes to this address.
+    + fn write_u64_be(value: u64) void
+    // Writes `value` as 8 little-endian bytes to this address.
+    + fn write_u64_le(value: u64) void
+    // Stores the byte `value` at this address.
+    + fn write_u8(value: u8) void
+    // Writes `value` as text in `base` (2 to 16) to this address and returns the byte count.
+    + fn write_uint_ascii(value: uint, base: u8 (10), lowercase: bool (false)) uint
+    // Writes `value` as `size_of(uint)` big-endian bytes to this address.
+    + fn write_uint_be(value: uint) void
+    // Writes `value` as `size_of(uint)` little-endian bytes to this address.
+    + fn write_uint_le(value: uint) void
 }
 ```
 
@@ -1951,7 +1949,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: u16) u16
     // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
-    + fn to_base(base: u16) String
+    + fn to_base(base: u16, lowercase: bool (false)) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(base: u16, buf: local mut &[u8], lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
@@ -1962,10 +1960,10 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn to_string() String
     // Returns how many zero bits come after the lowest one bit; the bit width for 0.
     + fn trailing_zeros() uint
-    // Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
-    + static fn write_big_endian(v: u16, to: local mut &[u8]) void
-    // Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
-    + static fn write_little_endian(v: u16, to: local mut &[u8]) void
+    // Writes `value` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
+    + static fn write_big_endian(value: u16, to: local mut &[u8]) void
+    // Writes `value` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
+    + static fn write_little_endian(value: u16, to: local mut &[u8]) void
 }
 ```
 
@@ -2001,7 +1999,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: u32) u32
     // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
-    + fn to_base(base: u32) String
+    + fn to_base(base: u32, lowercase: bool (false)) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(base: u32, buf: local mut &[u8], lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
@@ -2012,10 +2010,10 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn to_string() String
     // Returns how many zero bits come after the lowest one bit; the bit width for 0.
     + fn trailing_zeros() uint
-    // Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
-    + static fn write_big_endian(v: u32, to: local mut &[u8]) void
-    // Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
-    + static fn write_little_endian(v: u32, to: local mut &[u8]) void
+    // Writes `value` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
+    + static fn write_big_endian(value: u32, to: local mut &[u8]) void
+    // Writes `value` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
+    + static fn write_little_endian(value: u32, to: local mut &[u8]) void
 }
 ```
 
@@ -2053,7 +2051,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: u64) u64
     // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
-    + fn to_base(base: u64) String
+    + fn to_base(base: u64, lowercase: bool (false)) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(base: u64, buf: local mut &[u8], lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
@@ -2064,10 +2062,10 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn to_string() String
     // Returns how many zero bits come after the lowest one bit; the bit width for 0.
     + fn trailing_zeros() uint
-    // Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
-    + static fn write_big_endian(v: u64, to: local mut &[u8]) void
-    // Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
-    + static fn write_little_endian(v: u64, to: local mut &[u8]) void
+    // Writes `value` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
+    + static fn write_big_endian(value: u64, to: local mut &[u8]) void
+    // Writes `value` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
+    + static fn write_little_endian(value: u64, to: local mut &[u8]) void
 }
 ```
 
@@ -2133,7 +2131,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Returns a one-byte `String` holding this byte.
     + fn to_ascii_string() String
     // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
-    + fn to_base(base: u8) String
+    + fn to_base(base: u8, lowercase: bool (false)) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(base: u8, buf: local mut &[u8], lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
@@ -2146,10 +2144,10 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn trailing_zeros() uint
     // Returns the byte an escape letter stands for, e.g. `n` gives `\n`.
     + fn unescape() u8
-    // Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
-    + static fn write_big_endian(v: u8, to: local mut &[u8]) void
-    // Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
-    + static fn write_little_endian(v: u8, to: local mut &[u8]) void
+    // Writes `value` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
+    + static fn write_big_endian(value: u8, to: local mut &[u8]) void
+    // Writes `value` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
+    + static fn write_little_endian(value: u8, to: local mut &[u8]) void
 }
 ```
 
@@ -2191,7 +2189,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: uint) uint
     // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
-    + fn to_base(base: uint) String
+    + fn to_base(base: uint, lowercase: bool (false)) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(base: uint, buf: local mut &[u8], lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
@@ -2202,10 +2200,10 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn to_string() String
     // Returns how many zero bits come after the lowest one bit; the bit width for 0.
     + fn trailing_zeros() uint
-    // Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
-    + static fn write_big_endian(v: uint, to: local mut &[u8]) void
-    // Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
-    + static fn write_little_endian(v: uint, to: local mut &[u8]) void
+    // Writes `value` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
+    + static fn write_big_endian(value: uint, to: local mut &[u8]) void
+    // Writes `value` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
+    + static fn write_little_endian(value: uint, to: local mut &[u8]) void
 }
 ```
 
@@ -2252,6 +2250,8 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 ## Aliases for 'crypto'
 
 ```js
+// Length in bytes of a bcrypt hash string (`$2a$...`, 60 bytes).
++ value BCRYPT_HASH_SIZE (60)
 // The nonce size in bytes of every `Cipher`.
 + value CIPHER_NONCE_SIZE (12)
 // The size in bytes of the authentication tag every `Cipher` appends.
@@ -2305,10 +2305,18 @@ type c_long (int)
 + fn base64url_decode_in(text: local &[u8], out: local mut &[u8]) uint !CryptoError
 // Returns `data` encoded as URL-safe base64 (`-` and `_`) without `=` padding, the form JWT, JWK and WebAuthn use.
 + fn base64url_encode(data: local &[u8]) String
-// Computes the bcrypt hash of `password` with the given `cost` and `salt` into `output`.
-+ fn bcrypt(password: local &[u8], salt: local &[u8], cost: uint, output: ByteBuffer) void !CryptoError
+// Computes the 60-character `$2a$` bcrypt hash of `password` with the given `salt` and `cost`.
++ fn bcrypt(password: local &[u8], salt: local &[u8], cost: uint) String !CryptoError
 // Hashes `password` with bcrypt and a fresh random salt, for storing credentials.
 + fn bcrypt_hash(password: local &[u8], cost: uint (12)) String !CryptoError
+// Hashes `password` with bcrypt and a fresh random salt into `out` and returns the bytes written (60).
++ fn bcrypt_hash_in(password: local &[u8], out: local mut &[u8], cost: uint (12)) uint !CryptoError
+// Hashes `password` with bcrypt and a fresh random salt to `out` and returns the bytes written (60).
++ fn bcrypt_hash_into(password: local &[u8], out: Writer, cost: uint (12)) uint !CryptoError
+// Computes the bcrypt hash of `password` with `salt` and `cost` into `out` and returns the bytes written (60).
++ fn bcrypt_in(password: local &[u8], salt: local &[u8], cost: uint, out: local mut &[u8]) uint !CryptoError
+// Computes the bcrypt hash of `password` with `salt` and `cost` to `out` and returns the bytes written (60).
++ fn bcrypt_into(password: local &[u8], salt: local &[u8], cost: uint, out: Writer) uint !CryptoError
 // Returns whether `password` matches the bcrypt `hash` string.
 + fn bcrypt_verify(password: local &[u8], hash: local &[u8]) bool
 // Returns the key size in bytes that `cipher` takes: 16 for AES-128-GCM, 32 for the others.
@@ -2370,7 +2378,7 @@ type c_long (int)
 // Fills all of `out` with cryptographically secure random bytes and returns its length.
 + fn random_bytes_in(out: local mut &[u8]) uint
 // Writes `length` cryptographically secure random bytes to `out`; returns the bytes written.
-+ fn random_bytes_into(length: uint, out: Writer) uint !io:IoError
++ fn random_bytes_into(out: Writer, length: uint) uint !io:IoError
 // Encrypts `plaintext` with AES-256-GCM under the 32-byte `key` and a random nonce, and returns the nonce, ciphertext and tag together, ready for `unseal`.
 + fn seal(plaintext: local &[u8], key: local &[u8], aad: local &[u8] ("")) String !CipherError
 // Returns the SHA-1 digest of `data` as lowercase hex.
@@ -2416,14 +2424,14 @@ type c_long (int)
 ```js
 // A streaming BLAKE2b hash with a digest of 1 to 64 bytes and an optional key.
 + class Blake2b {
-    // Writes the `hash_size`-byte digest to the start of `out`.
-    + fn finalize(out: local mut &[u8]) void
-    // Returns the 64-byte BLAKE2b digest of `input` as 128 hex characters.
-    + static fn hash_string(input: local &[u8], key: ?String (null), lowercase: bool (true)) String !CryptoError
+    // Writes the `hash_size`-byte digest to the start of `out` and returns `hash_size`.
+    + fn finish(out: local mut &[u8]) uint
+    // Returns the 64-byte BLAKE2b digest of `data` as 128 hex characters.
+    + static fn hash_hex(data: local &[u8], key: ?String (null), lowercase: bool (true)) String !CryptoError
     // Returns a BLAKE2b hasher producing `hash_size` bytes, keyed with `key` when given.
     + static fn new(hash_size: uint, key: ?String (null)) Blake2b !CryptoError
     // Feeds more input into the hash.
-    + fn update(input: local &[u8]) void
+    + fn update(data: local &[u8]) void
 }
 ```
 
@@ -3049,7 +3057,7 @@ alias pid_t for i32
 ## Functions for 'fs'
 
 ```js
-// Joins `dir` and `fn` with exactly one separator between them.
+// Joins `dir` and `part` with exactly one separator between them.
 + fn add(dir: String, part: String) String
 // Returns the last component of `path`, ignoring trailing separators.
 + fn basename(path: String) String
@@ -3145,8 +3153,8 @@ alias pid_t for i32
 + fn write(path: String, content: local &[u8], append: bool (false)) void !io:IoError
 // Writes `content` to `path` atomically via a sibling temporary file and atomic rename.
 + fn write_atomic(path: String, content: local &[u8], sync: bool (true), permissions: u32 (0c644)) void !io:IoError
-// Writes everything `source` yields to the file at `path`, in chunks of `chunk_size` bytes, and returns the bytes written; the file is created when it is missing and replaced unless `append` is set.
-+ fn write_from(path: String, source: Reader, append: bool (false), chunk_size: uint (65536)) uint !io:IoError
+// Writes everything `reader` yields to the file at `path`, in chunks of `chunk_size` bytes, and returns the bytes written; the file is created when it is missing and replaced unless `append` is set.
++ fn write_from(path: String, reader: Reader, append: bool (false), chunk_size: uint (65536)) uint !io:IoError
 ```
 
 ## Classes for 'fs'
@@ -3233,8 +3241,8 @@ alias pid_t for i32
 + class InMemoryFile {
     // The file's bytes.
     ~ data: &[u8]
-    // The client's file name for an HTTP upload; empty otherwise.
-    ~ filename: String
+    // The client's file name for an HTTP upload; `null` otherwise.
+    ~ filename: ?String
     // The client's MIME type for an HTTP upload; `application/octet-stream` otherwise.
     ~ mime_type: String
 
@@ -3344,8 +3352,8 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 + fn collect_if_threshold_reached() void
 // Collects shared memory when its usage reached the shared trigger and the GC is idle.
 + fn collect_shared_if_threshold_reached() void
-// Returns the largest count of `item`-byte elements, at least `count`, whose storage of `prefix` bytes plus the elements still fits the GC size class that `count` of them need.
-+ fn fit_count(prefix: uint, item: uint, count: uint) uint
+// Returns the largest count of `item_size`-byte elements, at least `count`, whose storage of `prefix_bytes` bytes plus the elements still fits the GC size class that `count` of them need.
++ fn fit_count(prefix_bytes: uint, item_size: uint, count: uint) uint
 // Flushes buffered allocation counts on the calling thread.
 + fn flush_allocations() void
 // Takes the calling thread's GC lock again after `unlock`.
@@ -3417,7 +3425,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 // Returns `code` with the value of every URL attribute whose scheme is not allowed emptied.
 + fn sanitize_url_attributes(code: String, allowed_schemes: Array[String] (.{ "http", "https", "mailto" })) String
 // Returns whether a URL taken from an HTML attribute uses a scheme in `allowed_schemes`.
-+ fn url_is_allowed(target: String, allowed_schemes: Array[String] (.{ "http", "https", "mailto" })) bool
++ fn url_is_allowed(url: String, allowed_schemes: Array[String] (.{ "http", "https", "mailto" })) bool
 ```
 
 ## Classes for 'html'
@@ -3684,8 +3692,6 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     + fn clear() void
     // Returns an independent copy with the same headers.
     + fn clone() Headers
-    // Returns an independent copy of the list.
-    + fn copy() Headers
     // Returns the value of the first field named `name`; also backs `headers[name]`.
     + fn get(name: String) String !LookupError
     // Returns the values of every field named `name` in order; empty when there is none.
@@ -3779,7 +3785,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     // The PEM private key of `client_certificate_file`; `null` reads it from that file.
     + client_key_file: ?String
     // The password of an encrypted client key.
-    + client_key_password: String
+    + client_key_password: ?String
     // The limit for connecting plus the TLS handshake, in milliseconds.
     + connect_timeout_ms: uint
     // Whether the client asks for a gzip-compressed response and decompresses it.
@@ -3847,10 +3853,10 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 ```js
 // A request passed to a server handler.
 + class Request {
-    // The SHA-256 fingerprint of that certificate as 64 lowercase hex characters; empty when the client sent none.
-    + client_certificate_sha256: String
-    // The subject of the certificate the client sent, such as `CN=alice,O=Example`; empty when it sent none. A server asks for one with `Server.tls_client_ca`.
-    + client_subject: String
+    // The SHA-256 fingerprint of that certificate as 64 lowercase hex characters; `null` when the client sent none.
+    + client_certificate_sha256: ?String
+    // The subject of the certificate the client sent, such as `CN=alice,O=Example`; `null` when it sent none. A server asks for one with `Server.tls_client_ca`.
+    + client_subject: ?String
     // The request method as sent, such as `GET`.
     + method: String
     // The path of the request target without the query string, not percent-decoded (see `url.decode_path`).
@@ -3928,7 +3934,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     // Sets the trailing header `name` to `value`, replacing earlier values for that name.
     + fn set_trailer(name: String, value: String) void
     // Creates a response whose body is streamed from `reader`.
-    + static fn stream(reader: Reader, size: ?uint (null), content_type: String ("application/octet-stream"), filename: ?String (null)) Response
+    + static fn stream(reader: Reader, content_type: String ("application/octet-stream"), size: ?uint (null), filename: ?String (null)) Response
     // Creates a `text/plain; charset=utf-8` response.
     + static fn text(body: String, code: u16 (200), headers: ?Headers (null)) Response
     // Trailing headers sent after the response body over HTTP/2 and HTTP/3, created empty on first access.
@@ -3948,10 +3954,10 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     + fn send(body: local &[u8], code: u16 (200), content_type: String ("text/plain; charset=utf-8"), headers: ?Headers (null)) void
     // Responds with status `code` and the file at `path`; responds 404 when it cannot be opened.
     + fn send_file(path: String, code: u16 (200), filename: ?String (null), headers: ?Headers (null)) void
-    // Responds with `status_code` and an empty `text/plain` body.
-    + fn send_status(status_code: u16) void
+    // Responds with `code` and an empty `text/plain` body.
+    + fn send_status(code: u16) void
     // Responds with status `code` and a body streamed from `reader`.
-    + fn send_stream(reader: Reader, size: ?uint (null), code: u16 (200), content_type: String ("application/octet-stream"), filename: ?String (null), headers: ?Headers (null)) void
+    + fn send_stream(reader: Reader, code: u16 (200), content_type: String ("application/octet-stream"), size: ?uint (null), filename: ?String (null), headers: ?Headers (null)) void
     // Answers with the WebSocket upgrade and runs `handler` on the connection once the response is sent; the fast-handler form of `WebSocket.upgrade`.
     + fn send_websocket(context: Context, handler: fn(WebSocket)(), compression: ?bool (null), protocol: ?String (null), headers: ?Headers (null)) void
 }
@@ -4072,12 +4078,12 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 + class WebSocket {
     // The close code received from the peer, or the one sent when this side closed first; 0 while open, 1006 when the connection dropped without a close frame.
     ~ close_code: u16
-    // The close reason that came with `close_code`.
-    ~ close_reason: String
+    // The close reason that came with `close_code`, or `null` when none was sent.
+    ~ close_reason: ?String
     // The largest message accepted, in bytes (after decompression); a larger one closes the connection with code 1009. Defaults to 16 MB.
     + max_message_size: uint
-    // The subprotocol agreed in the handshake (`Sec-WebSocket-Protocol`), or "" for none.
-    ~ protocol: String
+    // The subprotocol agreed in the handshake (`Sec-WebSocket-Protocol`), or `null` for none.
+    ~ protocol: ?String
 
     // Performs the closing handshake and closes the socket.
     + fn close(code: u16 (1000), reason: ?String (null), timeout_ms: uint (1000)) void !WebSocketError
@@ -4098,7 +4104,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     // Sets the socket timeouts in milliseconds; 0 waits forever.
     + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) void
     // Answers a server request with the WebSocket upgrade, then runs `handler` on the connection.
-    + static fn upgrade(req: Request, handler: fn(WebSocket)(), compression: ?bool (null), protocol: ?String (null), headers: ?Headers (null)) Response
+    + static fn upgrade(request: Request, handler: fn(WebSocket)(), compression: ?bool (null), protocol: ?String (null), headers: ?Headers (null)) Response
     // Sends `text` as one text message; the bytes must be UTF-8.
     + fn write(text: local &[u8]) void !WebSocketError
     // Sends `data` as one binary message.
@@ -4190,13 +4196,13 @@ alias Fd for i32
 // Writes `msg` and a newline to standard output.
 + fn println(msg: String) void
 // Reads up to `buf.length` bytes from `fd` into `buf` and returns the number read.
-+ fn read(fd: i32, buf: local mut &[u8], offset: uint (uint.$max)) uint !IoError
++ fn read(fd: i32, buf: local mut &[u8], offset: ?uint (null)) uint !IoError
 // Reads `reader` until it is exhausted and returns everything read.
 + fn read_all(reader: Reader, chunk_size: uint (65536)) ByteBuffer !IoError
 // Fills all of `buf` from `reader`, retrying short reads until every byte is read.
 + fn read_exact(reader: Reader, buf: local mut &[u8]) void !IoError
 // Reads like `read`, but always blocks the thread, even inside a coroutine.
-+ fn read_sync(fd: i32, buf: local mut &[u8], offset: uint (uint.$max)) uint !IoError
++ fn read_sync(fd: i32, buf: local mut &[u8], offset: ?uint (null)) uint !IoError
 // Moves the position of `fd` to `offset` bytes from `from` and returns the new position.
 + fn seek(fd: i32, offset: int, from: SeekFrom (SeekFrom.start)) uint !IoError
 // Marks `fd` close-on-exec, so a program started with `core.Process.run` or `core.exec` does not inherit it. Every descriptor the standard library creates for itself is marked this way; the flag only matters for descriptors handed out by other code. Does nothing on Windows, where children only inherit the handles they are given.
@@ -4214,7 +4220,7 @@ alias Fd for i32
 // Flushes the data written to `fd` to disk.
 + fn sync(fd: i32, data_only: bool (false)) void !IoError
 // Writes up to `data.length` bytes of `data` to `fd` and returns the number written.
-+ fn write(fd: i32, data: local &[u8], offset: uint (uint.$max)) uint !IoError
++ fn write(fd: i32, data: local &[u8], offset: ?uint (null)) uint !IoError
 // Writes all of `data` to `writer`, retrying short writes until every byte is written.
 + fn write_all(writer: Writer, data: local &[u8]) void !IoError
 ```
@@ -4240,8 +4246,8 @@ alias Fd for i32
     + static fn new(reader: Reader, capacity: uint (8192)) BufReader
     // Returns the next byte without consuming it, or `null` at the end of input.
     + fn peek() ?u8 !IoError
-    // Reads up to `out.length` bytes into `out` and returns the count; 0 at the end of input.
-    + fn read(out: local mut &[u8]) uint !IoError
+    // Reads up to `buf.length` bytes into `buf` and returns the count; 0 at the end of input.
+    + fn read(buf: local mut &[u8]) uint !IoError
     // Reads and consumes one byte, or returns `null` at the end of input.
     + fn read_byte() ?u8 !IoError
     // Returns the next line without its `\n` or `\r\n`, or `null` at the end of input.
@@ -4864,16 +4870,16 @@ alias Fd for i32
 ```js
 // Allocates `size` bytes of unmanaged, uninitialized memory with `malloc`.
 + fn alloc(size: uint) ptr
-// Returns whether the `len` bytes at `a` and `b` match, ignoring ASCII letter case.
-+ fn ascii_bytes_equal_ignore_case(a: ptr, b: ptr, len: uint) bool
-// Converts the ASCII letters `A`-`Z` in the `len` bytes at `adr` to lower case, in place.
-+ fn ascii_bytes_to_lower(adr: ptr, len: uint) void
+// Returns whether the `length` bytes at `a` and `b` match, ignoring ASCII letter case.
++ fn ascii_bytes_equal_ignore_case(a: ptr, b: ptr, length: uint) bool
+// Converts the ASCII letters `A`-`Z` in the `length` bytes at `adr` to lower case, in place.
++ fn ascii_bytes_to_lower(adr: ptr, length: uint) void
 // Returns whether `a` and `b` have the same length and bytes, ignoring ASCII letter case.
 + fn ascii_equal_ignore_case(a: local &[u8], b: local &[u8]) bool
 // Converts the ASCII letters `A`-`Z` in `view` to lower case, in place.
 + fn ascii_to_lower(view: local mut &[u8]) void
-// Parses the `len` bytes at `adr` as a decimal unsigned integer.
-+ fn bytes_to_uint(adr: ptr, len: uint, allow_plus: bool (false)) uint !SyntaxError
+// Parses the `length` bytes at `adr` as a decimal unsigned integer.
++ fn bytes_to_uint(adr: ptr, length: uint, allow_plus: bool (false)) uint !SyntaxError
 // Allocates `size` bytes of unmanaged memory set to zero; release it with `free`.
 + fn calloc(size: uint) ptr
 // Sets every byte of `view` to zero.
@@ -4951,11 +4957,11 @@ type c_long (int)
 // Connects to a TCP server; the same as `TcpConnection.new`.
 + fn tcp_client(host: String, port: u16, timeout_ms: uint (5000), local_host: ?String (null), local_port: u16 (0)) TcpConnection !NetError
 // Opens a listening TCP socket; the same as `TcpServer.new`.
-+ fn tcp_server(host: String, port: u16, timeout_ms: uint (5000), reuse_port: bool (false)) atomic TcpServer !NetError
++ fn tcp_server(host: String, port: u16, reuse_port: bool (false), timeout_ms: uint (5000)) atomic TcpServer !NetError
 // Opens a UDP socket that talks to one server; the same as `UdpClient.new`.
 + fn udp_client(host: String, port: u16, timeout_ms: uint (5000), local_host: ?String (null), local_port: u16 (0)) UdpClient !NetError
 // Binds a UDP socket to your own address; the same as `UdpServer.new`.
-+ fn udp_server(host: String, port: u16, timeout_ms: uint (5000), reuse_address: bool (false)) UdpServer !NetError
++ fn udp_server(host: String, port: u16, reuse_address: bool (false), timeout_ms: uint (5000)) UdpServer !NetError
 // Connects to a Unix domain stream socket at `path`.
 + fn unix_client(path: String, timeout_ms: uint (5000)) TcpConnection !NetError
 // Opens a listening Unix domain stream socket at `path`; the same as `UnixServer.new`.
@@ -5027,8 +5033,8 @@ type c_long (int)
     // True for an IPv6 address, false for IPv4.
     + ipv6: bool
 
-    // Copies the raw address bytes (4 for IPv4, 16 for IPv6) into `out` and returns the count.
-    + fn bytes_into(out: local mut &[u8]) uint
+    // Copies the raw address bytes (4 for IPv4, 16 for IPv6) into `buf` and returns the count.
+    + fn bytes_in(buf: local mut &[u8]) uint
     // Creates an IPv4 (4 bytes) or IPv6 (16 bytes) address from raw network-order bytes.
     + static fn from_bytes(raw: local &[u8]) IpAddr !NetError
     // Extracts the IP address from a `SocketAddress` (dropping its port and scope id).
@@ -5150,8 +5156,8 @@ type c_long (int)
     + fn peer_certificate_subject() String !NetError
     // Reads up to `buf.length` decrypted bytes into `buf` and returns the count.
     + fn recv(buf: local mut &[u8], timeout_ms: uint (5000)) uint !NetError
-    // Returns the ALPN protocol agreed in the handshake, or `""` when none was.
-    + fn selected_alpn() String
+    // Returns the ALPN protocol agreed in the handshake, or `null` when none was.
+    + fn selected_alpn() ?String
     // Sets the ALPN protocols to offer (such as `"h2"`, `"http/1.1"`), most preferred first.
     + fn set_alpn(protocols: Array[String]) void !NetError
     // Trusts the CA certificates in the PEM file `path` and stores it as `cert_file`.
@@ -5171,7 +5177,7 @@ type c_long (int)
     // Sets the lowest TLS version this session accepts; throws `ssl` when OpenSSL rejects it.
     + fn set_min_version(version: TlsVersion) void !NetError
     // Turns verification of the peer certificate on or off for this session.
-    + fn set_verify(enable: bool) void
+    + fn set_verify(enabled: bool) void
     // Encrypts and sends all of `data`; returns the number of bytes written.
     + fn write(data: local &[u8], timeout_ms: uint (5000)) uint !NetError
 }
@@ -5260,7 +5266,7 @@ type c_long (int)
     // Returns the address the server listens on.
     + fn local_address() SocketAddress !NetError
     // Resolves `host`, binds to it and `port`, and starts listening; also `net.tcp_server`.
-    + static fn new(host: String, port: u16, timeout_ms: uint (5000), reuse_port: bool (false)) atomic TcpServer !NetError
+    + static fn new(host: String, port: u16, reuse_port: bool (false), timeout_ms: uint (5000)) atomic TcpServer !NetError
 }
 ```
 
@@ -5330,7 +5336,7 @@ type c_long (int)
     // Returns the address this socket is bound to.
     + fn local_address() SocketAddress !NetError
     // Binds a socket to your own `host` and `port`; also `net.udp_server`.
-    + static fn new(host: String, port: u16, timeout_ms: uint (5000), reuse_address: bool (false)) UdpServer !NetError
+    + static fn new(host: String, port: u16, reuse_address: bool (false), timeout_ms: uint (5000)) UdpServer !NetError
     // Receives one datagram into `buf` and returns its byte count and its sender.
     + fn recv_from(buf: local mut &[u8]) (uint, SocketAddress) !io:IoError
     // Sends `data` as one datagram to `to` and returns the number of bytes sent.
@@ -5454,7 +5460,7 @@ type c_long (int)
     // Byte offset in `text` where the whole match starts.
     + get start: uint
     // Returns the text of the whole match.
-    + fn str() String
+    + fn to_string() String
 }
 ```
 
@@ -5474,8 +5480,8 @@ type c_long (int)
     + fn group_count() uint
     // Returns the group index of the group called `name`.
     + fn group_index(name: String) uint !LookupError
-    // Returns the name of each group by group index, `""` for unnamed groups.
-    + fn group_names() Array[String]
+    // Returns the name of each group by group index, `null` for unnamed groups.
+    + fn group_names() Array[?String]
     // Returns whether the pattern matches anywhere in `text`.
     + fn is_match(text: String) bool
     // Returns the match that begins exactly at byte offset `start`, or `null`.
@@ -5879,8 +5885,8 @@ type Loader (fn(String)(?String))
 ```js
 // Calls `handler` once for every index in `0 .. count`, spread over `threads` OS threads, and returns when all calls finished.
 + fn parallel_for(count: uint, handler: atomic fn(uint)(), threads: uint (0)) void
-// Starts an OS thread that runs `func`; the same as `Thread[void].start`.
-+ fn start(func: atomic fn()()) Thread[void] !InitError
+// Starts an OS thread that runs `handler`; the same as `Thread[void].start`.
++ fn start(handler: atomic fn()()) Thread[void] !InitError
 // Blocks the whole OS thread, with every coroutine on it, for `ms` milliseconds.
 + fn suspend_ms(ms: uint) void
 // Blocks the whole OS thread, with every coroutine on it, for `ns` nanoseconds.
@@ -5904,8 +5910,8 @@ type Loader (fn(String)(?String))
 + class Thread[T] {
     // Waits until the handler has returned and returns its result.
     + fn await() T
-    // Starts an OS thread that runs `func` inside a coroutine, and returns its handle.
-    + static fn start(func: atomic fn()(T)) Thread[T] !InitError
+    // Starts an OS thread that runs `handler` inside a coroutine, and returns its handle.
+    + static fn start(handler: atomic fn()(T)) Thread[T] !InitError
 }
 ```
 
@@ -5980,7 +5986,7 @@ type Loader (fn(String)(?String))
 // Returns a zone following the POSIX TZ rule `rule`, such as `CET-1CEST,M3.5.0,M10.5.0/3`, and named after it.
 + fn zone_from_posix(rule: String) Zone !ZoneError
 // Returns a zone read from `data`, the contents of a TZif zone file, and named `name`.
-+ fn zone_from_tzif(name: String, data: String) Zone !ZoneError
++ fn zone_from_tzif(data: String, name: String) Zone !ZoneError
 ```
 
 ## Classes for 'time'
@@ -6301,23 +6307,23 @@ type Loader (fn(String)(?String))
 // A validation rule for a JSON value, built by chaining calls on a typed constructor.
 + class Field {
     // Returns a rule that requires an array, checking each item against `of` when it is set.
-    + static fn array(of: ?Field) Field
+    + static fn array(of: ?Field (null)) Field
     // Returns a rule that requires a bool.
     + static fn bool() Field
     // Adds a check: `func` must return `true` for the value, otherwise the field gets the error code `error`.
     + fn custom(func: fn(Value)(bool), error: String) Field
     // Sets the value `try_cast` fills in when the field is absent from its parent object.
-    + fn default(val: $T) Field
+    + fn default(value: $T) Field
     // Adds a check that the value is a string accepted by `validate.email`.
     + fn email() Field
     // Sets a string the value must equal; `null` removes the check.
-    + fn equals_string(str: ?String) Field
+    + fn equals_string(value: ?String) Field
     // Returns a rule that requires a number; an integer such as `1` is accepted as a float.
     + static fn float() Field
     // Sets a float maximum for a float rule, checked in addition to `max`.
-    + fn fmax(val: float) Field
+    + fn fmax(value: float) Field
     // Sets a float minimum for a float rule, checked in addition to `min`.
-    + fn fmin(val: float) Field
+    + fn fmin(value: float) Field
     // Returns the limits of the rule as a JSON object, for use by client-side form checks.
     + fn get_form_rules() Value
     // Returns a rule that requires an integer.
@@ -6325,15 +6331,15 @@ type Loader (fn(String)(?String))
     // Adds a check that the string value passes `String.is_syntax(mask, mask_is_exclude)`.
     + fn is_syntax(mask: String, mask_is_exclude: bool (false)) Field
     // Sets whether a string may not contain ASCII uppercase letters.
-    + fn lower(val: bool (true)) Field
+    + fn lower(value: bool (true)) Field
     // Sets the maximum: the byte length of a string, the item or member count of an array or object, or the value of an int or float.
-    + fn max(val: int) Field
+    + fn max(value: int) Field
     // Sets the minimum: the byte length of a string, the item or member count of an array or object, or the value of an int or float.
-    + fn min(val: int) Field
+    + fn min(value: int) Field
     // Sets whether `null` is accepted; a `null` value then passes every other check.
     + fn nullable(value: bool (true)) Field
     // Returns a rule that requires an object, checking each field in `fields` when it is set.
-    + static fn object(fields: ?Map[Field]) Field
+    + static fn object(fields: ?Map[Field] (null)) Field
     // Sets whether the field may be absent from its parent object.
     + fn optional(value: bool (true)) Field
     // Returns a rule that requires a string.
@@ -6343,13 +6349,13 @@ type Loader (fn(String)(?String))
     // Returns `data` converted toward the kind of the rule, or unchanged when it cannot be.
     + fn try_cast(data: Value) Value
     // Sets whether a string may not contain ASCII lowercase letters.
-    + fn upper(val: bool (true)) Field
+    + fn upper(value: bool (true)) Field
     // Adds a check that the value is a string of ASCII letters, plus digits when `numbers` and `_` when `underscore` is set.
     + fn username(numbers: bool, underscore: bool) Field
     // Sets the maximum string length in characters (UTF-8 code points).
-    + fn utf8_max(val: int) Field
+    + fn utf8_max(value: int) Field
     // Sets the minimum string length in characters (UTF-8 code points).
-    + fn utf8_min(val: int) Field
+    + fn utf8_min(value: int) Field
     // Returns whether `data` passes the rule.
     + fn validate(data: Value, errors: ?Map[String] (null), field_name: ?String (null)) bool
     // Validates `data` like `validate`, then turns the codes in `errors` into messages.
