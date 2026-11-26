@@ -21,6 +21,92 @@ class ServerStaticDir {
     next: ?atomic ServerStaticDir
 }
 
+class ServerBodyLimit {
+    // Normalized URL mount prefix without trailing slash (e.g. "/upload"); "" for root
+    prefix: String
+    // Largest accepted request body in bytes; 0 means no limit
+    max_bytes: uint
+    next: ?atomic ServerBodyLimit
+}
+
+fn path_needs_normalize(path: local &[u8]) bool {
+    let len = path.length
+    let i: uint = 0
+    while i < len {
+        let ch = path[i]
+        if ch == '%' : return true
+        if ch == '/' && i + 1 < len {
+            let next = path[i + 1]
+            if next == '/' || next == '.' : return true
+        }
+        i++
+    }
+    return false
+}
+
+fn normalize_limit_path(raw: local &[u8]) String {
+    let decoded = ByteBuffer.new(raw.length)
+    let i: uint = 0
+    while i < raw.length {
+        let ch = raw[i++]
+        if ch == '%' && i + 1 < raw.length && raw[i].is_hex() && raw[i + 1].is_hex() {
+            ch = raw[i].hex_byte_to_hex_value() * 16 + raw[i + 1].hex_byte_to_hex_value()
+            i += 2
+        }
+        decoded.write_byte(ch)
+    }
+    let parts = Array[String].new(4)
+    let pos: uint = 0
+    let len = decoded.length
+    while pos < len {
+        while pos < len && decoded[pos] == '/' : pos++
+        let start = pos
+        while pos < len && decoded[pos] != '/' : pos++
+        let seg_len = pos - start
+        if seg_len == 0 : continue
+        let seg = decoded.view(start, seg_len)
+        if seg.equals(".") : continue
+        if seg.equals("..") {
+            parts.pop_last() ! {}
+            continue
+        }
+        parts.append(seg.to_string())
+    }
+    if parts.length == 0 : return "/"
+    let out = ByteBuffer.new(len)
+    each parts as part {
+        out.write_byte('/')
+        out.write(part)
+    }
+    return out.into_string()
+}
+
+fn match_body_limit(limits: atomic ServerBodyLimit, default_limit: uint, path: local &[u8]) uint {
+    let cur: ?atomic ServerBodyLimit = limits
+    while isset(cur) {
+        let pfx = cur.prefix
+        if pfx.bytes == 0 : return cur.max_bytes
+        if path.length >= pfx.bytes && path.starts_with(pfx) {
+            if path.length == pfx.bytes || path[pfx.bytes] == '/' : return cur.max_bytes
+        }
+        cur = cur.next
+    }
+    return default_limit
+}
+
+// Resolves the body size limit for `raw_path` (which may carry a `?query` suffix).
+// `limits` is ordered longest-prefix-first so the first match wins.
+fn resolve_max_body_size(limits: ?atomic ServerBodyLimit, default_limit: uint, raw_path: local &[u8]) uint {
+    if !isset(limits) : return default_limit
+    let path_len = raw_path.index_of_byte('?') !? raw_path.length
+    let path = raw_path.view(0, path_len)
+    if !path_needs_normalize(path) {
+        return match_body_limit(limits, default_limit, path)
+    }
+    let norm = normalize_limit_path(path)
+    return match_body_limit(limits, default_limit, norm.view())
+}
+
 class StaticMatch {
     path: String
     // The file's metadata, when it was read for the match
@@ -178,6 +264,7 @@ class ServerWorkerData {
     handler: atomic fn(Request)(Response)
     fast_handler: ?atomic fn(Context, ResponseWriter)()
     static_dirs: ?atomic ServerStaticDir
+    body_limits: ?atomic ServerBodyLimit
     show_info: bool
     idle_timeout_ms: uint
     header_timeout_ms: uint
@@ -189,6 +276,7 @@ class ServerWorkerData {
     max_connections: uint
     max_request_header_size: uint
     max_request_body_size: uint
+    max_buffered_body_size: uint
     max_server_wide_body_size: uint
     max_memory: uint
     http2: bool (false)
@@ -314,15 +402,18 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
     -+ static_dirs: Array[String] (.{})
     -+ static_indexes: Array[String] (.{})
     -+ static_prefixes: Array[String] (.{})
+    -+ body_limit_prefixes: Array[String] (.{})
+    -+ body_limit_sizes: Array[uint] (.{})
     /// The largest accepted request head (request line and headers) in bytes; 0 means
     /// no limit. Defaults to 8 KiB.
     ///
     /// Larger requests are answered with 431 and the connection is closed.
     + max_request_header_size: uint (8 * 1024)
-    /// The largest accepted request body in bytes; 0 means no limit. Defaults to 32 MiB.
+    /// The largest accepted request body in bytes; 0 means no limit. Defaults to 2 MiB.
     ///
-    /// Larger requests are answered with 413 and the connection is closed.
-    + max_request_body_size: uint (32 * 1024 * 1024)
+    /// Larger requests are answered with 413 and the connection is closed. Use
+    /// `set_max_request_body_size` to raise or lower the limit for specific paths.
+    + max_request_body_size: uint (2 * 1024 * 1024)
     /// The combined size of the request bodies being received at once, over all
     /// connections, in bytes; 0 means no limit. Defaults to a quarter of `core.memory_limit`,
     /// so uploads alone cannot run the process out of memory.
@@ -645,6 +736,41 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
             }
         }
 
+        let body_limits: ?atomic ServerBodyLimit = null
+        let max_buffered_body_size = this.max_request_body_size
+        let limit_count = this.body_limit_prefixes.length
+        if limit_count > 0 {
+            // Sort ascending by prefix length so prepending yields longest-prefix-first
+            let order = Array[uint].new(limit_count)
+            each 0 .. limit_count as i {
+                let len = (this.body_limit_prefixes.get(i) !? "").bytes
+                let pos = order.length
+                order.append(i)
+                while pos > 0 {
+                    let prev_idx = order.get(pos - 1) !? 0
+                    let prev_len = (this.body_limit_prefixes.get(prev_idx) !? "").bytes
+                    if prev_len <= len : break
+                    order.set(pos, prev_idx) ! {}
+                    order.set(pos - 1, i) ! {}
+                    pos--
+                }
+            }
+            each order as idx {
+                let pfx = this.body_limit_prefixes.get(idx) !? ""
+                let sz = this.body_limit_sizes.get(idx) !? this.max_request_body_size
+                if sz == 0 || max_buffered_body_size == 0 {
+                    max_buffered_body_size = 0
+                } else if sz > max_buffered_body_size {
+                    max_buffered_body_size = sz
+                }
+                body_limits = .{
+                    prefix: pfx
+                    max_bytes: sz
+                    next: body_limits
+                }
+            }
+        }
+
         let alt_svc_val = ""
         let configured_alt_svc = this.alt_svc
         if isset(configured_alt_svc) {
@@ -663,6 +789,7 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
             handler: server_handler_chain(this.handler, this.middlewares)
             fast_handler: this.fast_handler
             static_dirs: static_dirs
+            body_limits: body_limits
             show_info: this.show_info
             idle_timeout_ms: this.idle_timeout_ms
             header_timeout_ms: this.header_timeout_ms
@@ -674,6 +801,7 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
             max_connections: this.max_connections
             max_request_header_size: this.max_request_header_size
             max_request_body_size: this.max_request_body_size
+            max_buffered_body_size: max_buffered_body_size
             max_server_wide_body_size: this.max_server_wide_body_size
             max_memory: this.max_memory
             http2: this.http2
@@ -774,6 +902,26 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
         this.static_dirs.append(full)
         this.static_indexes.append(index ?? "")
         this.static_prefixes.append(normalize_static_prefix(route_prefix))
+    }
+
+    /// Sets the largest accepted request body in bytes for requests whose path matches
+    /// `route_prefix`; 0 means no limit.
+    ///
+    /// Matching follows `add_static_dir`: `route_prefix` is normalized without trailing
+    /// slashes (`"/upload"` matches `"/upload"` and `"/upload/..."`, not `"/uploads"`).
+    /// When several prefixes match, the longest one wins; setting the same prefix again
+    /// replaces the earlier limit. Applies across HTTP/1.1, HTTP/2 and HTTP/3, and can
+    /// raise or lower the limit relative to `max_request_body_size`.
+    + fn set_max_request_body_size(route_prefix: String, max_bytes: uint) {
+        let norm = normalize_static_prefix(route_prefix)
+        each this.body_limit_prefixes as existing, i {
+            if existing == norm {
+                this.body_limit_sizes.set(i, max_bytes) ! {}
+                return
+            }
+        }
+        this.body_limit_prefixes.append(norm)
+        this.body_limit_sizes.append(max_bytes)
     }
 }
 

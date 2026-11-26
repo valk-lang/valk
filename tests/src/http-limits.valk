@@ -579,6 +579,7 @@ fn http_limit_memory_upload(port: u16, body: String) {
 synctest "HTTP server gives back the memory of large requests once idle" {
     let body = "".pad_right(8 * 1024 * 1024, 'x')
     let server = http.Server.new("127.0.0.1", 19648, http_limit_handler)
+    server.max_request_body_size = 16 * 1024 * 1024
     let running = co server.start(1)
     defer stop_http_test_server(server, running)
     let before = gc.mem_usage_shared
@@ -718,4 +719,72 @@ test "HTTP server refuses requests above max_memory and serves them again below 
     connection.write("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n") !!
     assert(http_limit_response(connection).contains(" 503 "))
     connection.close() _
+}
+
+fn http_limit_post_status(port: u16, target: String, body: String) String {
+    let connection = net.tcp_client("127.0.0.1", port) !!
+    connection.read_timeout_ms = 2000 * TIME_SCALE
+    defer connection.close() _
+    connection.write("POST " + target + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: " + body.bytes + "\r\n\r\n" + body) !!
+    return http_limit_response(connection)
+}
+
+fn http_limit_chunked_status(port: u16, target: String, body: String) String {
+    let connection = net.tcp_client("127.0.0.1", port) !!
+    connection.read_timeout_ms = 2000 * TIME_SCALE
+    defer connection.close() _
+    let hex_len = body.bytes.to_hex()
+    connection.write("POST " + target + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n" + hex_len + "\r\n" + body + "\r\n0\r\n\r\n") !!
+    return http_limit_response(connection)
+}
+
+test "HTTP server enforces per-path max_request_body_size rules" {
+    let handler: atomic fn(http.Request)(http.Response) = fn(req: http.Request) http.Response {
+        return http.Response.text("" + req.body.bytes)
+    }
+    let server = http.Server.new("127.0.0.1", 19653, handler)
+    assert(server.max_request_body_size == 2 * 1024 * 1024)
+    server.max_request_body_size = 16
+    server.set_max_request_body_size("/upload", 32)
+    server.set_max_request_body_size("/upload/", 64)
+    server.set_max_request_body_size("/upload/small", 8)
+    server.set_max_request_body_size("/tiny", 4)
+    server.set_max_request_body_size("/unlimited", 0)
+    let running = co server.start(1)
+    defer stop_http_test_server(server, running)
+
+    // Default limit applies to unmatched paths and non-segment-boundary siblings
+    assert(http_limit_post_status(19653, "/api", "x".repeat(16)).contains(" 200 "))
+    assert(http_limit_post_status(19653, "/api", "x".repeat(17)).contains(" 413 "))
+    assert(http_limit_post_status(19653, "/uploads", "x".repeat(20)).contains(" 413 "))
+
+    // Raised limit on /upload (replaced 32 -> 64) for exact, subpath, query, and chunked
+    assert(http_limit_post_status(19653, "/upload", "x".repeat(40)).contains(" 200 "))
+    assert(http_limit_post_status(19653, "/upload/file.bin?tag=1", "x".repeat(64)).contains(" 200 "))
+    assert(http_limit_post_status(19653, "/upload", "x".repeat(65)).contains(" 413 "))
+    assert(http_limit_chunked_status(19653, "/upload/part", "x".repeat(40)).contains(" 200 "))
+    assert(http_limit_chunked_status(19653, "/upload/part", "x".repeat(65)).contains(" 413 "))
+
+    // Longest prefix wins (/upload/small overrides /upload) and lowering below default works
+    assert(http_limit_post_status(19653, "/upload/small", "x".repeat(8)).contains(" 200 "))
+    assert(http_limit_post_status(19653, "/upload/small", "x".repeat(9)).contains(" 413 "))
+    assert(http_limit_post_status(19653, "/tiny", "x".repeat(4)).contains(" 200 "))
+    assert(http_limit_post_status(19653, "/tiny", "x".repeat(5)).contains(" 413 "))
+
+    // 0 means unlimited for that path
+    assert(http_limit_post_status(19653, "/unlimited/import", "x".repeat(200)).contains(" 200 "))
+
+    // Dot-segment traversal and percent-encoding cannot bypass limits
+    assert(http_limit_post_status(19653, "/upload/../api", "x".repeat(20)).contains(" 413 "))
+    assert(http_limit_post_status(19653, "/upload/%2e%2e/api", "x".repeat(20)).contains(" 413 "))
+    assert(http_limit_post_status(19653, "/%74iny", "x".repeat(5)).contains(" 413 "))
+
+    // Multi-packet incremental request preserves resolved per-path limit across reads
+    let inc = net.tcp_client("127.0.0.1", 19653) !!
+    inc.read_timeout_ms = 2000 * TIME_SCALE
+    inc.write("POST /upload HTTP/1.1\r\n") !!
+    time.sleep_ms(15)
+    inc.write("Host: localhost\r\nConnection: close\r\nContent-Length: 40\r\n\r\n" + "x".repeat(40)) !!
+    assert(http_limit_response(inc).contains(" 200 "))
+    inc.close() _
 }

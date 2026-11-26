@@ -13597,7 +13597,7 @@ Creates an empty router; also backs `Router[T]{}` and default construction.
     + max_connections: uint
     // New requests are answered with 503 while the memory of the process, after a collection, is above this many bytes; 0 means no limit. Defaults to three quarters of `core.memory_limit`, so handlers that allocate a lot slow down the service instead of getting the process killed.
     + max_memory: uint
-    // The largest accepted request body in bytes; 0 means no limit. Defaults to 32 MiB.
+    // The largest accepted request body in bytes; 0 means no limit. Defaults to 2 MiB.
     + max_request_body_size: uint
     // The largest accepted request head (request line and headers) in bytes; 0 means no limit. Defaults to 8 KiB.
     + max_request_header_size: uint
@@ -13636,6 +13636,8 @@ Creates an empty router; also backs `Router[T]{}` and default construction.
     + static fn new(host: String, port: u16, handler: atomic fn(Request)(Response) (handler_default)) Server
     // Stops accepting connections and gives in-flight requests `timeout_ms` to finish.
     + fn request_shutdown(timeout_ms: uint (5000)) void
+    // Sets the largest accepted request body in bytes for requests whose path matches `route_prefix`; 0 means no limit.
+    + fn set_max_request_body_size(route_prefix: String, max_bytes: uint) void
     // Calls `request_shutdown` and waits for the workers to finish.
     + fn shutdown(timeout_ms: uint (5000)) bool
     // Serves until `request_shutdown`/`shutdown` and every worker has drained.
@@ -13752,9 +13754,10 @@ getting the process killed.
 
 #### max_request_body_size
 
-The largest accepted request body in bytes; 0 means no limit. Defaults to 32 MiB.
+The largest accepted request body in bytes; 0 means no limit. Defaults to 2 MiB.
 
-Larger requests are answered with 413 and the connection is closed.
+Larger requests are answered with 413 and the connection is closed. Use
+`set_max_request_body_size` to raise or lower the limit for specific paths.
 
 #### max_request_header_size
 
@@ -13885,6 +13888,17 @@ Returns without waiting and is safe to call from a handler. Idle connections are
 closed right away. Before `start` the request is remembered and `start` stops
 again as soon as it is running. Repeated calls can shorten the deadline, never
 extend it.
+
+#### set_max_request_body_size
+
+Sets the largest accepted request body in bytes for requests whose path matches
+`route_prefix`; 0 means no limit.
+
+Matching follows `add_static_dir`: `route_prefix` is normalized without trailing
+slashes (`"/upload"` matches `"/upload"` and `"/upload/..."`, not `"/uploads"`).
+When several prefixes match, the longest one wins; setting the same prefix again
+replaces the earlier limit. Applies across HTTP/1.1, HTTP/2 and HTTP/3, and can
+raise or lower the limit relative to `max_request_body_size`.
 
 #### shutdown
 

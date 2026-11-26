@@ -4118,7 +4118,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     + max_connections: uint
     // New requests are answered with 503 while the memory of the process, after a collection, is above this many bytes; 0 means no limit. Defaults to three quarters of `core.memory_limit`, so handlers that allocate a lot slow down the service instead of getting the process killed.
     + max_memory: uint
-    // The largest accepted request body in bytes; 0 means no limit. Defaults to 32 MiB.
+    // The largest accepted request body in bytes; 0 means no limit. Defaults to 2 MiB.
     + max_request_body_size: uint
     // The largest accepted request head (request line and headers) in bytes; 0 means no limit. Defaults to 8 KiB.
     + max_request_header_size: uint
@@ -4157,6 +4157,8 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     + static fn new(host: String, port: u16, handler: atomic fn(Request)(Response) (handler_default)) Server
     // Stops accepting connections and gives in-flight requests `timeout_ms` to finish.
     + fn request_shutdown(timeout_ms: uint (5000)) void
+    // Sets the largest accepted request body in bytes for requests whose path matches `route_prefix`; 0 means no limit.
+    + fn set_max_request_body_size(route_prefix: String, max_bytes: uint) void
     // Calls `request_shutdown` and waits for the workers to finish.
     + fn shutdown(timeout_ms: uint (5000)) bool
     // Serves until `request_shutdown`/`shutdown` and every worker has drained.
